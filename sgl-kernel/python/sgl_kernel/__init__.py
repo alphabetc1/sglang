@@ -119,6 +119,7 @@ from sgl_kernel.sampling import (
 )
 from sgl_kernel.speculative import (
     build_tree_kernel_efficient,
+    chain_speculative_sampling_target_only,
     reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
