@@ -118,13 +118,8 @@ void tree_speculative_sampling_target_only(
   CHECK_GE(threshold_acc, 0);
   CHECK_GE(1, threshold_acc);
 
-  // FIXME: This allocates a dense [bs, num_draft_tokens, vocab] buffer every call, which can increase
-  // peak memory under concurrent verification and may add allocator/zero-fill overhead.
-  // Better options:
-  //  - Provide an explicit, reusable workspace tensor from the caller (cached per shape/device), OR
-  //  - Redesign the topk>1 path to avoid dense `draft_probs` (e.g., mask/rejected-list based sampling),
-  //    similar in spirit to `chain_speculative_sampling_target_only` (topk==1) fastpath.
-  at::Tensor draft_probs = target_probs.new_zeros(target_probs.sizes());
+  // NOTE: The TreeSpeculativeSamplingTargetOnly kernel now uses an internal rejected-id list (masking)
+  // and does not require a dense `draft_probs` workspace.
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
@@ -138,7 +133,6 @@ void tree_speculative_sampling_target_only(
       static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
       batch_size,
       num_spec_step,
       num_draft_tokens,

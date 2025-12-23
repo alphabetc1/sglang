@@ -47,7 +47,6 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
-    DType* draft_probs,
     uint32_t batch_size,
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
@@ -55,6 +54,16 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     DType threshold_single,
     DType threshold_acc) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Record rejected token ids (for the current `cur_prob_offset`) to mask them out in the final sampling.
+  // This replaces the previous "dense draft_probs workspace" used only as a rejection mask in TargetOnly mode.
+  constexpr int MAX_REJECTED_IDS = 256;
+  __shared__ IdType2 rejected_ids[MAX_REJECTED_IDS];
+  __shared__ int rejected_cnt;
+  if (tx == 0) {
+    rejected_cnt = 0;
+  }
+  __syncthreads();
 
   extern __shared__ __align__(alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
       uint8_t smem_sampling[];
@@ -86,72 +95,91 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         ++num_accepted_tokens;
         accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
         last_accepted_retrive_idx = draft_index;
+        if (tx == 0) {
+          // New state => clear rejected list (rejections are only relevant within the current state distribution).
+          rejected_cnt = 0;
+        }
         break;
       } else {
-        // FIXME: leverage draft probs
-        draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
+        if (tx == 0) {
+          if (rejected_cnt < MAX_REJECTED_IDS) {
+            rejected_ids[rejected_cnt++] = draft_token_id;
+          }
+        }
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
       }
     }
     if (cur_index == -1) break;
   }
   accept_token_num[bx] = num_accepted_tokens;
+  __syncthreads();
 
   // we need a different coin for the final sampling
   coin = uniform_samples_for_final_sampling[bx];
 
-  // sample from relu(target_probs - draft_probs)
-  DType sum_relu_q_minus_p(0);
-  vec_t<DType, VEC_SIZE> q_vec, p_vec;
-  DType relu_q_minus_p[VEC_SIZE];
+  // Final sampling from masked q (target_probs), excluding tokens that were rejected in the last state.
+  DType sum_q(0);
+  vec_t<DType, VEC_SIZE> q_vec;
+  DType q_masked[VEC_SIZE];
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
-    p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_tokens - 1) {
-        // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], DType(0));
+      uint32_t idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+      DType v = q_vec[j];
+      if (idx < d && rejected_cnt > 0) {
+        // small rejected-id list membership check
+        for (int r = 0; r < rejected_cnt; ++r) {
+          if (static_cast<IdType2>(idx) == rejected_ids[r]) {
+            v = DType(0);
+            break;
+          }
+        }
+      }
+      q_masked[j] = v;
     }
-    sum_relu_q_minus_p += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                              .Sum<VEC_SIZE>(relu_q_minus_p);
+    sum_q +=
+        BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce).Sum<VEC_SIZE>(q_masked);
     __syncthreads();
   }
   if (tx == 0) {
-    temp_storage.block_aggregate.value = sum_relu_q_minus_p;
+    temp_storage.block_aggregate.value = sum_q;
   }
   // init the first rejected token to (d - 1)
   temp_storage.sampled_id = d - 1;
   __syncthreads();
-  sum_relu_q_minus_p = temp_storage.block_aggregate.value;
-  DType u = coin * sum_relu_q_minus_p;
+  sum_q = temp_storage.block_aggregate.value;
+  DType u = coin * sum_q;
 
-  DType aggregate_relu_q_minus_p(0);
+  DType aggregate_q(0);
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
-    p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_tokens - 1) {
-        // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      }
     }
 
-    vec_t<DType, VEC_SIZE> relu_q_minus_p_vec;
+    vec_t<DType, VEC_SIZE> q_masked_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
+      uint32_t idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+      DType v = q_vec[j];
+      if (idx < d && rejected_cnt > 0) {
+        for (int r = 0; r < rejected_cnt; ++r) {
+          if (static_cast<IdType2>(idx) == rejected_ids[r]) {
+            v = DType(0);
+            break;
+          }
+        }
+      }
+      q_masked_vec[j] = v;
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(
-        i, d, [&](DType x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p, &temp_storage);
-    if (aggregate_relu_q_minus_p > u) {
+        i, d, [&](DType x) { return x > 0; }, u, q_masked_vec, aggregate_q, &temp_storage);
+    if (aggregate_q > u) {
       break;
     }
   }
@@ -309,7 +337,6 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
-    DType* draft_probs,
     uint32_t batch_size,
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
@@ -336,7 +363,6 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
       &uniform_samples,
       &uniform_samples_for_final_sampling,
       &target_probs,
-      &draft_probs,
       &batch_size,
       &num_speculative_tokens,
       &num_draft_tokens,
