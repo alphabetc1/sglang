@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.mode_controller import ModeController
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -94,6 +95,10 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    ModeStatusReqInput,
+    ModeStatusReqOutput,
+    ModeSwitchReqInput,
+    ModeSwitchReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
@@ -850,116 +855,21 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
-            draft_token_to_kv_pool = None
-        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
-            draft_token_to_kv_pool = draft_runner.token_to_kv_pool
-            model_config = draft_runner.model_config
+        # Initialize ModeController for dynamic mode switching
+        if self.server_args.enable_dynamic_disaggregation:
+            self.mode_controller = ModeController(self)
         else:
-            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-            draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
-            model_config = self.draft_worker.model_config
+            self.mode_controller = None
 
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=(
-                    model_config.hidden_size
-                    if self.spec_algorithm.is_eagle()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.is_eagle()
-                    else torch.float32
-                ),
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-            )
-
-            # The decode requests polling kv cache
-            self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                tp_rank=self.tp_rank,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                tree_cache=self.tree_cache,
-            )
-
-            # The decode requests pending for pre-allocation
-            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                transfer_queue=self.disagg_decode_transfer_queue,
-                tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                dp_size=self.server_args.dp_size,
-                gpu_id=self.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                max_total_num_tokens=self.max_total_num_tokens,
-                prefill_pp_size=self.server_args.disaggregation_prefill_pp,
-                pp_rank=self.pp_rank,
-                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
-                transfer_backend=self.transfer_backend,
-            )
-
+        # Initialize mode-specific components
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self._init_decode_disaggregation()
+            if self.mode_controller:
+                self.mode_controller.mark_decode_initialized()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=(
-                    model_config.hidden_size
-                    if self.spec_algorithm.is_eagle()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.is_eagle()
-                    else torch.float32
-                ),
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-            )
-
-            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
-                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=self.disagg_metadata_buffers,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                gpu_id=self.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                gloo_group=self.attn_tp_cpu_group,
-                max_total_num_tokens=self.max_total_num_tokens,
-                decode_tp_size=self.server_args.disaggregation_decode_tp,
-                decode_dp_size=self.server_args.disaggregation_decode_dp,
-                scheduler=self,
-                pp_rank=self.pp_rank,
-                pp_size=self.pp_size,
-                transfer_backend=self.transfer_backend,
-            )
-            # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_inflight_queue: List[Req] = []
+            self._init_prefill_disaggregation()
+            if self.mode_controller:
+                self.mode_controller.mark_prefill_initialized()
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -973,6 +883,136 @@ class Scheduler(
                 pp_rank=self.pp_rank,
                 tp_group=self.tp_group,
             )
+
+    def _get_draft_model_info(self):
+        """Get draft model kv pool and config for disaggregation."""
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            return None, None
+        elif self.spec_algorithm.is_eagle() and self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+        else:
+            return (
+                self.draft_worker.model_runner.token_to_kv_pool,
+                self.draft_worker.model_config,
+            )
+
+    def _init_decode_disaggregation(self):
+        """Initialize DECODE mode components (lazy initialization supported)."""
+        # Skip if already initialized
+        if hasattr(self, "disagg_decode_prealloc_queue"):
+            logger.debug("DECODE components already initialized")
+            return
+
+        draft_token_to_kv_pool, model_config = self._get_draft_model_info()
+
+        # *2 for headroom
+        buffer_size = (self.req_to_token_pool.size) * 2
+        self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            buffer_size
+        )
+        self.disagg_metadata_buffers = MetadataBuffers(
+            buffer_size,
+            hidden_size=(
+                model_config.hidden_size
+                if model_config and self.spec_algorithm.is_eagle()
+                else 16  # minimal padding size for RDMA
+            ),
+            hidden_states_dtype=(
+                model_config.dtype
+                if model_config and self.spec_algorithm.is_eagle()
+                else torch.float32
+            ),
+            custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+        )
+
+        # The decode requests polling kv cache
+        self.disagg_decode_transfer_queue = DecodeTransferQueue(
+            gloo_group=self.attn_tp_cpu_group,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            tp_rank=self.tp_rank,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            tree_cache=self.tree_cache,
+        )
+
+        # The decode requests pending for pre-allocation
+        self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            transfer_queue=self.disagg_decode_transfer_queue,
+            tree_cache=self.tree_cache,
+            gloo_group=self.attn_tp_cpu_group,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            dp_size=self.server_args.dp_size,
+            gpu_id=self.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            max_total_num_tokens=self.max_total_num_tokens,
+            prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+            pp_rank=self.pp_rank,
+            num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+            transfer_backend=self.transfer_backend,
+        )
+        logger.info("DECODE disaggregation components initialized")
+
+    def _init_prefill_disaggregation(self):
+        """Initialize PREFILL mode components (lazy initialization supported)."""
+        # Skip if already initialized
+        if hasattr(self, "disagg_prefill_bootstrap_queue"):
+            logger.debug("PREFILL components already initialized")
+            return
+
+        draft_token_to_kv_pool, model_config = self._get_draft_model_info()
+
+        # *2 for headroom
+        buffer_size = self.max_running_requests * 2
+        self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            buffer_size
+        )
+        self.disagg_metadata_buffers = MetadataBuffers(
+            buffer_size,
+            hidden_size=(
+                model_config.hidden_size
+                if model_config and self.spec_algorithm.is_eagle()
+                else 16  # minimal padding size for RDMA
+            ),
+            hidden_states_dtype=(
+                model_config.dtype
+                if model_config and self.spec_algorithm.is_eagle()
+                else torch.float32
+            ),
+            custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+        )
+
+        self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+            token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+            metadata_buffers=self.disagg_metadata_buffers,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            gpu_id=self.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            gloo_group=self.attn_tp_cpu_group,
+            max_total_num_tokens=self.max_total_num_tokens,
+            decode_tp_size=self.server_args.disaggregation_decode_tp,
+            decode_dp_size=self.server_args.disaggregation_decode_dp,
+            scheduler=self,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            transfer_backend=self.transfer_backend,
+        )
+        # The prefill requests that are in the middle of kv sending
+        self.disagg_prefill_inflight_queue: List[Req] = []
+        logger.info("PREFILL disaggregation components initialized")
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -1065,6 +1105,8 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (ModeSwitchReqInput, self.handle_mode_switch),
+                (ModeStatusReqInput, self.handle_mode_status),
             ]
         )
 
@@ -2682,6 +2724,57 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
+
+    def handle_mode_switch(self, recv_req: ModeSwitchReqInput) -> ModeSwitchReqOutput:
+        """Handle dynamic mode switch request."""
+        if self.mode_controller is None:
+            return ModeSwitchReqOutput(
+                success=False,
+                message="Dynamic mode switching not enabled. Use --enable-dynamic-disaggregation.",
+                current_mode=self.disaggregation_mode.value,
+                transition_state="disabled",
+            )
+
+        try:
+            target_mode = DisaggregationMode(recv_req.target_mode)
+        except ValueError:
+            return ModeSwitchReqOutput(
+                success=False,
+                message=f"Invalid mode: {recv_req.target_mode}. Valid: null, prefill, decode.",
+                current_mode=self.mode_controller.current_mode.value,
+                transition_state=self.mode_controller.transition_state.value,
+            )
+
+        success, message = self.mode_controller.request_mode_switch(target_mode)
+        status = self.mode_controller.get_status()
+
+        return ModeSwitchReqOutput(
+            success=success,
+            message=message,
+            current_mode=status["current_mode"],
+            transition_state=status["transition_state"],
+        )
+
+    def handle_mode_status(self, recv_req: ModeStatusReqInput) -> ModeStatusReqOutput:
+        """Handle mode status query request."""
+        if self.mode_controller is None:
+            return ModeStatusReqOutput(
+                current_mode=self.disaggregation_mode.value,
+                transition_state="disabled",
+                dynamic_mode_enabled=False,
+            )
+
+        status = self.mode_controller.get_status()
+        return ModeStatusReqOutput(
+            current_mode=status["current_mode"],
+            transition_state=status["transition_state"],
+            target_mode=status["target_mode"],
+            last_error=status["last_error"],
+            prefill_initialized=status["prefill_initialized"],
+            decode_initialized=status["decode_initialized"],
+            bootstrap_server_running=status["bootstrap_server_running"],
+            dynamic_mode_enabled=True,
+        )
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

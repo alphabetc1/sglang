@@ -48,6 +48,10 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    ModeStatusReqInput,
+    ModeStatusReqOutput,
+    ModeSwitchReqInput,
+    ModeSwitchReqOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -216,6 +220,12 @@ class TokenizerCommunicatorMixin:
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
+        self.mode_switch_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.mode_status_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -302,11 +312,33 @@ class TokenizerCommunicatorMixin:
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
                 ),
+                (
+                    ModeSwitchReqOutput,
+                    self.mode_switch_communicator.handle_recv,
+                ),
+                (
+                    ModeStatusReqOutput,
+                    self.mode_status_communicator.handle_recv,
+                ),
             ]
         )
 
     async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+
+    async def mode_switch(
+        self: TokenizerManager, target_mode: str
+    ) -> ModeSwitchReqOutput:
+        """Switch disaggregation mode dynamically."""
+        self.auto_create_handle_loop()
+        req = ModeSwitchReqInput(target_mode=target_mode)
+        return (await self.mode_switch_communicator(req))[0]
+
+    async def get_mode_status(self: TokenizerManager) -> ModeStatusReqOutput:
+        """Get current disaggregation mode status."""
+        self.auto_create_handle_loop()
+        req = ModeStatusReqInput()
+        return (await self.mode_status_communicator(req))[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

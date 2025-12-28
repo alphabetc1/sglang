@@ -607,6 +607,8 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Enable dynamic mode switching at runtime
+    enable_dynamic_disaggregation: bool = False
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4284,6 +4286,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-disaggregation",
+            action="store_true",
+            help="Enable dynamic mode switching between null/prefill/decode at runtime via admin API.",
         )
 
         # Encode prefill disaggregation
