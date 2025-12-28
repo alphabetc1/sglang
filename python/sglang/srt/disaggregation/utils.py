@@ -234,6 +234,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    FILE = "file"
 
 
 class KVClassType(Enum):
@@ -308,6 +309,23 @@ def get_kv_class(
             KVClassType.KVARGS: KVArgs,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.FILE:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.file import (
+            FileKVBootstrapServer,
+            FileKVManager,
+            FileKVReceiver,
+            FileKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FileKVManager,
+            KVClassType.SENDER: FileKVSender,
+            KVClassType.RECEIVER: FileKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: FileKVBootstrapServer,
         }
         return class_mapping.get(class_type)
 
