@@ -717,7 +717,7 @@ def decode_video_base64(video_base64):
     from PIL import Image
 
     # Decode the base64 string
-    video_bytes = pybase64.b64decode(video_base64, validate=True)
+    video_bytes = _b64decode_normalized(video_base64)
 
     # Placeholder for the start indices of each PNG image
     img_starts = []
@@ -807,7 +807,7 @@ def load_audio(
     if isinstance(audio_file, bytes):
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
+        _, audio_file = _parse_base64_data_url(audio_file)
         audio, original_sr = sf.read(
             BytesIO(pybase64.b64decode(audio_file, validate=True))
         )
@@ -840,6 +840,35 @@ class ImageData:
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
 
 
+def _strip_base64_whitespace(data: str) -> str:
+    # Base64 payloads may contain whitespace (spaces/newlines/tabs).
+    # `pybase64.b64decode(..., validate=True)` rejects whitespace.
+    return "".join(data.split())
+
+
+def _parse_base64_data_url(data_url: str) -> tuple[Optional[str], str]:
+    """Parse `data:<mime>;base64,<payload>` and return (mime_type, base64_payload)."""
+    if not data_url.startswith("data:"):
+        raise ValueError(f"Invalid data URL: {data_url!r}")
+
+    try:
+        header, payload = data_url.split(",", 1)
+    except ValueError as e:
+        raise ValueError("Invalid data URL: missing ',' separator") from e
+
+    header = header[5:]  # strip "data:"
+    parts = header.split(";") if header else []
+    mime_type = (parts[0] if parts else "") or None
+    if "base64" not in parts[1:]:
+        raise ValueError("data URL without ';base64' is not supported")
+
+    return mime_type, _strip_base64_whitespace(payload)
+
+
+def _b64decode_normalized(data: str) -> bytes:
+    return pybase64.b64decode(_strip_base64_whitespace(data), validate=True)
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
@@ -864,10 +893,12 @@ def load_image(
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        mime_type, b64_payload = _parse_base64_data_url(image_file)
+        if mime_type and not mime_type.lower().startswith("image/"):
+            raise ValueError(f"{mime_type} not supported")
+        image = Image.open(BytesIO(pybase64.b64decode(b64_payload, validate=True)))
     elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = Image.open(BytesIO(_b64decode_normalized(image_file)))
     else:
         raise ValueError(f"Invalid image: {image_file}")
 
@@ -885,10 +916,12 @@ def get_image_bytes(image_file: Union[str, bytes]):
         with open(image_file, "rb") as f:
             return f.read()
     elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        return pybase64.b64decode(image_file, validate=True)
+        mime_type, b64_payload = _parse_base64_data_url(image_file)
+        if mime_type and not mime_type.lower().startswith("image/"):
+            raise ValueError(f"{mime_type} not supported")
+        return pybase64.b64decode(b64_payload, validate=True)
     elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
+        return _b64decode_normalized(image_file)
     else:
         raise NotImplementedError(f"Invalid image: {image_file}")
 
@@ -924,7 +957,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
             elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
+                _, encoded = _parse_base64_data_url(video_file)
                 video_bytes = pybase64.b64decode(encoded, validate=True)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
@@ -934,7 +967,7 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
+                video_bytes = _b64decode_normalized(video_file)
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 tmp_file.write(video_bytes)
                 tmp_file.close()

@@ -125,8 +125,23 @@ class OpenAIServingBase(ABC):
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
         except ValueError as e:
+            msg = str(e)
+            # For certain client-side multimodal input issues, return OpenAI-style nested error.
+            # Example: {"error":{"message":"base64 'application/pdf' not supported.","type":"invalid_request_error","param":null,"code":null}}
+            if msg.startswith("base64 '") and msg.endswith("not supported."):
+                return ORJSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": msg,
+                            "type": "invalid_request_error",
+                            "param": None,
+                            "code": None,
+                        }
+                    },
+                )
             return self.create_error_response(
-                message=str(e),
+                message=msg,
                 err_type="BadRequest",
                 status_code=400,
             )
@@ -245,6 +260,19 @@ class OpenAIServingBase(ABC):
         status_code: int = 400,
     ) -> str:
         """Create a streaming error response"""
+        # Match OpenAI nested error envelope for certain client-side input issues.
+        if message.startswith("base64 '") and message.endswith("not supported."):
+            return json.dumps(
+                {
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": None,
+                    }
+                }
+            )
+
         error = ErrorResponse(
             object="error",
             message=message,

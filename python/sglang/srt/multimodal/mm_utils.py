@@ -260,6 +260,8 @@ def process_anyres_image(image, processor, grid_pinpoints):
 
 
 def load_image_from_base64(image):
+    # Base64 may contain whitespace (spaces/newlines/tabs). Normalize before decoding.
+    image = "".join(image.split())
     return Image.open(BytesIO(pybase64.b64decode(image, validate=True)))
 
 

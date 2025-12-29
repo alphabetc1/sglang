@@ -616,11 +616,43 @@ class BaseMultimodalProcessor(ABC):
         images, videos, audios = [], [], []
         new_text_parts = []
         has_precomputed_input = False
+
+        def _is_unsupported_mm_error(exc: BaseException) -> bool:
+            # Walk exception chain to detect explicit "not supported" errors (e.g. application/pdf).
+            cur = exc
+            seen = set()
+            while cur is not None and id(cur) not in seen:
+                seen.add(id(cur))
+                if "not supported" in str(cur):
+                    return True
+                cur = cur.__cause__ or cur.__context__
+            return False
+
+        def _unsupported_mm_client_message(exc: BaseException) -> str:
+            # Prefer extracting a mime-like token from the exception chain string.
+            s = str(exc)
+            # Common patterns we generate/see:
+            # - "application/pdf not supported"
+            # - "Error while loading data ...: application/pdf not supported"
+            m = re.search(r"([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)\s+not supported", s)
+            if m:
+                return f"base64 '{m.group(1)}' not supported."
+            return "base64 input not supported."
+
         for text_part in text_parts:
+            modality = None
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    result = next(futures_iter).result()
+                    future = next(futures_iter)
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        # For explicitly unsupported multimodal inputs (e.g., data:application/pdf),
+                        # treat as client error (400) and return to the caller.
+                        if _is_unsupported_mm_error(e):
+                            raise ValueError(_unsupported_mm_client_message(e)) from e
+                        raise
 
                     is_precomputed, new_imgs, new_vids, new_auds = (
                         self._process_loaded_mm_data(modality, raw_data, result)
@@ -669,6 +701,8 @@ class BaseMultimodalProcessor(ABC):
                     f"An exception occurred while loading multimodal data: {e}"
                 )
             except Exception as e:
+                if _is_unsupported_mm_error(e):
+                    raise ValueError(_unsupported_mm_client_message(e)) from e
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
