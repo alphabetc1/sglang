@@ -48,7 +48,10 @@ class PDDisaggregationServerBase(CustomTestCase):
                 "--disaggregation-ib-device",
                 envs.SGLANG_TEST_PD_DISAGG_DEVICES.get(),
             ]
-            if cls.rdma_devices[1] is None:
+            # File backend does not require RDMA.
+            if cls.transfer_backend[1] == "file":
+                cls.rdma_devices = []
+            elif cls.rdma_devices[1] is None:
                 cls.rdma_devices = []
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)

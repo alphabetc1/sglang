@@ -117,7 +117,11 @@ class PrefillBootstrapQueue:
             )
 
     def _init_kv_manager(self) -> BaseKVManager:
-        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args_class = get_kv_class(
+            self.transfer_backend,
+            KVClassType.KVARGS,
+            server_args=self.scheduler.server_args,
+        )
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
@@ -152,6 +156,37 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
+        # Some disaggregation backends (e.g., file, store-based backends) need direct object access
+        # for CPU staging and auxiliary buffers.
+        #
+        # For dynamic backends, we enable this for PDKP store-style integration by convention:
+        # extra_config.backend_name == "pdkp".
+        enable_direct_obj_access = (
+            self.scheduler.server_args.disaggregation_transfer_backend == "file"
+        )
+        if (
+            not enable_direct_obj_access
+            and self.scheduler.server_args.disaggregation_transfer_backend == "dynamic"
+            and getattr(
+                self.scheduler.server_args, "disaggregation_transfer_backend_extra_config", None
+            )
+        ):
+            try:
+                import json
+
+                extra = json.loads(
+                    self.scheduler.server_args.disaggregation_transfer_backend_extra_config
+                )
+                if isinstance(extra, dict) and extra.get("backend_name") == "pdkp":
+                    enable_direct_obj_access = True
+            except Exception:
+                pass
+
+        if enable_direct_obj_access:
+            kv_args._file_kv_pool = self.token_to_kv_pool
+            kv_args._file_draft_kv_pool = self.draft_token_to_kv_pool
+            kv_args._file_metadata_buffers = self.metadata_buffers
+
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
                 self.token_to_kv_pool.get_state_buf_infos()
@@ -175,7 +210,9 @@ class PrefillBootstrapQueue:
             kv_args.state_type = "none"
 
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
-            self.transfer_backend, KVClassType.MANAGER
+            self.transfer_backend,
+            KVClassType.MANAGER,
+            server_args=self.scheduler.server_args,
         )
         kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
@@ -190,9 +227,17 @@ class PrefillBootstrapQueue:
             return
 
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
-            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
+            kv_sender_class = get_kv_class(
+                TransferBackend.FAKE,
+                KVClassType.SENDER,
+                server_args=self.scheduler.server_args,
+            )
         else:
-            kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+            kv_sender_class = get_kv_class(
+                self.transfer_backend,
+                KVClassType.SENDER,
+                server_args=self.scheduler.server_args,
+            )
 
         dest_tp_ranks = [self.tp_rank]
 

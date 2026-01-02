@@ -23,7 +23,9 @@ def start_disagg_service(
     if disagg_mode == DisaggregationMode.PREFILL:
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class: Type[BaseKVBootstrapServer] = get_kv_class(
-            transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            transfer_backend,
+            KVClassType.BOOTSTRAP_SERVER,
+            server_args=server_args,
         )
         bootstrap_server: BaseKVBootstrapServer = kv_bootstrap_server_class(
             host=server_args.host,

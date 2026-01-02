@@ -15,7 +15,121 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
 
-Currently, we support Mooncake and NIXL as the transfer engine.
+Currently, we support Mooncake and NIXL as high-performance transfer engines. We also provide:
+
+- **`file`**: a shared-filesystem backend for correctness testing and debugging.
+- **`dynamic`**: a plugin mechanism to load a custom transfer backend provider at runtime.
+
+Details on `file` and `dynamic` are included below.
+
+## File Backend (Shared Filesystem)
+
+### What it is (and when to use it)
+
+The `file` backend transfers KV/aux/state by writing request-scoped `.pt` files into a **shared directory** that is visible to both prefill and decode machines/processes.
+
+Use it when you need:
+
+- A **minimal-dependency** PD-disaggregation setup (no RDMA / no special transport libraries).
+- A **debuggable and reproducible** data path (you can inspect intermediate artifacts on disk).
+- A correctness baseline to distinguish “PD logic bug” vs. “transport/backend bug”.
+
+### Requirements
+
+- A **shared filesystem** between prefill and decode (e.g., local shared path, NFS, parallel FS).
+- Sufficient disk throughput and capacity for temporary KV/aux/state artifacts.
+
+### How it works (high level)
+
+- Decode pre-allocates destination slots and sends a small “transfer info” handshake (destination indices, aux slot, optional state indices).
+- Prefill copies KV/aux/state to CPU and serializes payloads to:
+  - `room_<room>/pp_<pp_rank>_chunk_<chunk_id>.pt`
+  - `room_<room>/pp_<pp_rank>.done` (completion marker)
+- Decode waits for `.done` markers, then loads chunks in order and writes data into its local pools.
+
+### Usage
+
+```bash
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend file \
+  --port 30000
+
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend file \
+  --port 30001
+```
+
+### Environment variables
+
+- **`SGLANG_DISAGGREGATION_FILE_BACKEND_STORAGE_DIR`**: base directory for storing file-backend artifacts.
+  - Default: `/tmp/sglang_disaggregation_file_backend`
+- **`SGLANG_DISAGGREGATION_FILE_WAITING_TIMEOUT`**: timeout (seconds) for decode-side waiting.
+  - Default: `60`
+
+### Limitations / notes
+
+- **Performance**: this backend is not intended for production throughput/latency.
+- **Shared filesystem required**: prefill and decode must see the same storage path.
+- **TP sizing constraints**: for non-MLA models, the current implementation requires equal TP sizes (no head slicing).
+
+## Dynamic Backend (Plugin Provider)
+
+### What it is
+
+The `dynamic` backend is a **runtime plugin** that loads a user-provided “backend provider” class via Python import, and asks it to resolve backend classes (KV manager/sender/receiver/bootstrap server) for PD disaggregation.
+
+This is useful when:
+
+- You want to integrate an internal transport library without upstreaming it.
+- You want to experiment with new transfer designs while reusing SGLang’s PD control flow.
+
+### Configuration
+
+Enable the backend with:
+
+- `--disaggregation-transfer-backend dynamic`
+- `--disaggregation-transfer-backend-extra-config <JSON>`
+
+The JSON must contain:
+
+- `backend_name`: free-form name (for logs)
+- `module_path`: Python import path
+- `class_name`: provider class name
+
+Example:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend dynamic \
+  --disaggregation-transfer-backend-extra-config '{
+    "backend_name": "my_backend",
+    "module_path": "my_pkg.my_disagg_backend",
+    "class_name": "MyDisaggBackendProvider"
+  }'
+```
+
+### Provider interface
+
+Your provider class must implement:
+
+- `get_kv_class(class_type: KVClassType) -> Optional[type]`
+
+Where `KVClassType` includes:
+
+- `KVARGS`, `MANAGER`, `SENDER`, `RECEIVER`, `BOOTSTRAP_SERVER`
+
+Your provider can map these to existing built-in classes or your own implementations.
+
+### Notes
+
+- The provider is instantiated in-process and cached by `(module_path, class_name)`.
+- Any dependencies required by your backend must be available in the serving environment.
 
 ## Profiling in PD Disaggregation Mode
 

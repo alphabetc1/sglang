@@ -248,7 +248,11 @@ class DecodePreallocQueue:
             )
 
     def _init_kv_manager(self) -> BaseKVManager:
-        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
+        kv_args_class = get_kv_class(
+            self.transfer_backend,
+            KVClassType.KVARGS,
+            server_args=self.scheduler.server_args,
+        )
         kv_args = kv_args_class()
 
         attn_tp_size = get_attention_tp_size()
@@ -303,8 +307,42 @@ class DecodePreallocQueue:
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
+
+        # Some disaggregation backends (e.g., file, store-based backends) need direct object access
+        # for CPU staging and auxiliary buffers.
+        #
+        # For dynamic backends, we enable this for PDKP store-style integration by convention:
+        # extra_config.backend_name == "pdkp".
+        enable_direct_obj_access = (
+            self.scheduler.server_args.disaggregation_transfer_backend == "file"
+        )
+        if (
+            not enable_direct_obj_access
+            and self.scheduler.server_args.disaggregation_transfer_backend == "dynamic"
+            and getattr(
+                self.scheduler.server_args, "disaggregation_transfer_backend_extra_config", None
+            )
+        ):
+            try:
+                import json
+
+                extra = json.loads(
+                    self.scheduler.server_args.disaggregation_transfer_backend_extra_config
+                )
+                if isinstance(extra, dict) and extra.get("backend_name") == "pdkp":
+                    enable_direct_obj_access = True
+            except Exception:
+                pass
+
+        if enable_direct_obj_access:
+            kv_args._file_kv_pool = self.token_to_kv_pool
+            kv_args._file_draft_kv_pool = self.draft_token_to_kv_pool
+            kv_args._file_metadata_buffers = self.metadata_buffers
+
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
-            self.transfer_backend, KVClassType.MANAGER
+            self.transfer_backend,
+            KVClassType.MANAGER,
+            server_args=self.scheduler.server_args,
         )
         kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
@@ -329,11 +367,15 @@ class DecodePreallocQueue:
                 and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
             ):
                 kv_receiver_class = get_kv_class(
-                    TransferBackend.FAKE, KVClassType.RECEIVER
+                    TransferBackend.FAKE,
+                    KVClassType.RECEIVER,
+                    server_args=self.scheduler.server_args,
                 )
             else:
                 kv_receiver_class = get_kv_class(
-                    self.transfer_backend, KVClassType.RECEIVER
+                    self.transfer_backend,
+                    KVClassType.RECEIVER,
+                    server_args=self.scheduler.server_args,
                 )
 
             kv_receiver = kv_receiver_class(

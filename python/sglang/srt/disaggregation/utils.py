@@ -15,6 +15,7 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 #########################
 # Constants & Enums
@@ -234,6 +235,8 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    FILE = "file"
+    DYNAMIC = "dynamic"
 
 
 class KVClassType(Enum):
@@ -245,7 +248,9 @@ class KVClassType(Enum):
 
 
 def get_kv_class(
-    transfer_backend: TransferBackend, class_type: KVClassType
+    transfer_backend: TransferBackend,
+    class_type: KVClassType,
+    server_args: Optional[ServerArgs] = None,
 ) -> Optional[Type]:
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
@@ -300,6 +305,31 @@ def get_kv_class(
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.FILE:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.file import (
+            FileKVBootstrapServer,
+            FileKVManager,
+            FileKVReceiver,
+            FileKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: FileKVManager,
+            KVClassType.SENDER: FileKVSender,
+            KVClassType.RECEIVER: FileKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: FileKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.DYNAMIC:
+        if server_args is None:
+            raise ValueError(
+                "Dynamic transfer backend requires server_args to resolve extra config."
+            )
+        from sglang.srt.disaggregation.backend_factory import DisaggBackendFactory
+
+        return DisaggBackendFactory.get_kv_class(server_args, class_type)
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender

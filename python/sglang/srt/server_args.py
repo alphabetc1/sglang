@@ -140,7 +140,14 @@ ATTENTION_BACKEND_CHOICES = [
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+DISAGG_TRANSFER_BACKEND_CHOICES = [
+    "mooncake",
+    "nixl",
+    "ascend",
+    "fake",
+    "file",
+    "dynamic",
+]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
@@ -608,6 +615,9 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # Extra config for disaggregation transfer backend (e.g., for dynamic backend).
+    # JSON string; parsed by the corresponding backend/loader.
+    disaggregation_transfer_backend_extra_config: Optional[str] = None
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4296,6 +4306,13 @@ class ServerArgs:
             default=ServerArgs.disaggregation_transfer_backend,
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend-extra-config",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend_extra_config,
+            help="A dictionary in JSON string format containing extra configuration for the disaggregation transfer backend. "
+            "For dynamic backend, specify: backend_name (custom name), module_path (Python module path), class_name (backend provider class name).",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",
