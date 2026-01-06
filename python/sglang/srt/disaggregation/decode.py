@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     kv_to_page_indices,
     poll_and_all_reduce,
     prepare_abort,
+    should_enable_direct_obj_access,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
@@ -310,31 +311,7 @@ class DecodePreallocQueue:
 
         # Some disaggregation backends (e.g., file, store-based backends) need direct object access
         # for CPU staging and auxiliary buffers.
-        #
-        # For dynamic backends, we enable this for PDKP store-style integration by convention:
-        # extra_config.backend_name == "pdkp".
-        enable_direct_obj_access = (
-            self.scheduler.server_args.disaggregation_transfer_backend == "file"
-        )
-        if (
-            not enable_direct_obj_access
-            and self.scheduler.server_args.disaggregation_transfer_backend == "dynamic"
-            and getattr(
-                self.scheduler.server_args, "disaggregation_transfer_backend_extra_config", None
-            )
-        ):
-            try:
-                import json
-
-                extra = json.loads(
-                    self.scheduler.server_args.disaggregation_transfer_backend_extra_config
-                )
-                if isinstance(extra, dict) and extra.get("backend_name") == "pdkp":
-                    enable_direct_obj_access = True
-            except Exception:
-                pass
-
-        if enable_direct_obj_access:
+        if should_enable_direct_obj_access(self.scheduler.server_args):
             kv_args._file_kv_pool = self.token_to_kv_pool
             kv_args._file_draft_kv_pool = self.draft_token_to_kv_pool
             kv_args._file_metadata_buffers = self.metadata_buffers

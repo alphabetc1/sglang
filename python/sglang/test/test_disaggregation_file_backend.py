@@ -12,9 +12,9 @@ try:
     import torch
 
     from sglang.srt.disaggregation.file.conn import (
-        _atomic_torch_save,
         FileKVReceiver,
         TransferInfo,
+        _atomic_torch_save,
     )
 except ModuleNotFoundError as e:
     # Importing `sglang` transitively imports numpy/torch in some environments.
@@ -66,10 +66,18 @@ class _DummyMetadataBuffers:
     def __init__(self, buf_size: int, seq_len: int = 8, topk: int = 4, hidden: int = 6):
         self.output_ids = torch.zeros((buf_size, seq_len), dtype=torch.int64)
         self.cached_tokens = torch.zeros((buf_size, seq_len), dtype=torch.int64)
-        self.output_token_logprobs_val = torch.zeros((buf_size, seq_len), dtype=torch.float32)
-        self.output_token_logprobs_idx = torch.zeros((buf_size, seq_len), dtype=torch.int64)
-        self.output_top_logprobs_val = torch.zeros((buf_size, seq_len, topk), dtype=torch.float32)
-        self.output_top_logprobs_idx = torch.zeros((buf_size, seq_len, topk), dtype=torch.int64)
+        self.output_token_logprobs_val = torch.zeros(
+            (buf_size, seq_len), dtype=torch.float32
+        )
+        self.output_token_logprobs_idx = torch.zeros(
+            (buf_size, seq_len), dtype=torch.int64
+        )
+        self.output_top_logprobs_val = torch.zeros(
+            (buf_size, seq_len, topk), dtype=torch.float32
+        )
+        self.output_top_logprobs_idx = torch.zeros(
+            (buf_size, seq_len, topk), dtype=torch.int64
+        )
         self.output_topk_p = torch.zeros((buf_size, topk), dtype=torch.float32)
         self.output_topk_index = torch.zeros((buf_size, topk), dtype=torch.int64)
         self.output_hidden_states = torch.zeros((buf_size, hidden), dtype=torch.float32)
@@ -78,7 +86,12 @@ class _DummyMetadataBuffers:
 class _DummyFileKVManager:
     """A minimal subset of FileKVManager used by FileKVReceiver._load_and_apply()."""
 
-    def __init__(self, base_dir: str, kv_pool: _DummyKVPool, metadata_buffers: _DummyMetadataBuffers):
+    def __init__(
+        self,
+        base_dir: str,
+        kv_pool: _DummyKVPool,
+        metadata_buffers: _DummyMetadataBuffers,
+    ):
         self.base_dir = base_dir
         self.pp_rank = 0
         self.kv_args = SimpleNamespace(
@@ -143,14 +156,18 @@ class TestDisaggregationFileBackend(CustomTestCase):
             dst_aux_index = 1
             aux_tensors = (
                 torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int64),  # out_ids
-                torch.tensor([8, 7, 6, 5, 4, 3, 2, 1], dtype=torch.int64),  # cached_tokens
+                torch.tensor(
+                    [8, 7, 6, 5, 4, 3, 2, 1], dtype=torch.int64
+                ),  # cached_tokens
                 torch.zeros((8,), dtype=torch.float32),  # logp_val
                 torch.zeros((8,), dtype=torch.int64),  # logp_idx
                 torch.zeros((8, 4), dtype=torch.float32),  # top_logp_val
                 torch.zeros((8, 4), dtype=torch.int64),  # top_logp_idx
                 torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32),  # topk_p
                 torch.tensor([10, 20, 30, 40], dtype=torch.int64),  # topk_index
-                torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32),  # hidden_states
+                torch.tensor(
+                    [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], dtype=torch.float32
+                ),  # hidden_states
             )
 
             chunk_path = os.path.join(room_dir, "pp_0_chunk_0.pt")
@@ -171,7 +188,9 @@ class TestDisaggregationFileBackend(CustomTestCase):
                 chunk_path,
             )
             done_path = kv_mgr._done_path(room, 0)
-            _atomic_torch_save({"room": room, "pp_rank": 0, "last_chunk_id": 0}, done_path)
+            _atomic_torch_save(
+                {"room": room, "pp_rank": 0, "last_chunk_id": 0}, done_path
+            )
 
             # Construct a FileKVReceiver without running the full network bootstrap path.
             recv = FileKVReceiver.__new__(FileKVReceiver)
@@ -190,11 +209,29 @@ class TestDisaggregationFileBackend(CustomTestCase):
             self.assertEqual(kv_pool.swa_kv_pool.data[7], 999)
 
             # Aux tensors copied into the dst aux slot.
-            self.assertTrue(torch.equal(metadata_buffers.output_ids[dst_aux_index], aux_tensors[0]))
-            self.assertTrue(torch.equal(metadata_buffers.cached_tokens[dst_aux_index], aux_tensors[1]))
-            self.assertTrue(torch.equal(metadata_buffers.output_topk_p[dst_aux_index], aux_tensors[6]))
-            self.assertTrue(torch.equal(metadata_buffers.output_topk_index[dst_aux_index], aux_tensors[7]))
-            self.assertTrue(torch.equal(metadata_buffers.output_hidden_states[dst_aux_index], aux_tensors[8]))
+            self.assertTrue(
+                torch.equal(metadata_buffers.output_ids[dst_aux_index], aux_tensors[0])
+            )
+            self.assertTrue(
+                torch.equal(
+                    metadata_buffers.cached_tokens[dst_aux_index], aux_tensors[1]
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    metadata_buffers.output_topk_p[dst_aux_index], aux_tensors[6]
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    metadata_buffers.output_topk_index[dst_aux_index], aux_tensors[7]
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    metadata_buffers.output_hidden_states[dst_aux_index], aux_tensors[8]
+                )
+            )
 
             # Cleanup after successful load.
             self.assertFalse(os.path.exists(chunk_path))
@@ -219,6 +256,3 @@ class TestDisaggregationFileBackend(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

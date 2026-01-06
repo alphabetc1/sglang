@@ -388,3 +388,22 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.input_top_logprobs_idx = []
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
+
+
+def should_enable_direct_obj_access(server_args: ServerArgs) -> bool:
+    if server_args.disaggregation_transfer_backend == "file":
+        return True
+
+    if server_args.disaggregation_transfer_backend != "dynamic":
+        return False
+
+    try:
+        import json
+
+        extra = json.loads(server_args.disaggregation_transfer_backend_extra_config)
+        if isinstance(extra, dict) and extra.get("direct_obj_access") == True:
+            return True
+    except Exception:
+        pass
+
+    return False
