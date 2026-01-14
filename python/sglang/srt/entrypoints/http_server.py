@@ -708,6 +708,44 @@ async def flush_cache():
     )
 
 
+@app.post("/admin/mode_switch")
+async def mode_switch(target_mode: str):
+    """Switch disaggregation mode dynamically.
+
+    Requires --enable-dynamic-disaggregation flag.
+    Valid modes: null, prefill, decode
+    """
+    ret = await _global_state.tokenizer_manager.mode_switch(target_mode)
+    return ORJSONResponse(
+        content={
+            "success": ret.success,
+            "message": ret.message,
+            "current_mode": ret.current_mode,
+            "transition_state": ret.transition_state,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.get("/admin/mode_status")
+async def mode_status():
+    """Get current disaggregation mode status."""
+    ret = await _global_state.tokenizer_manager.get_mode_status()
+    return ORJSONResponse(
+        content={
+            "current_mode": ret.current_mode,
+            "transition_state": ret.transition_state,
+            "target_mode": ret.target_mode,
+            "last_error": ret.last_error,
+            "prefill_initialized": ret.prefill_initialized,
+            "decode_initialized": ret.decode_initialized,
+            "bootstrap_server_running": ret.bootstrap_server_running,
+            "dynamic_mode_enabled": ret.dynamic_mode_enabled,
+        },
+        status_code=200,
+    )
+
+
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 async def clear_hicache_storage_backend():
     """Clear the hierarchical cache storage backend."""

@@ -1678,6 +1678,45 @@ class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
 
 
+# Dynamic disaggregation mode switch
+@dataclass
+class ModeSwitchReqInput(BaseReq):
+    """Request to switch disaggregation mode dynamically."""
+
+    target_mode: str  # "null", "prefill", or "decode"
+
+
+@dataclass
+class ModeSwitchReqOutput(BaseReq):
+    """Response for mode switch request."""
+
+    success: bool
+    message: str
+    current_mode: Optional[str] = None
+    transition_state: Optional[str] = None
+
+
+@dataclass
+class ModeStatusReqInput(BaseReq):
+    """Request to get current mode status."""
+
+    pass
+
+
+@dataclass
+class ModeStatusReqOutput(BaseReq):
+    """Response for mode status request."""
+
+    current_mode: str
+    transition_state: str
+    target_mode: Optional[str] = None
+    last_error: Optional[str] = None
+    prefill_initialized: bool = False
+    decode_initialized: bool = False
+    bootstrap_server_running: bool = False
+    dynamic_mode_enabled: bool = False
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect
