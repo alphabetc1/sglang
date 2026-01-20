@@ -168,6 +168,10 @@ Data parallelism attention is not recommended for low-latency, small-batch use c
 Before serving the DeepSeek model, precompile the DeepGEMM kernels to improve first-run performance. The precompilation process typically takes around 10 minutes to complete.
 ```
 
+```{tip}
+To speed up the DeepGEMM warmup phase, you can increase the number of parallel compilation workers by setting `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS`. For example, `SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS=8` can reduce warmup time from ~8 minutes to ~2 minutes. The default value is 4.
+```
+
 ```bash
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
 ```

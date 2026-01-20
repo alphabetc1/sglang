@@ -1,5 +1,6 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
@@ -165,9 +166,28 @@ def _compile_deep_gemm_one_type_all(
 
         old_compile_mode = deep_gemm.get_compile_mode()
         deep_gemm.set_compile_mode(1)
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
+
+        num_workers = envs.SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS.get()
+        if num_workers > 1:
+            # Multi-threaded warmup for faster JIT compilation
+            logger.info(
+                f"DeepGEMM warmup using {num_workers} threads "
+                f"(set SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS to adjust)"
+            )
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                futures = [pool.submit(executor.execute, m=m) for m in m_list]
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(m_list),
+                    desc="DeepGEMM warmup",
+                ):
+                    # Raise exception if any thread failed
+                    future.result()
+        else:
+            # Single-threaded warmup (original behavior)
+            for m in tqdm(m_list, desc="DeepGEMM warmup"):
+                executor.execute(m=m)
+
         deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
