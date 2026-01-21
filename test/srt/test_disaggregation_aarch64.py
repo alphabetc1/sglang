@@ -25,9 +25,9 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
         cls.start_prefill()
         cls.start_decode()
 
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        # Block until both (with process check for early exit detection)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 

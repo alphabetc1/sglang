@@ -40,10 +40,10 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
         prefill_thread.join()
         decode_thread.join()
 
-        # Wait for all servers to be ready
-        cls.wait_server_ready(cls.encode_url + "/health")
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        # Wait for all servers to be ready (with process check for early exit detection)
+        cls.wait_server_ready(cls.encode_url + "/health", process=cls.process_encode)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -246,10 +246,10 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
         prefill_thread.join()
         decode_thread.join()
 
-        cls.wait_server_ready(cls.encode_url1 + "/health")
-        cls.wait_server_ready(cls.encode_url2 + "/health")
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.encode_url1 + "/health", process=cls.process_encode1)
+        cls.wait_server_ready(cls.encode_url2 + "/health", process=cls.process_encode2)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 

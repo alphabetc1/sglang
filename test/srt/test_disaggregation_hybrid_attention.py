@@ -23,9 +23,9 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         cls.start_prefill()
         cls.start_decode()
 
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        # Block until both (with process check for early exit detection)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -91,9 +91,9 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
         cls.start_prefill()
         cls.start_decode()
 
-        # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        # Block until both (with process check for early exit detection)
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -104,7 +104,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            "4",
+            "2",
             "--mamba-scheduler-strategy",
             "extra_buffer",
         ]
@@ -123,9 +123,9 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
             "--disaggregation-mode",
             "decode",
             "--tp",
-            "4",
+            "2",
             "--base-gpu-id",
-            "4",
+            "2",
             "--mamba-scheduler-strategy",
             "extra_buffer",
         ]

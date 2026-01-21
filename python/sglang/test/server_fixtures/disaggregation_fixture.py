@@ -72,12 +72,30 @@ class PDDisaggregationServerBase(CustomTestCase):
         ]
         print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
+    def wait_server_ready(
+        cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, process=None
+    ):
+        """Wait for server to be ready.
+
+        Args:
+            url: Health check URL
+            timeout: Maximum wait time in seconds
+            process: Optional subprocess.Popen object. If provided, the method
+                will check if the process is still alive and raise an error
+                early if the process has terminated.
+        """
         start_time = time.perf_counter()
         while True:
+            # Check if the process has terminated early
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    f"Server process terminated unexpectedly with "
+                    f"return code {process.returncode} while waiting for {url}"
+                )
+
             try:
                 response = requests.get(url)
                 if response.status_code == 200:
