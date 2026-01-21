@@ -2,7 +2,6 @@ import os
 import threading
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -124,18 +123,10 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        """Clean up all processes"""
-        for process in [
-            cls.process_lb,
-            cls.process_decode,
-            cls.process_prefill,
-            cls.process_encode,
-        ]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process: {e}")
+        """Clean up all processes via base class addClassCleanup."""
+        # Base class _cleanup_processes will automatically clean up all process_* attributes
+        # (process_lb, process_decode, process_prefill, process_encode)
+        pass
 
     def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
         """
@@ -339,19 +330,10 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
-        """Clean up all processes"""
-        for process in [
-            cls.process_lb,
-            cls.process_decode,
-            cls.process_prefill,
-            cls.process_encode1,
-            cls.process_encode2,
-        ]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process: {e}")
+        """Clean up all processes via base class addClassCleanup."""
+        # Base class _cleanup_processes will automatically clean up all process_* attributes
+        # (process_lb, process_decode, process_prefill, process_encode1, process_encode2)
+        pass
 
     def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
         """

@@ -19,6 +19,8 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
         super().setUpClass()
         os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
         os.environ["MC_FORCE_MNNVL"] = "true"
+        # Register cleanup for env vars to ensure they're cleaned even if setUpClass fails
+        cls.addClassCleanup(cls._cleanup_env_vars)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -32,10 +34,10 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
         cls.launch_lb()
 
     @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
-        os.environ.pop("MC_FORCE_MNNVL")
-        super().tearDownClass()
+    def _cleanup_env_vars(cls):
+        """Clean up environment variables. Called by addClassCleanup."""
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
+        os.environ.pop("MC_FORCE_MNNVL", None)
 
     @classmethod
     def start_prefill(cls):

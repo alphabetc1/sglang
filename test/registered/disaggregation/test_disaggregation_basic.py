@@ -196,6 +196,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         super().setUpClass()
         # set DISAGGREGATION_TEST_FAILURE_PROB to simulate failure
         os.environ["DISAGGREGATION_TEST_FAILURE_PROB"] = "0.05"
+        # Register cleanup for env vars to ensure they're cleaned even if setUpClass fails
+        cls.addClassCleanup(cls._cleanup_env_vars)
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
@@ -210,9 +212,9 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         cls.launch_lb()
 
     @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB")
-        super().tearDownClass()
+    def _cleanup_env_vars(cls):
+        """Clean up environment variables. Called by addClassCleanup."""
+        os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB", None)
 
     @classmethod
     def start_prefill(cls):
@@ -368,6 +370,8 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         os.environ["SGLANG_TEST_RETRACT"] = "true"
+        # Register cleanup for env vars to ensure they're cleaned even if setUpClass fails
+        cls.addClassCleanup(cls._cleanup_env_vars)
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
@@ -381,9 +385,9 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         cls.launch_lb()
 
     @classmethod
-    def tearDownClass(cls):
-        os.environ.pop("SGLANG_TEST_RETRACT")
-        super().tearDownClass()
+    def _cleanup_env_vars(cls):
+        """Clean up environment variables. Called by addClassCleanup."""
+        os.environ.pop("SGLANG_TEST_RETRACT", None)
 
     @classmethod
     def start_prefill(cls):

@@ -1,6 +1,7 @@
 import logging
 import os
 import shlex
+import subprocess
 import time
 import warnings
 from urllib.parse import urlparse
@@ -35,6 +36,9 @@ class PDDisaggregationServerBase(CustomTestCase):
         print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
 
+        # Register cleanup to ensure processes are killed even if setUpClass fails
+        cls.addClassCleanup(cls._cleanup_processes)
+
         # config transfer backend and rdma devices
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
@@ -52,6 +56,30 @@ class PDDisaggregationServerBase(CustomTestCase):
                 cls.rdma_devices = []
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)
+
+    @classmethod
+    def _cleanup_processes(cls):
+        """Clean up all server processes. Called by addClassCleanup."""
+        # Collect all process attributes dynamically to handle subclasses
+        # that may have additional processes (e.g., process_encode)
+        process_attrs = [
+            attr
+            for attr in dir(cls)
+            if attr.startswith("process_") and not callable(getattr(cls, attr, None))
+        ]
+
+        for attr in process_attrs:
+            process = getattr(cls, attr, None)
+            # Verify it's actually a Popen object (not some other process_* attribute)
+            if process is not None and isinstance(process, subprocess.Popen):
+                try:
+                    print(f"Cleaning up {attr} (pid={process.pid})")
+                    kill_process_tree(process.pid)
+                except Exception as e:
+                    print(f"Error killing {attr} (pid={process.pid}): {e}")
+
+        # Wait for processes to fully terminate
+        time.sleep(5)
 
     @classmethod
     def launch_lb(cls):
@@ -110,15 +138,11 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
-            if process:
-                try:
-                    kill_process_tree(process.pid)
-                except Exception as e:
-                    print(f"Error killing process {process.pid}: {e}")
-
-        # wait for 5 seconds
-        time.sleep(5)
+        # Note: _cleanup_processes is called via addClassCleanup,
+        # so we don't need to call it here again.
+        # This method is kept for subclasses that may override it
+        # to do additional cleanup (e.g., environment variables).
+        pass
 
 
 def get_rdma_devices_args():
