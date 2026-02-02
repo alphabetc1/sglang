@@ -977,8 +977,9 @@ class HiRadixCache(RadixCache):
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
+            group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
             torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                qsizes, op=torch.distributed.ReduceOp.MIN, group=group
             )
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
@@ -1021,6 +1022,9 @@ class HiRadixCache(RadixCache):
 
         operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
+            # Use a dedicated group for storage ops to avoid interfering with
+            # scheduler TP communication collectives.
+            group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
             states = torch.tensor(
                 [1 - int(can_terminate), int(operation_terminated)],
                 dtype=torch.int,
@@ -1028,7 +1032,7 @@ class HiRadixCache(RadixCache):
             torch.distributed.all_reduce(
                 states,
                 op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
+                group=group,
             )
             can_terminate = states[0].item() == 0
             operation_terminated = states[1].item() == 1
@@ -1088,8 +1092,20 @@ class HiRadixCache(RadixCache):
 
         # Probe stage: wait for ack, then decide whether to issue IO.
         if stage == "probe":
-            if probe_result is None:
-                return False
+            # Wait until all TP ranks have a probe result to avoid collective mismatch.
+            if self.tp_world_size > 1:
+                group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
+                ready = torch.tensor(
+                    int(probe_result is not None), dtype=torch.int
+                )
+                torch.distributed.all_reduce(
+                    ready, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                if ready.item() == 0:
+                    return False
+            else:
+                if probe_result is None:
+                    return False
 
             hit_tokens, hash_value = probe_result
             if hit_tokens < self.prefetch_threshold:
@@ -1108,6 +1124,31 @@ class HiRadixCache(RadixCache):
             if host_indices is None:
                 self.evict_host(hit_tokens)
                 host_indices = self.cache_controller.mem_pool_host.alloc(hit_tokens)
+            # Ensure allocation decision is consistent across TP ranks.
+            if self.tp_world_size > 1:
+                group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
+                alloc_ok = torch.tensor(
+                    int(host_indices is not None), dtype=torch.int
+                )
+                torch.distributed.all_reduce(
+                    alloc_ok, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                if alloc_ok.item() == 0:
+                    if host_indices is not None:
+                        try:
+                            self.cache_controller.mem_pool_host.free(host_indices)
+                        except Exception:
+                            pass
+                    try:
+                        anchor_node.release_host()
+                    except Exception:
+                        pass
+                    del self.ongoing_prefetch[req_id]
+                    self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+                    if self.cache_controller.prefetch_tokens_occupied < 0:
+                        self.cache_controller.prefetch_tokens_occupied = 0
+                    return True
+
             if host_indices is None:
                 try:
                     anchor_node.release_host()
@@ -1173,12 +1214,13 @@ class HiRadixCache(RadixCache):
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
+            group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
             # synchrnoize TP workers to make the same update to hiradix cache
             completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
             torch.distributed.all_reduce(
                 completed_tokens_tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
+                group=group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
 
@@ -1548,7 +1590,8 @@ class HiRadixCache(RadixCache):
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+            group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
+            torch.distributed.barrier(group=group)
 
         try:
             anchor_node.release_host()

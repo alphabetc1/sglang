@@ -983,13 +983,21 @@ class HiCacheController:
                     hit_pages = storage_hit_count // self.page_size
                     hash_value = hash_value[:hit_pages]
 
+                    # IMPORTANT: always publish a probe ack to avoid scheduler-side stalls.
+                    # The ack queue is unbounded; this should not block in normal cases.
                     try:
-                        self.prefetch_probe_ack_queue.put_nowait(
-                            (operation.request_id, storage_hit_count, hash_value)
+                        self.prefetch_probe_ack_queue.put(
+                            (operation.request_id, storage_hit_count, hash_value),
+                            timeout=1,
                         )
                     except Exception:
-                        # Best-effort: if ack can't be queued, mark terminate so main thread can proceed.
-                        operation.mark_terminate()
+                        # Best-effort fallback: publish a miss ack so main thread can proceed.
+                        try:
+                            self.prefetch_probe_ack_queue.put_nowait(
+                                (operation.request_id, 0, [])
+                            )
+                        except Exception:
+                            pass
                     continue
 
                 # IO phase: directly fetch precomputed hash chain into host pages.
