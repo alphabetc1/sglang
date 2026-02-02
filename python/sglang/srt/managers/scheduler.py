@@ -1596,11 +1596,39 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
+            # IMPORTANT: TP ranks must make consistent prefetch decisions to avoid
+            # collective mismatch / deadlocks. We synchronize the decision using
+            # the storage prefetch TP group (gloo) if available.
+            prefetch_group = None
+            try:
+                prefetch_group = getattr(
+                    getattr(self.tree_cache, "cache_controller", None),
+                    "prefetch_tp_group",
+                    None,
+                )
+            except Exception:
+                prefetch_group = None
+
+            local_backuped = int(req.last_node.backuped)
+            any_backuped = local_backuped
+            if prefetch_group is not None and self.tp_size > 1:
+                t = torch.tensor(any_backuped, dtype=torch.int)
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX, group=prefetch_group
+                )
+                any_backuped = int(t.item())
+
+            if any_backuped:
                 # Tail prefetch from the last backuped host prefix.
                 # NOTE: Phase-0 probe is handled inside `tree_cache.prefetch_from_storage`.
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+                if prefetch_group is not None and self.tp_size > 1:
+                    t = torch.tensor(matched_len, dtype=torch.int)
+                    torch.distributed.all_reduce(
+                        t, op=torch.distributed.ReduceOp.MIN, group=prefetch_group
+                    )
+                    matched_len = int(t.item())
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (

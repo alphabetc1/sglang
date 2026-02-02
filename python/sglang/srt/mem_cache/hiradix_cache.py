@@ -1338,11 +1338,19 @@ class HiRadixCache(RadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return
+
+        # IMPORTANT: TP ranks must make consistent prefetch decisions; otherwise
+        # storage-thread collectives can deadlock. We synchronize the rate-limit
+        # decision using the storage prefetch TP group (gloo) if available.
+        rate_limited = self.cache_controller.prefetch_rate_limited()
+        if self.tp_world_size > 1:
+            group = getattr(self.cache_controller, "prefetch_tp_group", self.tp_group)
+            t = torch.tensor(int(rate_limited), dtype=torch.int)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
+            rate_limited = bool(t.item())
+        if rate_limited:
             return
 
         if req_id in self.ongoing_prefetch:
