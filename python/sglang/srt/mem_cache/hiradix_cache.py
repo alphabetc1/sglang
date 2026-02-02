@@ -95,6 +95,8 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
+            root_prefetch_request_window,
+            root_prefetch_key_cap,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
@@ -127,6 +129,9 @@ class HiRadixCache(RadixCache):
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
         )
+        # Root-anchored prefetch knobs (default disabled: 0).
+        self.root_prefetch_request_window = root_prefetch_request_window
+        self.root_prefetch_key_cap = root_prefetch_key_cap
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -246,6 +251,39 @@ class HiRadixCache(RadixCache):
                         1 if hicache_write_policy == "write_through" else 2
                     )
                     logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+
+                # Optional: update prefetch knobs (including root-anchored knobs) even when
+                # the backend is already enabled (idle-state requirement still applies).
+                if storage_backend_extra_config_json is not None:
+                    (
+                        _extra_config,
+                        prefetch_threshold,
+                        prefetch_timeout_base,
+                        prefetch_timeout_per_ki_token,
+                        hicache_storage_pass_prefix_keys,
+                        root_prefetch_request_window,
+                        root_prefetch_key_cap,
+                    ) = self._parse_storage_backend_extra_config(
+                        storage_backend_extra_config_json
+                    )
+                    self.root_prefetch_request_window = root_prefetch_request_window
+                    self.root_prefetch_key_cap = root_prefetch_key_cap
+                    # Keep controller and cache-side thresholds consistent.
+                    try:
+                        self.cache_controller.prefetch_threshold = max(
+                            int(prefetch_threshold), self.page_size
+                        )
+                    except Exception:
+                        pass
+                    self._apply_storage_runtime_config(
+                        storage_backend=storage_backend,
+                        prefetch_threshold=prefetch_threshold,
+                        prefetch_timeout_base=prefetch_timeout_base,
+                        prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+                        hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+                        enable_storage=True,
+                        enable_storage_metrics=self.enable_storage_metrics,
+                    )
                 return (
                     True,
                     "HiCache storage backend already enabled with same backend; policies updated.",
@@ -279,6 +317,8 @@ class HiRadixCache(RadixCache):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                root_prefetch_request_window,
+                root_prefetch_key_cap,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -311,6 +351,8 @@ class HiRadixCache(RadixCache):
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
         )
+        self.root_prefetch_request_window = root_prefetch_request_window
+        self.root_prefetch_key_cap = root_prefetch_key_cap
         return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
@@ -358,7 +400,19 @@ class HiRadixCache(RadixCache):
         try:
             for req_id, info in list(self.ongoing_prefetch.items()):
                 try:
-                    last_host_node, token_ids, host_indices, _operation = info
+                    if len(info) == 8:
+                        (
+                            last_host_node,
+                            token_ids,
+                            host_indices,
+                            _operation,
+                            _stage,
+                            _extra_key,
+                            _prefix_keys,
+                            _probe_result,
+                        ) = info
+                    else:
+                        last_host_node, token_ids, host_indices, _operation = info
                 except Exception:
                     # Unexpected shape; just drop it.
                     self.ongoing_prefetch.pop(req_id, None)
@@ -439,7 +493,10 @@ class HiRadixCache(RadixCache):
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
-                    last_host_node, token_ids, _, _ = info
+                    if len(info) == 8:
+                        last_host_node, token_ids, _, _, _, _, _, _ = info
+                    else:
+                        last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
@@ -518,6 +575,13 @@ class HiRadixCache(RadixCache):
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
+        # Root-anchored prefetch for cold-start/global-share:
+        # - root_prefetch_request_window: enable for first N requests (0 disables)
+        # - root_prefetch_key_cap: probe token cap K (default 2048, only effective when window > 0)
+        root_prefetch_request_window = extra_config.pop(
+            "root_prefetch_request_window", 0
+        )
+        root_prefetch_key_cap = extra_config.pop("root_prefetch_key_cap", 2048)
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -536,6 +600,24 @@ class HiRadixCache(RadixCache):
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
+        if not isinstance(root_prefetch_request_window, int):
+            raise ValueError(
+                "root_prefetch_request_window must be int, got "
+                f"{type(root_prefetch_request_window).__name__}"
+            )
+        if not isinstance(root_prefetch_key_cap, int):
+            raise ValueError(
+                "root_prefetch_key_cap must be int, got "
+                f"{type(root_prefetch_key_cap).__name__}"
+            )
+        if root_prefetch_request_window < 0:
+            raise ValueError(
+                f"root_prefetch_request_window must be >= 0, got {root_prefetch_request_window}"
+            )
+        if root_prefetch_key_cap < 0:
+            raise ValueError(
+                f"root_prefetch_key_cap must be >= 0, got {root_prefetch_key_cap}"
+            )
 
         return (
             extra_config,
@@ -543,6 +625,8 @@ class HiRadixCache(RadixCache):
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            root_prefetch_request_window,
+            root_prefetch_key_cap,
         )
 
     def reset(self):
@@ -954,47 +1038,155 @@ class HiRadixCache(RadixCache):
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
+        # Phase-0: drain probe-only acks (best-effort, scheduler thread).
+        try:
+            cc = self.cache_controller
+            if hasattr(cc, "prefetch_probe_ack_queue"):
+                while not cc.prefetch_probe_ack_queue.empty():
+                    rid, hit_tokens, hash_value = cc.prefetch_probe_ack_queue.get_nowait()
+                    entry = self.ongoing_prefetch.get(rid)
+                    if entry is None:
+                        continue
+                    (
+                        anchor_node,
+                        token_ids,
+                        host_indices,
+                        operation,
+                        stage,
+                        extra_key,
+                        prefix_keys,
+                        probe_result,
+                    ) = entry
+                    if stage == "probe" and probe_result is None:
+                        self.ongoing_prefetch[rid] = (
+                            anchor_node,
+                            token_ids,
+                            host_indices,
+                            operation,
+                            stage,
+                            extra_key,
+                            prefix_keys,
+                            (hit_tokens, hash_value),
+                        )
+        except Exception:
+            pass
+
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
 
-        # todo: more policies for prefetch progress such as timeout
-        # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        (
+            anchor_node,
+            token_ids,
+            host_indices,
+            operation,
+            stage,
+            extra_key,
+            prefix_keys,
+            probe_result,
+        ) = self.ongoing_prefetch[req_id]
 
-        if operation.host_indices is None:
-            # prefetch has not been issued due to insufficient host memory
+        # Probe stage: wait for ack, then decide whether to issue IO.
+        if stage == "probe":
+            if probe_result is None:
+                return False
+
+            hit_tokens, hash_value = probe_result
+            if hit_tokens < self.prefetch_threshold:
+                try:
+                    anchor_node.release_host()
+                except Exception:
+                    pass
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+                if self.cache_controller.prefetch_tokens_occupied < 0:
+                    self.cache_controller.prefetch_tokens_occupied = 0
+                return True
+
+            # Allocate exact host pages for hit portion.
+            host_indices = self.cache_controller.mem_pool_host.alloc(hit_tokens)
+            if host_indices is None:
+                self.evict_host(hit_tokens)
+                host_indices = self.cache_controller.mem_pool_host.alloc(hit_tokens)
+            if host_indices is None:
+                try:
+                    anchor_node.release_host()
+                except Exception:
+                    pass
+                del self.ongoing_prefetch[req_id]
+                self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+                if self.cache_controller.prefetch_tokens_occupied < 0:
+                    self.cache_controller.prefetch_tokens_occupied = 0
+                return True
+
+            # Submit IO op using precomputed hash chain (skip probe in controller).
+            operation = self.cache_controller.prefetch(
+                req_id,
+                host_indices,
+                token_ids[:hit_tokens],
+                last_hash=None,
+                prefix_keys=prefix_keys,
+                mode="io",
+                precomputed_hash_value=hash_value,
+            )
+            self.ongoing_prefetch[req_id] = (
+                anchor_node,
+                token_ids,
+                host_indices,
+                operation,
+                "io",
+                extra_key,
+                prefix_keys,
+                None,
+            )
+            return False
+
+        if stage != "io":
+            # Unknown stage: fail open.
+            try:
+                anchor_node.release_host()
+            except Exception:
+                pass
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            if self.cache_controller.prefetch_tokens_occupied < 0:
+                self.cache_controller.prefetch_tokens_occupied = 0
+            return True
+
+        # IO stage.
+        if host_indices is None or getattr(operation, "host_indices", None) is None:
+            try:
+                anchor_node.release_host()
+            except Exception:
+                pass
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            if self.cache_controller.prefetch_tokens_occupied < 0:
+                self.cache_controller.prefetch_tokens_occupied = 0
             return True
 
         if not self.can_terminate_prefetch(operation):
             return False
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(operation)
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
             # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
+            completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
             torch.distributed.all_reduce(
                 completed_tokens_tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
             min_completed_tokens = completed_tokens_tensor.item()
+
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
-            last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
+            anchor_node,
+            RadixKey(token_ids=fetched_token_ids, extra_key=extra_key),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -1003,9 +1195,11 @@ class HiRadixCache(RadixCache):
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
-        last_host_node.release_host()
+        anchor_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        if self.cache_controller.prefetch_tokens_occupied < 0:
+            self.cache_controller.prefetch_tokens_occupied = 0
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(
@@ -1018,8 +1212,35 @@ class HiRadixCache(RadixCache):
         if req_id not in self.ongoing_prefetch:
             return
 
-        _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
+        (
+            anchor_node,
+            token_ids,
+            _host_indices,
+            operation,
+            stage,
+            _extra_key,
+            _prefix_keys,
+            _probe_result,
+        ) = self.ongoing_prefetch[req_id]
+
+        if stage == "probe":
+            # Probe-only: best-effort cancel and release.
+            try:
+                operation.mark_terminate()
+            except Exception:
+                pass
+            try:
+                anchor_node.release_host()
+            except Exception:
+                pass
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+            if self.cache_controller.prefetch_tokens_occupied < 0:
+                self.cache_controller.prefetch_tokens_occupied = 0
+            return
+
+        # IO stage: terminate transfer ASAP.
+        if getattr(operation, "host_indices", None) is None:
             return
         operation.mark_terminate()
 
@@ -1067,6 +1288,8 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        *,
+        extra_key: Optional[str] = None,
     ):
         # align the number of fetching tokens to the page size
         prefetch_length = len(new_input_tokens) - (
@@ -1080,24 +1303,32 @@ class HiRadixCache(RadixCache):
         ):
             return
 
-        last_host_node.protect_host()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory for prefetch
+        if req_id in self.ongoing_prefetch:
             return
+
+        # Phase-0 probe: do NOT allocate host memory here.
+        last_host_node.protect_host()
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            None,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            mode="probe",
         )
+        # entry shape:
+        # (anchor_node, token_ids, host_indices, operation, stage, extra_key, prefix_keys, probe_result)
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
-            host_indices,
+            None,
             operation,
+            "probe",
+            extra_key,
+            prefix_keys,
+            None,
         )
+        # Conservative budget for rate limiting: count probe as occupied tokens too.
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
     def _insert_helper_host(
@@ -1289,14 +1520,44 @@ class HiRadixCache(RadixCache):
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
+        entry = self.ongoing_prefetch[rid]
+        # entry shape:
+        # (anchor_node, token_ids, host_indices, operation, stage, extra_key, prefix_keys, probe_result)
+        if len(entry) == 8:
+            (
+                anchor_node,
+                token_ids,
+                host_indices,
+                operation,
+                stage,
+                _extra_key,
+                _prefix_keys,
+                _probe_result,
+            ) = entry
+        else:
+            anchor_node, token_ids, host_indices, operation = entry
+            stage = "io" if getattr(operation, "host_indices", None) is not None else "probe"
+
+        if stage == "probe":
+            # Probe-only: cancel and release immediately.
+            self.terminate_prefetch(rid)
+            return
+
+        if getattr(operation, "host_indices", None) is None or host_indices is None:
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         if self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
-        last_host_node.release_host()
+
+        try:
+            anchor_node.release_host()
+        except Exception:
+            pass
         del self.ongoing_prefetch[rid]
+
+        # Release fetched host pages (tail pages will be released by controller aux thread).
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        if self.cache_controller.prefetch_tokens_occupied < 0:
+            self.cache_controller.prefetch_tokens_occupied = 0

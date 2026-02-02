@@ -311,6 +311,10 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        # Root-anchored prefetch knobs (parsed from hicache_storage_backend_extra_config).
+        # Default disabled: 0.
+        self.hicache_root_prefetch_remaining = 0
+        self.hicache_root_prefetch_key_cap = 0
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
         # Distributed rank info
@@ -693,6 +697,15 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+
+        # Initialize root-anchored prefetch knobs from tree_cache config (default disabled).
+        if self.enable_hicache_storage and self.enable_hierarchical_cache:
+            self.hicache_root_prefetch_remaining = int(
+                getattr(self.tree_cache, "root_prefetch_request_window", 0) or 0
+            )
+            self.hicache_root_prefetch_key_cap = int(
+                getattr(self.tree_cache, "root_prefetch_key_cap", 0) or 0
+            )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1584,8 +1597,8 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
+                # Tail prefetch from the last backuped host prefix.
+                # NOTE: Phase-0 probe is handled inside `tree_cache.prefetch_from_storage`.
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
@@ -1601,6 +1614,24 @@ class Scheduler(
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    extra_key=req.extra_key,
+                )
+                return
+
+            # Root-anchored prefetch (cold-start window) to support cold-start + global share.
+            # Enabled only when window N is set (> 0).
+            if self.hicache_root_prefetch_remaining > 0:
+                self.hicache_root_prefetch_remaining -= 1
+                anchor = getattr(self.tree_cache, "root_node", req.last_host_node)
+                token_cap = max(int(self.hicache_root_prefetch_key_cap), 0)
+                new_input_tokens = req.fill_ids[:token_cap] if token_cap > 0 else req.fill_ids
+                self.tree_cache.prefetch_from_storage(
+                    req.rid,
+                    anchor,
+                    new_input_tokens,
+                    last_hash=None,
+                    prefix_keys=None,
+                    extra_key=req.extra_key,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -2501,6 +2532,13 @@ class Scheduler(
             logger.info(
                 f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
             )
+            # Refresh root-anchored prefetch knobs from tree_cache config (default disabled).
+            self.hicache_root_prefetch_remaining = int(
+                getattr(self.tree_cache, "root_prefetch_request_window", 0) or 0
+            )
+            self.hicache_root_prefetch_key_cap = int(
+                getattr(self.tree_cache, "root_prefetch_key_cap", 0) or 0
+            )
         return AttachHiCacheStorageReqOutput(success=ok, message=msg)
 
     def detach_hicache_storage_wrapped(
@@ -2540,6 +2578,8 @@ class Scheduler(
             self.enable_hicache_storage = False
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
+            self.hicache_root_prefetch_remaining = 0
+            self.hicache_root_prefetch_key_cap = 0
             logger.info("Detached HiCache storage backend.")
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."

@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional
 
 import torch
 
@@ -192,7 +192,7 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
@@ -216,18 +216,28 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        *,
+        mode: Literal["probe", "io"] = "probe",
+        precomputed_hash_value: Optional[List[str]] = None,
     ):
         self.request_id = request_id
+        self.mode = mode
+        # For IO mode, caller may supply the hash chain computed during probe.
+        self.precomputed_hash_value = precomputed_hash_value
 
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+
+        if self.mode == "io" and self.precomputed_hash_value is not None:
+            # `hash_value` drives IO in prefetch thread / aux thread.
+            self.hash_value = self.precomputed_hash_value
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -344,6 +354,8 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_revoke_queue = Queue()
+        # Probe-only ack queue: (req_id, hit_tokens, hash_value) for Phase-0 decision.
+        self.prefetch_probe_ack_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
@@ -558,6 +570,18 @@ class HiCacheController:
         except Exception:
             logger.exception("Failed to close storage backend cleanly.")
 
+        # Best-effort clear any leftover control queues (probe acks, etc).
+        try:
+            if hasattr(self, "prefetch_probe_ack_queue"):
+                self.prefetch_probe_ack_queue.queue.clear()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "prefetch_revoke_queue"):
+                self.prefetch_revoke_queue.queue.clear()
+        except Exception:
+            pass
+
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
@@ -611,6 +635,7 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.prefetch_probe_ack_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
         self.stop_event.clear()
@@ -761,16 +786,31 @@ class HiCacheController:
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        *,
+        mode: Literal["probe", "io"] = "probe",
+        precomputed_hash_value: Optional[List[str]] = None,
     ) -> PrefetchOperation:
         """
-        Prefetch KV caches from storage backend to host memory.
+        Prefetch KV caches from storage backend.
+
+        Phase-0 probe: `mode="probe"`, `host_indices=None`. Background thread will only
+        run storage hit query and return ack via `prefetch_probe_ack_queue`.
+
+        Phase-1 IO: `mode="io"`, `host_indices` provided and `precomputed_hash_value`
+        is used directly to fetch pages to host memory (skip probe).
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            mode=mode,
+            precomputed_hash_value=precomputed_hash_value,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -910,6 +950,10 @@ class HiCacheController:
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
+
+        Supports a two-phase flow:
+        - probe: query consecutive hit length without allocating host memory
+        - io: fetch the precomputed hash chain into pre-allocated host memory
         """
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
@@ -921,38 +965,46 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if self.tp_world_size > 1:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    torch.distributed.all_reduce(
-                        storage_hit_count_tensor,
-                        op=torch.distributed.ReduceOp.MIN,
-                        group=self.prefetch_tp_group,
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                if operation.mode == "probe":
+                    # Probe-only: compute hit length and hash chain. Do NOT touch host memory.
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    if self.tp_world_size > 1:
+                        storage_hit_count_tensor = torch.tensor(
+                            storage_hit_count, dtype=torch.int
+                        )
+                        torch.distributed.all_reduce(
+                            storage_hit_count_tensor,
+                            op=torch.distributed.ReduceOp.MIN,
+                            group=self.prefetch_tp_group,
+                        )
+                        storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
+                    # Only keep the hit portion of the hash chain (in pages).
+                    hit_pages = storage_hit_count // self.page_size
+                    hash_value = hash_value[:hit_pages]
+
+                    try:
+                        self.prefetch_probe_ack_queue.put_nowait(
+                            (operation.request_id, storage_hit_count, hash_value)
+                        )
+                    except Exception:
+                        # Best-effort: if ack can't be queued, mark terminate so main thread can proceed.
+                        operation.mark_terminate()
+                    continue
+
+                # IO phase: directly fetch precomputed hash chain into host pages.
+                if operation.host_indices is None:
+                    # Defensive: nothing to do.
+                    continue
+                if len(operation.hash_value) == 0:
+                    # Nothing to fetch.
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
-                else:
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
-                    self.prefetch_buffer.put(operation)
+                    continue
+
+                logger.debug(
+                    f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                )
+                self.prefetch_buffer.put(operation)
 
             except Empty:
                 continue

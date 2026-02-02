@@ -98,7 +98,7 @@ curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
   -H 'Content-Type: application/json' \
   -d '{
     "hicache_storage_backend": "mooncake",
-    "hicache_storage_backend_extra_config_json": "{\"master_server_address\":\"127.0.0.1:50051\",\"protocol\":\"tcp\",\"global_segment_size\":\"4gb\",\"prefetch_threshold\":256}",
+    "hicache_storage_backend_extra_config_json": "{\"master_server_address\":\"127.0.0.1:50051\",\"protocol\":\"tcp\",\"global_segment_size\":\"4gb\",\"prefetch_threshold\":256,\"root_prefetch_request_window\":10000,\"root_prefetch_key_cap\":4096}",
     "hicache_storage_prefetch_policy": "timeout"
   }'
 ```
@@ -107,7 +107,16 @@ Notes:
 
 - `hicache_storage_backend_extra_config_json` can include both:
   - **Backend configuration** (e.g., Mooncake master/metadata/protocol, etc.)
-  - **Prefetch configuration** (`prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, `hicache_storage_pass_prefix_keys`)
+  - **Prefetch configuration**:
+    - `prefetch_threshold` (tokens): only prefetch when storage consecutive-hit length reaches this threshold
+    - `prefetch_timeout_base` / `prefetch_timeout_per_ki_token`: timeout policy knobs (when `hicache_storage_prefetch_policy=timeout`)
+    - `hicache_storage_pass_prefix_keys`: pass prefix hash chain to backend for hierarchical keying (backend-specific)
+    - `root_prefetch_request_window` (int, default 0): enable **root-anchored prefetch** for the first N requests after attach/startup
+    - `root_prefetch_key_cap` (int, default 2048): cap the probe token length K for root-anchored prefetch (bounds probe cost). Effective only when `root_prefetch_request_window > 0`.
+
+Root-anchored prefetch is designed for **cold start** and **global cache sharing**:
+- When enabled (`root_prefetch_request_window > 0`), SGLang may probe storage using the request's prefix (up to K tokens) even if the local HiCache has not backed up that prefix yet.
+- If storage hit length is below `prefetch_threshold`, it will **not** allocate host memory or issue IO (probe-only, best-effort).
 
 ### 3.3 Detach (disable) the storage backend
 
