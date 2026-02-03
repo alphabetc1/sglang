@@ -1,7 +1,9 @@
 import hashlib
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -204,8 +206,138 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        self.capacity_bytes, self.ttl_seconds = self._parse_policy_config(
+            storage_config.extra_config
+        )
+        self._lru_entries: OrderedDict[str, "_HiCacheFileEntry"] = OrderedDict()
+        self._usage_bytes = 0
+
+        self._load_existing_files()
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _parse_policy_config(self, extra_config: Optional[dict]):
+        if extra_config is None:
+            return 0, 0.0
+        if not isinstance(extra_config, dict):
+            raise ValueError(
+                "HiCacheFile extra_config must be a dict when provided."
+            )
+
+        capacity_gb = extra_config.get("capacity_gb", 0)
+        ttl_seconds = extra_config.get("ttl_seconds", 0)
+
+        if not isinstance(capacity_gb, (int, float)):
+            raise ValueError(
+                f"HiCacheFile capacity_gb must be number, got {type(capacity_gb).__name__}"
+            )
+        if not isinstance(ttl_seconds, (int, float)):
+            raise ValueError(
+                f"HiCacheFile ttl_seconds must be number, got {type(ttl_seconds).__name__}"
+            )
+        if capacity_gb < 0:
+            raise ValueError("HiCacheFile capacity_gb must be non-negative")
+        if ttl_seconds < 0:
+            raise ValueError("HiCacheFile ttl_seconds must be non-negative")
+
+        capacity_bytes = int(capacity_gb * 1e9)
+        return capacity_bytes, float(ttl_seconds)
+
+    def _load_existing_files(self) -> None:
+        if not os.path.exists(self.file_path):
+            return
+
+        suffix = f"{self.config_suffix}.bin"
+        entries = []
+        for filename in os.listdir(self.file_path):
+            if not filename.endswith(suffix):
+                continue
+            path = os.path.join(self.file_path, filename)
+            if not os.path.isfile(path):
+                continue
+            try:
+                size_bytes = os.path.getsize(path)
+                mtime = os.path.getmtime(path)
+            except OSError as e:
+                logger.warning(f"Failed to stat HiCacheFile entry {path}: {e}")
+                continue
+            entries.append((mtime, filename[:-4], size_bytes))
+
+        entries.sort(key=lambda item: item[0])
+        for mtime, key, size_bytes in entries:
+            self._lru_entries[key] = _HiCacheFileEntry(
+                size_bytes=size_bytes,
+                created_ts=mtime,
+                last_access_ts=mtime,
+            )
+            self._usage_bytes += size_bytes
+
+    def _touch_entry(self, key: str, now: float) -> None:
+        entry = self._lru_entries.get(key)
+        if entry is None:
+            return
+        entry.last_access_ts = now
+        self._lru_entries.move_to_end(key)
+
+    def _is_expired(self, entry: _HiCacheFileEntry, now: float) -> bool:
+        if self.ttl_seconds <= 0:
+            return False
+        return (now - entry.created_ts) >= self.ttl_seconds
+
+    def _remove_entry(self, key: str) -> None:
+        entry = self._lru_entries.pop(key, None)
+        if entry is not None:
+            self._usage_bytes -= entry.size_bytes
+            if self._usage_bytes < 0:
+                self._usage_bytes = 0
+        path = os.path.join(self.file_path, f"{key}.bin")
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            logger.warning(f"Failed to remove HiCacheFile entry {path}: {e}")
+
+    def _ensure_entry_from_disk(self, key: str) -> Optional["_HiCacheFileEntry"]:
+        entry = self._lru_entries.get(key)
+        if entry is not None:
+            return entry
+
+        path = os.path.join(self.file_path, f"{key}.bin")
+        if not os.path.exists(path):
+            return None
+        try:
+            size_bytes = os.path.getsize(path)
+            mtime = os.path.getmtime(path)
+        except OSError as e:
+            logger.warning(f"Failed to stat HiCacheFile entry {path}: {e}")
+            return None
+
+        entry = _HiCacheFileEntry(
+            size_bytes=size_bytes,
+            created_ts=mtime,
+            last_access_ts=mtime,
+        )
+        self._lru_entries[key] = entry
+        self._usage_bytes += size_bytes
+        return entry
+
+    def _evict_for_capacity(self, incoming_bytes: int) -> bool:
+        if self.capacity_bytes <= 0:
+            return True
+        if incoming_bytes > self.capacity_bytes:
+            logger.warning(
+                "HiCacheFile entry size exceeds capacity: "
+                f"{incoming_bytes} > {self.capacity_bytes}"
+            )
+            return False
+
+        while self._usage_bytes + incoming_bytes > self.capacity_bytes:
+            if not self._lru_entries:
+                return False
+            oldest_key, _ = next(iter(self._lru_entries.items()))
+            self._remove_entry(oldest_key)
+        return True
 
     def get(
         self,
@@ -215,15 +347,24 @@ class HiCacheFile(HiCacheStorage):
     ) -> torch.Tensor | None:
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        now = time.time()
+        entry = self._ensure_entry_from_disk(key)
+        if entry is not None and self._is_expired(entry, now):
+            self._remove_entry(key)
+            return None
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {key}")
+            self._touch_entry(key, now)
             return target_location
         except FileNotFoundError:
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to read tensor {key}: {e}")
             return None
 
     def batch_get(
@@ -246,14 +387,30 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        if self.exists(key):
-            logger.debug(f"Key {key} already exists. Skipped.")
-            return True
-
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        now = time.time()
+
+        entry = self._ensure_entry_from_disk(key)
+        if entry is not None:
+            if self._is_expired(entry, now):
+                self._remove_entry(key)
+            else:
+                logger.debug(f"Key {key} already exists. Skipped.")
+                self._touch_entry(key, now)
+                return True
+
+        size_bytes = value.numel() * value.element_size()
+        if not self._evict_for_capacity(size_bytes):
+            return False
         try:
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+            self._lru_entries[key] = _HiCacheFileEntry(
+                size_bytes=size_bytes,
+                created_ts=now,
+                last_access_ts=now,
+            )
+            self._usage_bytes += size_bytes
             return True
         except Exception as e:
             logger.error(f"Failed to save tensor {key}: {e}")
@@ -274,7 +431,17 @@ class HiCacheFile(HiCacheStorage):
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        return os.path.exists(tensor_path)
+        now = time.time()
+        entry = self._ensure_entry_from_disk(key)
+        if entry is not None and self._is_expired(entry, now):
+            self._remove_entry(key)
+            return False
+
+        exists = os.path.exists(tensor_path)
+        if exists:
+            self._touch_entry(key, now)
+            return True
+        return False
 
     def clear(self) -> bool:
         try:
@@ -283,7 +450,16 @@ class HiCacheFile(HiCacheStorage):
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             logger.info("Cleared all entries in HiCacheFile storage.")
+            self._lru_entries.clear()
+            self._usage_bytes = 0
             return True
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+
+@dataclass
+class _HiCacheFileEntry:
+    size_bytes: int
+    created_ts: float
+    last_access_ts: float
