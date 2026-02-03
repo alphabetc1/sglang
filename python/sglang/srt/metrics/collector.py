@@ -1361,13 +1361,21 @@ class StorageMetrics:
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
 
+    capacity_gb: Optional[float] = None
+    current_usage_gb: Optional[float] = None
+    hit_count: int = 0
+    miss_count: int = 0
+    evict_count: int = 0
+    expired_count: int = 0
+    hit_ratio: Optional[float] = None
+
 
 class StorageMetricsCollector:
     def __init__(
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1429,6 +1437,42 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
+        self.storage_capacity_gb = Gauge(
+            name="sglang:storage_capacity_gb",
+            documentation="Storage capacity in bytes.",
+            labelnames=labels.keys(),
+        )
+        self.storage_current_usage_bytes = Gauge(
+            name="sglang:storage_current_usage_gb",
+            documentation="Current storage usage in GB.",
+            labelnames=labels.keys(),
+        )
+        self.storage_hit_total = Counter(
+            name="sglang:storage_hit_total",
+            documentation="Number of storage hits.",
+            labelnames=labels.keys(),
+        )
+        self.storage_miss_total = Counter(
+            name="sglang:storage_miss_total",
+            documentation="Number of storage misses.",
+            labelnames=labels.keys(),
+        )
+        self.storage_evict_total = Counter(
+            name="sglang:storage_evict_total",
+            documentation="Number of storage evictions.",
+            labelnames=labels.keys(),
+        )
+        self.storage_expired_total = Counter(
+            name="sglang:storage_expired_total",
+            documentation="Number of storage expirations.",
+            labelnames=labels.keys(),
+        )
+        self.storage_hit_ratio = Gauge(
+            name="sglang:storage_hit_ratio",
+            documentation="Storage hit ratio.",
+            labelnames=labels.keys(),
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1454,6 +1498,29 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+        if storage_metrics.capacity_gb is not None:
+            self.storage_capacity_gb.labels(**self.labels).set(
+                storage_metrics.capacity_gb
+            )
+        if storage_metrics.current_usage_gb is not None:
+            self.storage_current_usage_gb.labels(**self.labels).set(
+                storage_metrics.current_usage_gb
+            )
+        if storage_metrics.hit_count:
+            self.storage_hit_total.labels(**self.labels).inc(storage_metrics.hit_count)
+        if storage_metrics.miss_count:
+            self.storage_miss_total.labels(**self.labels).inc(storage_metrics.miss_count)
+        if storage_metrics.evict_count:
+            self.storage_evict_total.labels(**self.labels).inc(
+                storage_metrics.evict_count
+            )
+        if storage_metrics.expired_count:
+            self.storage_expired_total.labels(**self.labels).inc(
+                storage_metrics.expired_count
+            )
+        if storage_metrics.hit_ratio is not None:
+            self.storage_hit_ratio.labels(**self.labels).set(storage_metrics.hit_ratio)
 
 
 class ExpertDispatchCollector:

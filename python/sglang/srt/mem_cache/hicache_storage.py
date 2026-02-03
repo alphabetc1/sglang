@@ -206,43 +206,32 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
-        self.capacity_bytes, self.ttl_seconds = self._parse_policy_config(
-            storage_config.extra_config
-        )
+        capacity_gb = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_CAPACITY", 0)
+        if capacity_gb > 0:
+            self.capacity_bytes = capacity_gb * 1e9
+        else:
+            self.capacity_bytes = 0
+        self.ttl_seconds = int(os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_TTL", 0))
         self._lru_entries: OrderedDict[str, "_HiCacheFileEntry"] = OrderedDict()
         self._usage_bytes = 0
 
-        self._load_existing_files()
+        self._hit_count_total = 0
+        self._miss_count_total = 0
+        self._evict_count_total = 0
+        self._expired_count_total = 0
+        self._last_reported = {
+            "hit": 0,
+            "miss": 0,
+            "evict": 0,
+            "expired": 0,
+        }
+
+        if (self.capacity_bytes > 0):
+            logger.info(f"HiCacheFile storage initialized with capacity {capacity_gb} GB")
+            self._load_existing_files()
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
-
-    def _parse_policy_config(self, extra_config: Optional[dict]):
-        if extra_config is None:
-            return 0, 0.0
-        if not isinstance(extra_config, dict):
-            raise ValueError(
-                "HiCacheFile extra_config must be a dict when provided."
-            )
-
-        capacity_gb = extra_config.get("capacity_gb", 0)
-        ttl_seconds = extra_config.get("ttl_seconds", 0)
-
-        if not isinstance(capacity_gb, (int, float)):
-            raise ValueError(
-                f"HiCacheFile capacity_gb must be number, got {type(capacity_gb).__name__}"
-            )
-        if not isinstance(ttl_seconds, (int, float)):
-            raise ValueError(
-                f"HiCacheFile ttl_seconds must be number, got {type(ttl_seconds).__name__}"
-            )
-        if capacity_gb < 0:
-            raise ValueError("HiCacheFile capacity_gb must be non-negative")
-        if ttl_seconds < 0:
-            raise ValueError("HiCacheFile ttl_seconds must be non-negative")
-
-        capacity_bytes = int(capacity_gb * 1e9)
-        return capacity_bytes, float(ttl_seconds)
 
     def _load_existing_files(self) -> None:
         if not os.path.exists(self.file_path):
@@ -279,6 +268,18 @@ class HiCacheFile(HiCacheStorage):
             return
         entry.last_access_ts = now
         self._lru_entries.move_to_end(key)
+
+    def _record_hit(self) -> None:
+        self._hit_count_total += 1
+
+    def _record_miss(self) -> None:
+        self._miss_count_total += 1
+
+    def _record_evict(self) -> None:
+        self._evict_count_total += 1
+
+    def _record_expired(self) -> None:
+        self._expired_count_total += 1
 
     def _is_expired(self, entry: _HiCacheFileEntry, now: float) -> bool:
         if self.ttl_seconds <= 0:
@@ -337,6 +338,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             oldest_key, _ = next(iter(self._lru_entries.items()))
             self._remove_entry(oldest_key)
+            self._record_evict()
         return True
 
     def get(
@@ -351,6 +353,8 @@ class HiCacheFile(HiCacheStorage):
         entry = self._ensure_entry_from_disk(key)
         if entry is not None and self._is_expired(entry, now):
             self._remove_entry(key)
+            self._record_expired()
+            self._record_miss()
             return None
         try:
             expected = target_location.numel() * target_location.element_size()
@@ -359,12 +363,15 @@ class HiCacheFile(HiCacheStorage):
                 if f.readinto(buf) != expected:
                     raise IOError(f"Short read for {key}")
             self._touch_entry(key, now)
+            self._record_hit()
             return target_location
         except FileNotFoundError:
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            self._record_miss()
             return None
         except Exception as e:
             logger.error(f"Failed to read tensor {key}: {e}")
+            self._record_miss()
             return None
 
     def batch_get(
@@ -395,6 +402,7 @@ class HiCacheFile(HiCacheStorage):
         if entry is not None:
             if self._is_expired(entry, now):
                 self._remove_entry(key)
+                self._record_expired()
             else:
                 logger.debug(f"Key {key} already exists. Skipped.")
                 self._touch_entry(key, now)
@@ -435,12 +443,16 @@ class HiCacheFile(HiCacheStorage):
         entry = self._ensure_entry_from_disk(key)
         if entry is not None and self._is_expired(entry, now):
             self._remove_entry(key)
+            self._record_expired()
+            self._record_miss()
             return False
 
         exists = os.path.exists(tensor_path)
         if exists:
             self._touch_entry(key, now)
+            self._record_hit()
             return True
+        self._record_miss()
         return False
 
     def clear(self) -> bool:
@@ -456,6 +468,35 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    def get_stats(self):
+        from sglang.srt.metrics.collector import StorageMetrics
+
+        storage_metrics = StorageMetrics()
+        storage_metrics.capacity_gb = float(self.capacity_bytes / 1e9)
+        storage_metrics.current_usage_gb = float(self._usage_bytes / 1e9)
+
+        deltas = {
+            "hit": self._hit_count_total - self._last_reported["hit"],
+            "miss": self._miss_count_total - self._last_reported["miss"],
+            "evict": self._evict_count_total - self._last_reported["evict"],
+            "expired": self._expired_count_total - self._last_reported["expired"],
+        }
+        storage_metrics.hit_count = deltas["hit"]
+        storage_metrics.miss_count = deltas["miss"]
+        storage_metrics.evict_count = deltas["evict"]
+        storage_metrics.expired_count = deltas["expired"]
+
+        total_access = self._hit_count_total + self._miss_count_total
+        if total_access > 0:
+            storage_metrics.hit_ratio = self._hit_count_total / total_access
+
+        self._last_reported["hit"] = self._hit_count_total
+        self._last_reported["miss"] = self._miss_count_total
+        self._last_reported["evict"] = self._evict_count_total
+        self._last_reported["expired"] = self._expired_count_total
+
+        return storage_metrics
 
 
 @dataclass

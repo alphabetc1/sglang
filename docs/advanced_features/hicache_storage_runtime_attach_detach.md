@@ -108,7 +108,6 @@ Notes:
 - `hicache_storage_backend_extra_config_json` can include both:
   - **Backend configuration** (e.g., Mooncake master/metadata/protocol, etc.)
   - **Prefetch configuration** (`prefetch_threshold`, `prefetch_timeout_base`, `prefetch_timeout_per_ki_token`, `hicache_storage_pass_prefix_keys`)
-- For `file` backend only, `hicache_storage_backend_extra_config_json` may include `capacity_gb` and `ttl_seconds` to enable LRU-based eviction and TTL expiration. When both are 0, capacity/TTL eviction is disabled.
 
 ### 3.3 Detach (disable) the storage backend
 
