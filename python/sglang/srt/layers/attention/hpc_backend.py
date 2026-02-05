@@ -74,9 +74,7 @@ class HpcAttentionBackend(AttentionBackend):
             cache_seqlens = forward_batch.seq_lens.to(torch.int32)
             max_seq_len_k = int(forward_batch.seq_lens.max().item())
 
-            cu_seqlens_q = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=device
-            )
+            cu_seqlens_q = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
             max_seq_len_q = 1
 
             page_table = self._build_page_table(forward_batch, max_seq_len_k)
@@ -93,12 +91,10 @@ class HpcAttentionBackend(AttentionBackend):
             max_seq_len_k = int(forward_batch.seq_lens.max().item())
 
             # Build cu_seqlens_q from extend_seq_lens
-            cu_seqlens_q = torch.zeros(
-                bs + 1, dtype=torch.int32, device=device
+            cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            cu_seqlens_q[1:] = torch.cumsum(forward_batch.extend_seq_lens, dim=0).to(
+                torch.int32
             )
-            cu_seqlens_q[1:] = torch.cumsum(
-                forward_batch.extend_seq_lens, dim=0
-            ).to(torch.int32)
             max_seq_len_q = int(forward_batch.extend_seq_lens.max().item())
 
             page_table = self._build_page_table(forward_batch, max_seq_len_k)
@@ -141,12 +137,8 @@ class HpcAttentionBackend(AttentionBackend):
         q_3d = q.contiguous().view(-1, tp_q_head_num, head_dim)
 
         # Get KV cache and reshape to [num_pages, page_size, kv_heads, dim]
-        key_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-            layer.layer_id
-        )
-        value_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-            layer.layer_id
-        )
+        key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         key_cache = key_cache.view(-1, BLOCK_SIZE, key_cache.shape[-2], head_dim)
         value_cache = value_cache.view(
             -1, BLOCK_SIZE, value_cache.shape[-2], v_head_dim
@@ -189,12 +181,8 @@ class HpcAttentionBackend(AttentionBackend):
         q_3d = q.contiguous().view(-1, tp_q_head_num, head_dim)
 
         # Get KV cache and reshape to [num_pages, page_size, kv_heads, dim]
-        key_cache = forward_batch.token_to_kv_pool.get_key_buffer(
-            layer.layer_id
-        )
-        value_cache = forward_batch.token_to_kv_pool.get_value_buffer(
-            layer.layer_id
-        )
+        key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         key_cache = key_cache.view(-1, BLOCK_SIZE, key_cache.shape[-2], head_dim)
         value_cache = value_cache.view(
             -1, BLOCK_SIZE, value_cache.shape[-2], v_head_dim
