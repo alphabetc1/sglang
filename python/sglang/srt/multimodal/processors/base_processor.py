@@ -301,6 +301,23 @@ class BaseMultimodalProcessor(ABC):
             "im_token_id": self.IM_TOKEN_ID,
         }
 
+    def _apply_image_process_config(self, processor) -> None:
+        image_config = self.server_args.mm_process_config.get("image", {})
+        if not image_config or not hasattr(processor, "image_processor"):
+            return
+
+        image_processor = processor.image_processor
+        for key in ("min_pixels", "max_pixels", "size", "rescale_factor"):
+            if key not in image_config or not hasattr(image_processor, key):
+                continue
+            value = image_config[key]
+            if value is None:
+                continue
+            setattr(image_processor, key, value)
+            logger.debug(
+                "[mm_process_config] override image_processor.%s=%s", key, value
+            )
+
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
     ) -> dict:
@@ -326,6 +343,7 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
+        self._apply_image_process_config(processor)
         if (
             hasattr(processor, "image_processor")
             and isinstance(processor.image_processor, BaseImageProcessorFast)
