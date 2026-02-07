@@ -479,7 +479,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 headers={"Authorization": "Bearer None"},
             )
             if response.status_code == 200:
-                time.sleep(5)
+                time.sleep(1)
                 print_highlight(
                     """\n
                     NOTE: Typically, the server runs in a separate terminal.
