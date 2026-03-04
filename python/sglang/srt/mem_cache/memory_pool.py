@@ -784,50 +784,8 @@ class MHATokenToKVPool(KVCache):
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
-        # Heuristics for KV copy tiling
-        _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
-        _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
-        _KV_COPY_TILE_SIZE_LARGE = 512
-        _KV_COPY_TILE_SIZE_MEDIUM = 256
-        _KV_COPY_TILE_SIZE_SMALL = 128
-        _KV_COPY_NUM_WARPS_LARGE_TILE = 8
-        _KV_COPY_NUM_WARPS_SMALL_TILE = 4
-
-        stride_bytes = int(self.data_strides[0].item())
-        if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
-        elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
-        else:
-            bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
-
-        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
-        chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
-
-        self._kv_copy_config = {
-            "bytes_per_tile": bytes_per_tile,
-            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
-            "num_warps": (
-                _KV_COPY_NUM_WARPS_SMALL_TILE
-                if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
-                else _KV_COPY_NUM_WARPS_LARGE_TILE
-            ),
-            "num_locs_upper": chunk_upper,
-        }
-
-        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
-        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
-
-        copy_all_layer_kv_cache_tiled[grid](
-            self.data_ptrs,
-            self.data_strides,
-            dummy_loc,
-            dummy_loc,
-            1,
-            chunk_upper,
-            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
-            num_warps=self._kv_copy_config["num_warps"],
-            num_stages=2,
+        self._kv_copy_config = _compute_kv_copy_config_and_warmup(
+            self.data_ptrs, self.data_strides, self.device
         )
 
     def _create_buffers(self):
@@ -1032,41 +990,9 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config is not None
         ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
-        cfg = self._kv_copy_config
-        cap = int(cfg.get("num_locs_upper", 256))
-        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
-
-        if N <= cap:
-            upper = next_power_of_2(N)
-            copy_all_layer_kv_cache_tiled[grid](
-                self.data_ptrs,
-                self.data_strides,
-                tgt_loc,
-                src_loc,
-                N,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
-            )
-            return
-
-        # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
-        for start in range(0, N, cap):
-            end = min(start + cap, N)
-            chunk_len = end - start
-            upper = next_power_of_2(chunk_len)
-            copy_all_layer_kv_cache_tiled[grid](
-                self.data_ptrs,
-                self.data_strides,
-                tgt_loc[start:end],
-                src_loc[start:end],
-                chunk_len,
-                upper,
-                BYTES_PER_TILE=cfg["bytes_per_tile"],
-                num_warps=cfg["num_warps"],
-                num_stages=2,
-            )
+        _triton_move_kv_cache(
+            self.data_ptrs, self.data_strides, tgt_loc, src_loc, self._kv_copy_config
+        )
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
@@ -1421,6 +1347,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_nsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        enable_kv_cache_copy: bool = False,
     ):
         super().__init__(
             size,
@@ -1450,15 +1377,29 @@ class MLATokenToKVPool(KVCache):
         )
 
         self._create_buffers()
+        self._init_data_ptrs()
 
+        if enable_kv_cache_copy:
+            self._init_kv_copy_and_warmup()
+        else:
+            self._kv_copy_config = None
+
+        if not use_nsa:
+            # NSA will allocate indexer KV cache later and then log the total size
+            self._finalize_allocation_log(size)
+
+    def _init_data_ptrs(self):
+        """Build data_ptrs and data_strides from kv_buffer.
+        Subclasses with extra buffers (e.g. FP4 scale) should override."""
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
             device=self.device,
         )
-        if not use_nsa:
-            # NSA will allocate indexer KV cache later and then log the total size
-            self._finalize_allocation_log(size)
+        self.data_strides = torch.tensor(
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in self.kv_buffer],
+            device=self.device,
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1629,6 +1570,32 @@ class MLATokenToKVPool(KVCache):
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
 
+    def _init_kv_copy_and_warmup(self):
+        """Compute tiling config and warmup the Triton copy kernel."""
+        self._kv_copy_config = _compute_kv_copy_config_and_warmup(
+            self.data_ptrs, self.data_strides, self.device
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        N = tgt_loc.numel()
+        if N == 0:
+            return
+
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+            tgt_loc_flat = tgt_loc.view(-1).long()
+            src_loc_flat = src_loc.view(-1).long()
+            for kv_cache in self.kv_buffer:
+                kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+            return
+
+        assert (
+            self._kv_copy_config is not None
+        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+
+        _triton_move_kv_cache(
+            self.data_ptrs, self.data_strides, tgt_loc, src_loc, self._kv_copy_config
+        )
+
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
@@ -1665,9 +1632,41 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+    def _init_data_ptrs(self):
+        """Include both kv_buffer and kv_scale_buffer in data_ptrs so that
+        the Triton copy kernel copies scale data alongside KV data."""
+        all_buffers = self.kv_buffer + self.kv_scale_buffer
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in all_buffers],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [np.prod(x.shape[1:]) * x.dtype.itemsize for x in all_buffers],
+            device=self.device,
+        )
+
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        N = tgt_loc.numel()
+        if N == 0:
+            return
+
+        if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+            tgt_loc_flat = tgt_loc.view(-1).long()
+            src_loc_flat = src_loc.view(-1).long()
+            for kv_cache in self.kv_buffer:
+                kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+            for scale_cache in self.kv_scale_buffer:
+                scale_cache[tgt_loc_flat] = scale_cache[src_loc_flat]
+            return
+
+        # Triton path: data_ptrs already includes both kv_buffer and
+        # kv_scale_buffer, so the parent implementation handles both.
+        super().move_kv_cache(tgt_loc, src_loc)
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1778,6 +1777,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_kv_cache_copy: bool = False,
     ):
 
         override_dim = (
@@ -1797,6 +1797,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_nsa=True,
             override_kv_cache_dim=override_dim,
+            enable_kv_cache_copy=enable_kv_cache_copy,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
@@ -1914,6 +1915,66 @@ class NSATokenToKVPool(MLATokenToKVPool):
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Move the main kv_buffer (token-indexed) via the parent implementation.
+        super().move_kv_cache(tgt_loc, src_loc)
+
+        # Move the NSA indexer buffer (index_k_with_scale_buffer).
+        # This buffer is page-indexed: shape (num_pages, page_stride) where
+        # page_stride = page_size * (index_head_dim + scale_bytes_per_token).
+        # tgt_loc / src_loc are token-level slot indices, so we translate them
+        # to (page_index, offset_within_page) using the same arithmetic as
+        # SetKAndS in index_buf_accessor.
+        N = tgt_loc.numel()
+        if N == 0:
+            return
+
+        tgt = tgt_loc.view(-1).long()
+        src = src_loc.view(-1).long()
+        page_size = self.page_size
+        k_bytes = self.index_head_dim  # 128
+        s_bytes = self.index_head_dim // self.quant_block_size * 4  # 4
+        s_page_offset = page_size * k_bytes  # scale region offset in page
+
+        for buf in self.index_k_with_scale_buffer:
+            stride = buf.shape[1]
+            flat = buf.flatten()
+
+            src_page = src // page_size
+            src_off = src % page_size
+            tgt_page = tgt // page_size
+            tgt_off = tgt % page_size
+
+            # K data: gather from src, scatter to tgt
+            k_range = torch.arange(k_bytes, device=buf.device)
+            src_k_idx = (
+                (src_page * stride)[:, None]
+                + (src_off * k_bytes)[:, None]
+                + k_range[None, :]
+            ).flatten()
+            tgt_k_idx = (
+                (tgt_page * stride)[:, None]
+                + (tgt_off * k_bytes)[:, None]
+                + k_range[None, :]
+            ).flatten()
+            flat[tgt_k_idx] = flat[src_k_idx]
+
+            # S data: gather from src, scatter to tgt
+            s_range = torch.arange(s_bytes, device=buf.device)
+            src_s_idx = (
+                (src_page * stride)[:, None]
+                + s_page_offset
+                + (src_off * s_bytes)[:, None]
+                + s_range[None, :]
+            ).flatten()
+            tgt_s_idx = (
+                (tgt_page * stride)[:, None]
+                + s_page_offset
+                + (tgt_off * s_bytes)[:, None]
+                + s_range[None, :]
+            ).flatten()
+            flat[tgt_s_idx] = flat[src_s_idx]
+
 
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
@@ -2019,6 +2080,122 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for Triton-based KV cache copy (used by MHA and MLA pools)
+# ---------------------------------------------------------------------------
+
+# Heuristic constants for KV copy tiling
+_KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
+_KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
+_KV_COPY_TILE_SIZE_LARGE = 512
+_KV_COPY_TILE_SIZE_MEDIUM = 256
+_KV_COPY_TILE_SIZE_SMALL = 128
+_KV_COPY_NUM_WARPS_LARGE_TILE = 8
+_KV_COPY_NUM_WARPS_SMALL_TILE = 4
+
+
+def _compute_kv_copy_config_and_warmup(
+    data_ptrs: torch.Tensor,
+    data_strides: torch.Tensor,
+    device: str,
+) -> dict:
+    """Compute tiling config and warmup the Triton copy kernel.
+
+    Shared by MHATokenToKVPool and MLATokenToKVPool (and their FP4 variants).
+    Returns the config dict to be stored as ``self._kv_copy_config``.
+    """
+    stride_bytes = int(data_strides[0].item())
+    if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
+    elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
+    else:
+        bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
+
+    # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+    chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
+
+    config = {
+        "bytes_per_tile": bytes_per_tile,
+        "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
+        "num_warps": (
+            _KV_COPY_NUM_WARPS_SMALL_TILE
+            if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
+            else _KV_COPY_NUM_WARPS_LARGE_TILE
+        ),
+        "num_locs_upper": chunk_upper,
+    }
+
+    # Warmup: pre-compile the Triton kernel with dummy data
+    dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=device)
+    grid = (data_ptrs.numel(), config["byte_tiles"])
+    copy_all_layer_kv_cache_tiled[grid](
+        data_ptrs,
+        data_strides,
+        dummy_loc,
+        dummy_loc,
+        1,
+        chunk_upper,
+        BYTES_PER_TILE=config["bytes_per_tile"],
+        num_warps=config["num_warps"],
+        num_stages=2,
+    )
+    return config
+
+
+def _triton_move_kv_cache(
+    data_ptrs: torch.Tensor,
+    data_strides: torch.Tensor,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+    kv_copy_config: dict,
+):
+    """Triton-based KV cache copy shared by MHA and MLA pools."""
+    N = tgt_loc.numel()
+    if N == 0:
+        return
+
+    # Ensure int64 for safe pointer arithmetic in Triton kernel
+    tgt_loc = tgt_loc.to(torch.int64)
+    src_loc = src_loc.to(torch.int64)
+
+    cfg = kv_copy_config
+    cap = int(cfg["num_locs_upper"])
+    grid = (data_ptrs.numel(), cfg["byte_tiles"])
+
+    if N <= cap:
+        upper = next_power_of_2(N)
+        copy_all_layer_kv_cache_tiled[grid](
+            data_ptrs,
+            data_strides,
+            tgt_loc,
+            src_loc,
+            N,
+            upper,
+            BYTES_PER_TILE=cfg["bytes_per_tile"],
+            num_warps=cfg["num_warps"],
+            num_stages=2,
+        )
+        return
+
+    # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
+    for start in range(0, N, cap):
+        end = min(start + cap, N)
+        chunk_len = end - start
+        upper = next_power_of_2(chunk_len)
+        copy_all_layer_kv_cache_tiled[grid](
+            data_ptrs,
+            data_strides,
+            tgt_loc[start:end],
+            src_loc[start:end],
+            chunk_len,
+            upper,
+            BYTES_PER_TILE=cfg["bytes_per_tile"],
+            num_warps=cfg["num_warps"],
+            num_stages=2,
+        )
 
 
 @triton.jit

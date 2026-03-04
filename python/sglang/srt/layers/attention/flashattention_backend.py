@@ -1040,11 +1040,27 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    # expand page_table uses token-level indices (not divided
+                    # by page_size), so view the cache with page_size=1 to
+                    # match, same as the non-MLA path.
+                    # NOTE: MLA has tp_k_head_num == tp_v_head_num == 1, so the
+                    # view below is always valid. If TP layout changes in the
+                    # future this assumption must be revisited.
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_rope,
-                            k_cache=k_rope_cache,
-                            v_cache=c_kv_cache,
+                            k_cache=k_rope.view(
+                                -1,
+                                1,
+                                layer.tp_k_head_num,
+                                layer.head_dim - layer.v_head_dim,
+                            ),
+                            v_cache=c_kv.view(
+                                -1,
+                                1,
+                                layer.tp_v_head_num,
+                                layer.v_head_dim,
+                            ),
                             qv=q_nope,
                             page_table=self.forward_metadata_spec_decode_expand.page_table,
                             cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
