@@ -771,30 +771,53 @@ class DiffusionRouter:
         status, payload = await self._broadcast_to_pool(
             request, "release_memory_occupation"
         )
-        if status != 200:
-            return JSONResponse(status_code=status, content=payload)
+        if status == 200:
+            for item in payload["results"]:
+                if item.get("status_code") == 200:
+                    self.sleeping_workers.add(item["worker_url"])
+            return JSONResponse(content=payload)
 
-        for item in payload["results"]:
-            if item.get("status_code") == 200:
-                self.sleeping_workers.add(item["worker_url"])
+        all_already_sleeping = bool(self.worker_request_counts) and all(
+            url in self.sleeping_workers
+            for url in self.worker_request_counts
+            if url not in self.dead_workers
+        )
+        if all_already_sleeping:
+            return JSONResponse(
+                content={
+                    "message": "All workers are already sleeping",
+                    "sleeping_workers": len(self.sleeping_workers),
+                }
+            )
 
-        return JSONResponse(content=payload)
+        return JSONResponse(status_code=status, content=payload)
 
     async def resume_memory_occupation(self, request: Request):
         status, payload = await self._broadcast_to_pool(
             request, "resume_memory_occupation"
         )
-        if status != 200:
-            return JSONResponse(status_code=status, content=payload)
+        if status == 200:
+            for item in payload["results"]:
+                if item.get("status_code") == 200:
+                    url = item["worker_url"]
+                    self.sleeping_workers.discard(url)
+                    self.worker_failure_counts[url] = 0
+                    self.dead_workers.discard(url)
+            return JSONResponse(content=payload)
 
-        for item in payload["results"]:
-            if item.get("status_code") == 200:
-                url = item["worker_url"]
-                self.sleeping_workers.discard(url)
-                self.worker_failure_counts[url] = 0
-                self.dead_workers.discard(url)  # wake success => recover
+        has_no_sleeping_workers = not self.sleeping_workers and bool(
+            self.worker_request_counts
+        )
+        if has_no_sleeping_workers:
+            return JSONResponse(
+                content={
+                    "message": "All workers are already active",
+                    "active_workers": len(self.worker_request_counts)
+                    - len(self.dead_workers),
+                }
+            )
 
-        return JSONResponse(content=payload)
+        return JSONResponse(status_code=status, content=payload)
 
     def register_worker(self, url: str) -> None:
         """Register a worker URL if not already known."""

@@ -55,7 +55,7 @@ sglang-d-router --port 30081 --launcher-config examples/local_launcher.yaml
 ```yaml
 launcher:
   backend: local
-  model: stabilityai/stable-diffusion-3-medium-diffusers
+  model: Qwen/Qwen-Image
   num_workers: 8
   num_gpus_per_worker: 1
   worker_base_port: 10090
@@ -70,14 +70,14 @@ launcher:
 
 # worker 1
 CUDA_VISIBLE_DEVICES=0 sglang serve \
-    --model-path stabilityai/stable-diffusion-3-medium-diffusers \
+    --model-path Qwen/Qwen-Image \
     --num-gpus 1 \
     --host 127.0.0.1 \
     --port 30000
 
 # worker 2
 CUDA_VISIBLE_DEVICES=1 sglang serve \
-    --model-path stabilityai/stable-diffusion-3-medium-diffusers \
+    --model-path Qwen/Qwen-Image \
     --num-gpus 1 \
     --host 127.0.0.1 \
     --port 30002
@@ -139,7 +139,7 @@ print("Saved to output.png")
 # so this request will fail. Use a video-capable model instead.
 
 resp = requests.post(f"{ROUTER}/v1/videos", json={
-    "model": "stabilityai/stable-diffusion-3-medium-diffusers",
+    "model": "Qwen/Qwen-Image",
     "prompt": "a flowing river",
 })
 print(resp.json())
@@ -149,8 +149,16 @@ if video_id:
 
 # Update weights from disk
 resp = requests.post(f"{ROUTER}/update_weights_from_disk", json={
-    "model_path": "/path/to/new/checkpoint",
+    "model_path": "Qwen/Qwen-Image-2512",
 })
+print(resp.json())
+
+# sleep and wake up
+resp = requests.post(f"{ROUTER}/release_memory_occupation", json={})
+print(resp.json())
+
+
+resp = requests.post(f"{ROUTER}/resume_memory_occupation", json={})
 print(resp.json())
 ```
 

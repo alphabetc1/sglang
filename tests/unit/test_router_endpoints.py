@@ -415,6 +415,31 @@ def test_resume_memory_occupation_unmarks_sleeping_resets_failure_and_revives_de
     assert router.worker_failure_counts["http://localhost:10091"] == 2
 
 
+def test_release_memory_occupation_idempotent_when_all_already_sleeping():
+    router = DiffusionRouter(make_router_args())
+    router.register_worker("http://localhost:10090")
+    router.register_worker("http://localhost:10091")
+    router.sleeping_workers.update(["http://localhost:10090", "http://localhost:10091"])
+
+    with TestClient(router.app) as client:
+        resp = client.post("/release_memory_occupation", json={})
+        assert resp.status_code == 200
+        assert "already sleeping" in resp.json()["message"].lower()
+        assert resp.json()["sleeping_workers"] == 2
+
+
+def test_resume_memory_occupation_idempotent_when_all_already_active():
+    router = DiffusionRouter(make_router_args())
+    router.register_worker("http://localhost:10090")
+    router.register_worker("http://localhost:10091")
+
+    with TestClient(router.app) as client:
+        resp = client.post("/resume_memory_occupation", json={})
+        assert resp.status_code == 200
+        assert "already active" in resp.json()["message"].lower()
+        assert resp.json()["active_workers"] == 2
+
+
 def test_select_worker_excludes_sleeping_workers():
     router = DiffusionRouter(make_router_args(routing_algorithm="least-request"))
     router.register_worker("http://localhost:10090")
