@@ -27,7 +27,7 @@ From repository root:
 # python3 -m venv .venv
 # source .venv/bin/activate
 # pip install uv
-git clone --recursive https://github.com/sglang/sglang-diffusion-routing.git
+git clone --recursive https://github.com/zhaochenyang20/sglang-diffusion-routing.git
 cd sglang-diffusion-routing
 uv pip install .
 ```
