@@ -33,9 +33,9 @@ uv pip install .
 # Install SGLang diffusion from the pinned submodule (includes RL patches).
 # Do NOT install sglang from PyPI — the submodule tracks a fork with
 # /v1/diffusion/generate, flow-matching log-prob, and other RL features.
-cd sglang
+cd sglang/python
 uv pip install ".[diffusion]" --prerelease=allow
-cd ..
+cd ../..
 ```
 
 ## Quick Start
@@ -60,6 +60,9 @@ launcher:
 
 ### Manual Launch Workers
 
+<details>
+<summary>Manual Launch Workers</summary>
+
 ```bash
 # If connect to HuggingFace is not allowed
 # You can set the environment variable SGLANG_USE_MODELSCOPE=TRUE
@@ -82,7 +85,25 @@ sglang-d-router --port 30081 \
     --worker-urls http://localhost:30000 http://localhost:30002
 ```
 
+</details>
+
+
+
 ## Demonstrative Examples
+
+A typical RL loop looks like:
+
+```
+1. Start workers   → sglang-d-router --port 30081 --launcher-config examples/local_launcher.yaml
+2. Rollout         → POST /v1/images/generations or /v1/diffusion/generate
+3. Sleep workers   → POST /release_memory_occupation
+4. Train on rollout data (GPU memory now free for training)
+5. Wake workers    → POST /resume_memory_occupation
+6. Refit weights   → POST /update_weights_from_disk
+7. Repeat from step 2
+```
+
+We provide all the steps in the code examples below.
 
 ### With Python Requests
 
@@ -116,7 +137,7 @@ print(resp.json())
 
 # Image generation request (OpenAI-compatible, returns base64-encoded image)
 resp = requests.post(f"{ROUTER}/v1/images/generations", json={
-    "model": "stabilityai/stable-diffusion-3-medium-diffusers",
+    "model": "Qwen/Qwen-Image",
     "prompt": "a cute cat",
     "num_images": 1,
     "response_format": "b64_json",
@@ -187,28 +208,23 @@ data = resp.json()
 print(f"Inference time: {data.get('inference_time_s')}s")
 
 # Decode the output image
-if data.get("output_b64"):
-    img_bytes = base64.b64decode(data["output_b64"])
-    with open("output.png", "wb") as f:
-        f.write(img_bytes)
-    print(f"Saved image ({data.get('output_format', 'unknown')} format)")
+img_bytes = base64.b64decode(data["output_b64"])
+with open("output.png", "wb") as f:
+    f.write(img_bytes)
+print(f"Saved image ({data.get('output_format', 'unknown')} format)")
 
 # Decode trajectory data
 trajectory = data.get("trajectory")
-if trajectory:
-    if trajectory.get("latents"):
-        latents = np.load(io.BytesIO(base64.b64decode(trajectory["latents"])))
-        print(f"Latents shape: {trajectory['latents_shape']}, dtype: {trajectory['latents_dtype']}")
-        print(f"Decoded latents array shape: {latents.shape}")
+latents = np.load(io.BytesIO(base64.b64decode(trajectory["latents"])))
+print(f"Latents shape: {trajectory['latents_shape']}, dtype: {trajectory['latents_dtype']}")
+print(f"Decoded latents array shape: {latents.shape}")
 
-    if trajectory.get("timesteps"):
-        timesteps = [np.load(io.BytesIO(base64.b64decode(t))) for t in trajectory["timesteps"]]
-        print(f"Timesteps count: {len(timesteps)}")
+timesteps = [np.load(io.BytesIO(base64.b64decode(t))) for t in trajectory["timesteps"]]
+print(f"Timesteps count: {len(timesteps)}")
 
-    if trajectory.get("log_probs"):
-        log_probs = np.load(io.BytesIO(base64.b64decode(trajectory["log_probs"])))
-        print(f"Log-probs shape: {trajectory['log_probs_shape']}")
-        print(f"Decoded log-probs array shape: {log_probs.shape}")
+log_probs = np.load(io.BytesIO(base64.b64decode(trajectory["log_probs"])))
+print(f"Log-probs shape: {trajectory['log_probs_shape']}")
+print(f"Decoded log-probs array shape: {log_probs.shape}")
 ```
 
 ### Rollout with SDE/CPS Log-Prob Computation
@@ -265,144 +281,6 @@ data = resp.json()
 print(f"Trajectory available: {data.get('trajectory') is not None}")
 ```
 
-### Sleep / Wake (Memory Occupation Control)
-
-In RL training pipelines, the diffusion server is typically slept during the
-training phase to free GPU memory, then woken up for the next rollout with
-updated weights. The router broadcasts sleep/wake commands to all workers.
-
-```python
-import requests
-
-ROUTER = "http://localhost:30081"
-
-# --- Sleep: release GPU memory on all workers ---
-resp = requests.post(f"{ROUTER}/release_memory_occupation", json={})
-print(resp.json())
-# Each worker result shows {"worker_url": "...", "status_code": 200, "body": {"success": true, "sleeping": true}}
-
-# While sleeping, generation requests are rejected:
-resp = requests.post(f"{ROUTER}/v1/images/generations", json={
-    "model": "stabilityai/stable-diffusion-3-medium-diffusers",
-    "prompt": "a cute cat",
-    "response_format": "b64_json",
-})
-print(resp.status_code)  # 503 — workers are sleeping
-
-# Sleep is idempotent: calling again is safe and returns 200.
-resp = requests.post(f"{ROUTER}/release_memory_occupation", json={})
-print(resp.json())
-
-# --- Wake: resume GPU memory on all workers ---
-resp = requests.post(f"{ROUTER}/resume_memory_occupation", json={})
-print(resp.json())
-# Each worker result shows {"worker_url": "...", "status_code": 200, "body": {"success": true, "sleeping": false}}
-
-# Wake is also idempotent.
-resp = requests.post(f"{ROUTER}/resume_memory_occupation", json={})
-print(resp.json())
-
-# After waking, you can optionally refit weights before the next rollout:
-resp = requests.post(f"{ROUTER}/update_weights_from_disk", json={
-    "model_path": "/path/to/new/checkpoint",
-})
-print(resp.json())
-
-# Now generation works again:
-resp = requests.post(f"{ROUTER}/v1/images/generations", json={
-    "model": "stabilityai/stable-diffusion-3-medium-diffusers",
-    "prompt": "a cute cat",
-    "response_format": "b64_json",
-})
-print(resp.status_code)  # 200
-```
-
-A typical RL loop looks like:
-
-```
-1. Wake workers    → POST /resume_memory_occupation
-2. Refit weights   → POST /update_weights_from_disk
-3. Run rollout     → POST /v1/images/generations or /v1/diffusion/generate
-4. Sleep workers   → POST /release_memory_occupation
-5. Train on rollout data (GPU memory now free for training)
-6. Repeat from step 1
-```
-
-### With Curl
-
-```bash
-# Check router health
-curl http://localhost:30081/health
-
-# Register a worker
-curl -X POST http://localhost:30081/workers \
-    -H "Content-Type: application/json" \
-    -d '{"url": "http://localhost:30000"}'
-
-# List registered workers (with health/load)
-curl http://localhost:30081/workers
-
-# Image generation request (returns base64-encoded image)
-curl -X POST http://localhost:30081/v1/images/generations \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "stabilityai/stable-diffusion-3-medium-diffusers",
-        "prompt": "a cute cat",
-        "num_images": 1,
-        "response_format": "b64_json"
-    }'
-
-# Decode and save the image locally
-curl -s -X POST http://localhost:30081/v1/images/generations \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "stabilityai/stable-diffusion-3-medium-diffusers",
-        "prompt": "a cute cat",
-        "num_images": 1,
-        "response_format": "b64_json"
-    }' | python3 -c "
-import sys, json, base64
-resp = json.load(sys.stdin)
-img = base64.b64decode(resp['data'][0]['b64_json'])
-with open('output.png', 'wb') as f:
-    f.write(img)
-print('Saved to output.png')
-"
-
-# Native diffusion generate with trajectory
-curl -X POST http://localhost:30081/v1/diffusion/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "prompt": "a cute cat",
-        "width": 512,
-        "height": 512,
-        "get_latents": true,
-        "get_log_probs": true
-    }'
-
-# Video generation request
-curl -X POST http://localhost:30081/v1/videos \
-    -H "Content-Type: application/json" \
-    -d '{"model": "stabilityai/stable-diffusion-3-medium-diffusers", "prompt": "a flowing river"}'
-
-# Poll a specific video job by video_id
-curl http://localhost:30081/v1/videos/{video_id}
-
-# Update weights from disk
-curl -X POST http://localhost:30081/update_weights_from_disk \
-    -H "Content-Type: application/json" \
-    -d '{"model_path": "/path/to/new/checkpoint"}'
-
-# Sleep workers (release GPU memory)
-curl -X POST http://localhost:30081/release_memory_occupation \
-    -H "Content-Type: application/json" \
-    -d '{}'
-
-# Wake workers (resume GPU memory)
-curl -X POST http://localhost:30081/resume_memory_occupation \
-    -H "Content-Type: application/json" \
-    -d '{}'
-```
 
 ## Router API
 
@@ -461,7 +339,7 @@ Both sleep and wake are idempotent. While sleeping, generation requests are reje
 
 ## Acknowledgment
 
-This project is derived from [radixark/miles#544](https://github.com/radixark/miles/pull/544). Thanks to the original authors.
+This project is derived from [radixark/miles#544](https://github.com/radixark/miles/pull/544) and [alphabetc1/sglang](https://github.com/alphabetc1/sglang/tree/sglang/diffusion-rl-base). Thanks to the original authors.
 
 SGLang Diffusion RL team is responsible for the development and maintenance of this project. Our team mates in alphabetical order:
 
