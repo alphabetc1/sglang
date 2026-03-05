@@ -200,29 +200,41 @@ class DecodingStage(PipelineStage):
         frames = self.decode(batch.latents, server_args)
 
         # decode trajectory latents if needed
+        trajectory_decoded = None
         if batch.return_trajectory_decoded:
             assert (
                 batch.trajectory_latents is not None
             ), "batch should have trajectory latents"
 
-            # 1. Batch trajectory decoding to improve GPU utilization
-            # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
-            B, T, C, F, H, W = batch.trajectory_latents.shape
-            flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+            ndim = batch.trajectory_latents.ndim
+            if ndim == 6:
+                # Video latents: [B, T, C, F, H, W]
+                B, T, C, F, H, W = batch.trajectory_latents.shape
+                flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+            elif ndim == 5:
+                # Image latents (no frames dim): [B, T, C, H, W]
+                B, T, C, H, W = batch.trajectory_latents.shape
+                flat_latents = batch.trajectory_latents.view(B * T, C, 1, H, W)
+            else:
+                # Packed / non-standard latent layout (e.g. Qwen-Image stores
+                # packed 3-D per-step latents → 4-D after stack).  VAE decode
+                # requires unpacked spatial dims which are not available here,
+                # so skip trajectory decoding and keep raw latents only.
+                logger.warning(
+                    "Skipping trajectory decoding: unsupported latent ndim=%d "
+                    "(expected 5 or 6). Raw latents are still available.",
+                    ndim,
+                )
+                flat_latents = None
 
-            logger.info("decoding %s trajectory latents in batch", B * T)
-            # Use the optimized batch decode
-            all_decoded = self.decode(flat_latents, server_args)
-
-            # 2. Reshape back
-            # Keep on GPU to allow faster vectorized post-processing
-            decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
-
-            # Convert to list of tensors (per timestep) as expected by OutputBatch
-            # Each element in list is [B, channels, frames, H_out, W_out]
-            trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
-        else:
-            trajectory_decoded = None
+            if flat_latents is not None:
+                logger.info(
+                    "decoding %d trajectory latents in batch",
+                    flat_latents.shape[0],
+                )
+                all_decoded = self.decode(flat_latents, server_args)
+                decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+                trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 
