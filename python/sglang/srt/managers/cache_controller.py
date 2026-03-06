@@ -284,6 +284,7 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self.storage_io_blocked = threading.Event()
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -349,6 +350,15 @@ class HiCacheController:
 
         self.prefetch_thread.start()
         self.backup_thread.start()
+
+    def set_storage_io_blocked(self, blocked: bool):
+        if blocked:
+            self.storage_io_blocked.set()
+        else:
+            self.storage_io_blocked.clear()
+
+    def is_storage_io_blocked(self) -> bool:
+        return self.storage_io_blocked.is_set()
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -481,6 +491,7 @@ class HiCacheController:
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
+            self.storage_io_blocked.clear()
             self._start_storage_threads()
         except Exception:
             # Best-effort cleanup for partial init.
@@ -513,15 +524,16 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
             raise
 
-    def detach_storage_backend(self):
+    def detach_storage_backend(self, force: bool = False) -> bool:
         """Detach (disable) storage backend at runtime.
 
-        Requirement: no in-flight requests. This will stop storage threads and release
-        the backend instance (best-effort close).
+        Args:
+            force: Reserved for compatibility with upper layers. In strict mode,
+                detach still fails if storage threads cannot be joined.
+
+        Returns:
+            True if resources are released cleanly.
         """
-        # Idempotent cleanup: even if `enable_storage` is already False,
-        # we may still have leftover resources (threads/backend/process group) from a
-        # previous partial detach. We attempt cleanup whenever possible.
         try:
             self._stop_storage_threads()
         except Exception as e:
@@ -784,6 +796,9 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        if self.storage_io_blocked.is_set():
+            return None
+
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -982,6 +997,9 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
+        if self.storage_io_blocked.is_set():
+            return None
+
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
