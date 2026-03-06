@@ -208,6 +208,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -320,6 +321,23 @@ class Scheduler(
         )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
+
+        # Per-request spec decode overhead for early admission control.
+        self.spec_decode_overhead = 0
+        if server_args.speculative_algorithm is not None:
+            _num_steps = server_args.speculative_num_steps or 1
+            _topk = server_args.speculative_eagle_topk or 1
+            _draft_tokens = server_args.speculative_num_draft_tokens or 0
+            if self.page_size > 1 and _topk > 1:
+                _len_per_topk = ceil_align(_num_steps + self.page_size, self.page_size)
+                _draft_tokens = ceil_align(_draft_tokens, self.page_size)
+            elif self.page_size > 1:
+                _len_per_topk = ceil_align(_num_steps, self.page_size)
+                _draft_tokens = ceil_align(_draft_tokens, self.page_size)
+            else:
+                _len_per_topk = _num_steps
+            self.spec_decode_overhead = max(_len_per_topk * _topk, _draft_tokens)
+
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
@@ -1661,6 +1679,28 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        # Early rejection: if input + max_new_tokens + spec overhead exceeds
+        # the total KV pool capacity, this request can never be scheduled.
+        if self.spec_decode_overhead > 0:
+            total_needed = (
+                len(req.origin_input_ids)
+                + req.sampling_params.max_new_tokens
+                + self.spec_decode_overhead
+            )
+            if total_needed > self.max_total_num_tokens:
+                error_msg = (
+                    f"Request requires {total_needed} tokens "
+                    f"(input={len(req.origin_input_ids)}, "
+                    f"max_new_tokens={req.sampling_params.max_new_tokens}, "
+                    f"spec_overhead={self.spec_decode_overhead}) "
+                    f"but total KV pool capacity is {self.max_total_num_tokens}. "
+                    f"Out of memory even after retracting all other requests. "
+                    f"Use shorter input/output or increase --max-total-tokens."
+                )
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
