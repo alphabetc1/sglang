@@ -22,6 +22,7 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 Notes:
 
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](hicache_storage_runtime_attach_detach.md).
+- To pre-populate the host KV cache from storage on cold start, set `warmup_ratio` in the extra config (e.g., `'{"warmup_ratio": 0.5}'`). See [HiCache Global Warmup](hicache_global_warmup.md).
 
 ## Key Configurations with Storage Backends Enabled
 

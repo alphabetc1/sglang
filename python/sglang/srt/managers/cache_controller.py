@@ -1062,6 +1062,36 @@ class HiCacheController:
             except Empty:
                 continue
 
+    def _warmup_load_pages(self, hash_chain, host_indices):
+        """Load pages from storage into host memory. Returns count of consecutive successes."""
+        # Try v1 interface first (zero-copy path for advanced backends)
+        results = self.storage_backend.batch_get_v1(hash_chain, host_indices)
+        if results is not None:
+            success_count = 0
+            for r in results:
+                if not r:
+                    break
+                success_count += 1
+            return success_count
+
+        # Fall back to legacy batch_get interface (e.g., HiCacheFile)
+        dummy_pages = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_chain
+        ]
+        page_data = self.storage_backend.batch_get(hash_chain, dummy_pages)
+        if page_data is None:
+            return 0
+        success_count = 0
+        for i in range(len(hash_chain)):
+            if page_data[i] is None:
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size],
+                page_data[i],
+            )
+            success_count += 1
+        return success_count
+
     def start_warmup(self, max_tokens, result_queue, tp_group=None):
         """Start background warmup thread. Returns the thread handle."""
         thread = threading.Thread(
@@ -1083,6 +1113,9 @@ class HiCacheController:
             loaded_tokens = 0
             for entry in entries:
                 if loaded_tokens >= max_tokens:
+                    break
+                if self.storage_stop_event.is_set():
+                    logger.info("Warmup: storage detached, stopping.")
                     break
 
                 # Align to page_size
@@ -1130,15 +1163,7 @@ class HiCacheController:
                     hash_chain = hash_chain[:hit_count]
 
                 # Load KV data from storage into host memory
-                results = self.storage_backend.batch_get_v1(hash_chain, host_indices)
-
-                # Count consecutive successes
-                success_count = 0
-                if results is not None:
-                    for r in results:
-                        if not r:
-                            break
-                        success_count += 1
+                success_count = self._warmup_load_pages(hash_chain, host_indices)
 
                 if success_count == 0:
                     self.mem_pool_host.free(host_indices)

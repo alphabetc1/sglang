@@ -228,7 +228,13 @@ class HiRadixCache(RadixCache):
                 break
             token_ids, hash_chain, host_indices, priority = item
             key = RadixKey(token_ids=token_ids)
-            self._insert_helper_host(self.root_node, key, host_indices, hash_chain)
+            matched = self._insert_helper_host(
+                self.root_node, key, host_indices, hash_chain
+            )
+            # Free host indices for the already-matched prefix (they duplicate
+            # existing nodes and would otherwise leak).
+            if matched > 0:
+                self.cache_controller.mem_pool_host.free(host_indices[:matched])
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -372,6 +378,7 @@ class HiRadixCache(RadixCache):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                warmup_ratio,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -405,6 +412,11 @@ class HiRadixCache(RadixCache):
             enable_storage_metrics=self._enable_metrics_flag,
             extra_metric_labels=self.extra_metric_labels,
         )
+
+        # Trigger warmup if configured (default off for attach path)
+        self.warmup_ratio = warmup_ratio
+        self.warmup_from_storage()
+
         return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
