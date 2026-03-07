@@ -14,8 +14,8 @@ You can optionally enable a **force mode** (`"force": true`) to switch even unde
 - The idle check is **bypassed**
 - New storage IO is **blocked** immediately (new prefetch/backup will be skipped)
 - The request goes directly to runtime attach/detach logic
-- On force detach, the system waits briefly (up to 5 s) for in-flight storage ops to drain; timeout only logs a warning
-- On detach, if storage threads do not stop in time, the switch can still **proceed anyway**
+- On force detach, the system waits briefly (up to 10 s) for in-flight storage ops to drain; timeout only logs a warning
+- On detach, if storage threads do not stop in time, the switch **fails** instead of force-releasing the backend
 
 ---
 
@@ -144,6 +144,7 @@ Notes:
 - **Must be idle (default)**: otherwise the request is rejected (HTTP 400) to avoid consistency issues.  Pass `"force": true` to bypass the idle check
 - **Force mode**:
   - In-flight requests are **not affected**; they continue normally while the switch blocks new storage prefetch/backup issuance
+  - Detach remains **conservative**: if storage background threads cannot stop cleanly, the API returns failure and leaves the backend attached
 - **Host KV layout constraints still apply**: for example, Mooncake still requires layouts like `page_first/page_first_direct/page_head`; if the server's HiCache host-memory layout does not satisfy the backend requirements, attach will fail with an error
 - **Observability**:
   - After attach, `server_args.hicache_storage_backend*` is updated on both the tokenizer and scheduler sides

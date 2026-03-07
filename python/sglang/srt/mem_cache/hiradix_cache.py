@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import heapq
 import json
 import logging
 import os
 import threading
 import time
-from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -193,36 +193,19 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 
-    def set_storage_io_blocked(self, blocked: bool):
-        self.cache_controller.set_storage_io_blocked(blocked)
+    def _count_pending_storage_bookkeeping(self) -> int:
+        return len(self.ongoing_backup) + len(self.ongoing_prefetch)
 
-    def _count_pending_storage_ops(self) -> int:
-        pending = len(self.ongoing_backup) + len(self.ongoing_prefetch)
-        cc = self.cache_controller
-        for name in (
-            "backup_queue",
-            "prefetch_queue",
-            "prefetch_buffer",
-            "ack_backup_queue",
-            "prefetch_revoke_queue",
-            "host_mem_release_queue",
-        ):
-            q = getattr(cc, name, None)
-            if q is None:
-                continue
-            try:
-                pending += q.qsize()
-            except Exception:
-                continue
-        return pending
-
-    def wait_storage_ops_idle(
+    def _wait_storage_ops_idle(
         self, timeout_s: float = 10.0, poll_interval_s: float = 0.1
     ) -> tuple[bool, str]:
         start = time.monotonic()
         while True:
             self._drain_storage_control_queues_local()
-            pending = self._count_pending_storage_ops()
+            pending = (
+                self.cache_controller.count_pending_storage_ops()
+                + self._count_pending_storage_bookkeeping()
+            )
 
             if pending == 0:
                 return True, ""
@@ -232,6 +215,16 @@ class HiRadixCache(RadixCache):
                     f"Timeout waiting for storage ops to drain: pending={pending}",
                 )
             time.sleep(poll_interval_s)
+
+    @contextmanager
+    def _storage_io_blocked(self, force: bool) -> Iterator[None]:
+        if force:
+            self.cache_controller.set_storage_io_blocked(True)
+        try:
+            yield
+        finally:
+            if force:
+                self.cache_controller.set_storage_io_blocked(False)
 
     def _apply_storage_runtime_config(
         self,
@@ -279,100 +272,6 @@ class HiRadixCache(RadixCache):
                     sorted(labels.keys()),
                 )
 
-    def _attach_storage_backend_impl(
-        self,
-        storage_backend: str,
-        storage_backend_extra_config_json: Optional[str] = None,
-        served_model_name: Optional[str] = None,
-        hicache_storage_prefetch_policy: Optional[str] = None,
-        hicache_write_policy: Optional[str] = None,
-    ) -> tuple[bool, str]:
-        # If already enabled:
-        # - backend unchanged: treat as success, update policies only.
-        # - backend changed: treat as failure, do NOT update policies.
-        if self.enable_storage:
-            current_backend = self.cache_controller.storage_backend_type
-
-            if current_backend == storage_backend:
-                if hicache_storage_prefetch_policy is not None:
-                    self.prefetch_stop_policy = hicache_storage_prefetch_policy
-                    logger.info(
-                        f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
-                    )
-                if hicache_write_policy is not None:
-                    self.cache_controller.write_policy = hicache_write_policy
-                    self.write_through_threshold = (
-                        1 if hicache_write_policy == "write_through" else 2
-                    )
-                    logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
-                return (
-                    True,
-                    "HiCache storage backend already enabled with same backend; policies updated.",
-                )
-
-            return (
-                False,
-                f"HiCache storage backend is already enabled with backend '{current_backend}'. "
-                f"Cannot attach different backend '{storage_backend}'. Detach first.",
-            )
-
-        # Not enabled: update policies before controller attach so storage threads observe new values.
-        if hicache_storage_prefetch_policy is not None:
-            self.prefetch_stop_policy = hicache_storage_prefetch_policy
-            logger.info(
-                f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
-            )
-
-        if hicache_write_policy is not None:
-            self.cache_controller.write_policy = hicache_write_policy
-            self.write_through_threshold = (
-                1 if hicache_write_policy == "write_through" else 2
-            )
-            logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
-
-        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
-        try:
-            (
-                extra_config,
-                prefetch_threshold,
-                prefetch_timeout_base,
-                prefetch_timeout_per_ki_token,
-                hicache_storage_pass_prefix_keys,
-            ) = self._parse_storage_backend_extra_config(
-                storage_backend_extra_config_json
-            )
-        except Exception as e:
-            logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
-            return (
-                False,
-                f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
-            )
-
-        try:
-            self.cache_controller.attach_storage_backend(
-                storage_backend=storage_backend,
-                prefetch_threshold=prefetch_threshold,
-                model_name=served_model_name,
-                storage_backend_extra_config=extra_config,
-            )
-        except Exception as e:
-            logger.exception(
-                f"Failed to attach storage backend '{storage_backend}': {e}"
-            )
-            return False, f"Failed to attach storage backend '{storage_backend}': {e}"
-
-        self._apply_storage_runtime_config(
-            storage_backend=storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
-            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
-            enable_storage=True,
-            enable_storage_metrics=self._enable_metrics_flag,
-            extra_metric_labels=self.extra_metric_labels,
-        )
-        return True, "Attached HiCache storage backend successfully."
-
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -410,22 +309,98 @@ class HiRadixCache(RadixCache):
                     f"Expected one of {allowed}.",
                 )
 
-        cleanup_io_block = False
-        if force:
-            self.set_storage_io_blocked(True)
-            cleanup_io_block = True
+        with self._storage_io_blocked(force):
+            # If already enabled:
+            # - backend unchanged: treat as success, update policies only.
+            # - backend changed: treat as failure, do NOT update policies.
+            if self.enable_storage:
+                current_backend = self.cache_controller.storage_backend_type
 
-        try:
-            return self._attach_storage_backend_impl(
+                if current_backend == storage_backend:
+                    if hicache_storage_prefetch_policy is not None:
+                        self.prefetch_stop_policy = hicache_storage_prefetch_policy
+                        logger.info(
+                            f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+                        )
+                    if hicache_write_policy is not None:
+                        self.cache_controller.write_policy = hicache_write_policy
+                        self.write_through_threshold = (
+                            1 if hicache_write_policy == "write_through" else 2
+                        )
+                        logger.info(
+                            f"Set hicache_write_policy to {hicache_write_policy}"
+                        )
+                    return (
+                        True,
+                        "HiCache storage backend already enabled with same backend; policies updated.",
+                    )
+
+                return (
+                    False,
+                    f"HiCache storage backend is already enabled with backend '{current_backend}'. "
+                    f"Cannot attach different backend '{storage_backend}'. Detach first.",
+                )
+
+            # Not enabled: update policies before controller attach so storage threads observe new values.
+            if hicache_storage_prefetch_policy is not None:
+                self.prefetch_stop_policy = hicache_storage_prefetch_policy
+                logger.info(
+                    f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+                )
+            if hicache_write_policy is not None:
+                self.cache_controller.write_policy = hicache_write_policy
+                self.write_through_threshold = (
+                    1 if hicache_write_policy == "write_through" else 2
+                )
+                logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+
+            logger.info(f"Attaching HiCache storage backend: {storage_backend}")
+            try:
+                (
+                    extra_config,
+                    prefetch_threshold,
+                    prefetch_timeout_base,
+                    prefetch_timeout_per_ki_token,
+                    hicache_storage_pass_prefix_keys,
+                ) = self._parse_storage_backend_extra_config(
+                    storage_backend_extra_config_json
+                )
+            except Exception as e:
+                logger.exception(
+                    f"Failed to parse storage_backend_extra_config_json: {e}"
+                )
+                return (
+                    False,
+                    f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
+                )
+
+            try:
+                self.cache_controller.attach_storage_backend(
+                    storage_backend=storage_backend,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=served_model_name,
+                    storage_backend_extra_config=extra_config,
+                )
+            except Exception as e:
+                logger.exception(
+                    f"Failed to attach storage backend '{storage_backend}': {e}"
+                )
+                return (
+                    False,
+                    f"Failed to attach storage backend '{storage_backend}': {e}",
+                )
+
+            self._apply_storage_runtime_config(
                 storage_backend=storage_backend,
-                storage_backend_extra_config_json=storage_backend_extra_config_json,
-                served_model_name=served_model_name,
-                hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
-                hicache_write_policy=hicache_write_policy,
+                prefetch_threshold=prefetch_threshold,
+                prefetch_timeout_base=prefetch_timeout_base,
+                prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+                hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+                enable_storage=True,
+                enable_storage_metrics=self._enable_metrics_flag,
+                extra_metric_labels=self.extra_metric_labels,
             )
-        finally:
-            if cleanup_io_block:
-                self.set_storage_io_blocked(False)
+            return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self, force: bool = False) -> tuple[bool, str]:
         """Detach (disable) storage backend at runtime.
@@ -435,45 +410,30 @@ class HiRadixCache(RadixCache):
                 in-flight storage ops before detach. Thread-stop remains strict
                 in the controller.
         """
-        cleanup_io_block = False
-        if force:
-            self.set_storage_io_blocked(True)
-            cleanup_io_block = True
+        with self._storage_io_blocked(force):
+            if force:
+                drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=10.0)
+                if not drain_ok:
+                    logger.warning(
+                        "Force detach: storage ops still in-flight after wait: %s",
+                        drain_msg,
+                    )
 
-            drain_ok, drain_msg = self.wait_storage_ops_idle(timeout_s=10.0)
-            if not drain_ok:
-                logger.warning(
-                    "Force detach: storage ops still in-flight after wait: %s",
-                    drain_msg,
-                )
+            try:
+                self._drain_storage_control_queues_local()
+                self.cache_controller.detach_storage_backend(force=force)
+                self._drain_storage_control_queues_local()
+                self._cleanup_pending_storage_bookkeeping()
+            except Exception as e:
+                logger.exception("Failed to detach storage backend.")
+                # Do NOT crash the server for admin operations. Return failure with detail.
+                return False, f"Failed to detach HiCache storage backend: {e}"
 
-        try:
-            # Drain any pending control queues before tearing down storage threads/backend.
-            # IMPORTANT: this must happen before we clear `ongoing_*`, otherwise acks/releases
-            # cannot be matched to nodes and may leak host pages / locks.
-            self._drain_storage_control_queues_local()
-            # Idempotent detach: always ask controller to best-effort cleanup, even if
-            # `self.enable_storage` is already False (may be leftover state from a
-            # previous partial detach).
-            self.cache_controller.detach_storage_backend(force=force)
-        except Exception as e:
-            logger.exception("Failed to detach storage backend.")
-            # Do NOT crash the server for admin operations. Return failure with detail.
-            return False, f"Failed to detach HiCache storage backend: {e}"
-        finally:
-            self.set_storage_io_blocked(False)
+            self.enable_storage = False
+            self.enable_storage_metrics = False
+            return True, "Detached HiCache storage backend successfully."
 
-        # Best-effort cleanup of any leftover bookkeeping.
-        self._drain_storage_control_queues_local()
-        # After controller threads are fully stopped, it's safe to force-release any
-        # leftover pending ops (e.g., async prefetch/backup that didn't get a revoke/ack).
-        self._force_release_pending_storage_ops()
-
-        self.enable_storage = False
-        self.enable_storage_metrics = False
-        return True, "Detached HiCache storage backend successfully."
-
-    def _force_release_pending_storage_ops(self):
+    def _cleanup_pending_storage_bookkeeping(self):
         """Force release any leftover pending prefetch/backup bookkeeping.
 
         This is a safety net for detach/shutdown paths. It assumes storage threads
@@ -538,12 +498,34 @@ class HiRadixCache(RadixCache):
         This is intended for shutdown/detach paths where we want to make best-effort
         cleanup even if queue sizes temporarily differ across ranks.
         """
-        self._drain_storage_control_queues_impl(
-            n_revoke=None,
-            n_backup=None,
-            n_release=None,
-            log_metrics=False,
-        )
+        events = self.cache_controller.drain_storage_control_events_local()
+        self._apply_storage_control_events(events, log_metrics=False)
+
+    def _apply_storage_control_events(self, events, *, log_metrics: bool):
+        cc = self.cache_controller
+
+        for req_id in events.revoked_request_ids:
+            info = self.ongoing_prefetch.pop(req_id, None)
+            if info is not None:
+                last_host_node, token_ids, _, _ = info
+                last_host_node.release_host()
+                cc.prefetch_tokens_occupied -= len(token_ids)
+                if cc.prefetch_tokens_occupied < 0:
+                    cc.prefetch_tokens_occupied = 0
+
+        for operation in events.backup_acks:
+            ack_id = operation.id
+            entry = self.ongoing_backup.pop(ack_id, None)
+            if entry is not None:
+                entry.release_host()
+            if log_metrics and self.enable_storage_metrics:
+                self.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
+
+        if events.host_indices_to_release:
+            host_indices = torch.cat(events.host_indices_to_release, dim=0)
+            cc.mem_pool_host.free(host_indices)
 
     def _drain_storage_control_queues_impl(
         self,
@@ -552,55 +534,12 @@ class HiRadixCache(RadixCache):
         n_release: Optional[int],
         log_metrics: bool,
     ):
-        cc = self.cache_controller
-
-        def _drain_queue(q, limit: Optional[int]):
-            if q is None:
-                return
-            drained = 0
-            while limit is None or drained < limit:
-                try:
-                    item = q.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                yield item
-
-        def _drain_revoke():
-            revoke_q = getattr(cc, "prefetch_revoke_queue", None)
-            for req_id in _drain_queue(revoke_q, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
-                if info is not None:
-                    last_host_node, token_ids, _, _ = info
-                    last_host_node.release_host()
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
-
-        def _drain_backup():
-            ack_backup_q = getattr(cc, "ack_backup_queue", None)
-            for operation in _drain_queue(ack_backup_q, n_backup):
-                ack_id = operation.id
-                entry = self.ongoing_backup.pop(ack_id, None)
-                if entry is not None:
-                    entry.release_host()
-                if log_metrics and self.enable_storage_metrics:
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
-                    )
-
-        def _drain_release():
-            host_indices_list = []
-            host_release_q = getattr(cc, "host_mem_release_queue", None)
-            for host_indices in _drain_queue(host_release_q, n_release):
-                host_indices_list.append(host_indices)
-            if host_indices_list:
-                host_indices = torch.cat(host_indices_list, dim=0)
-                cc.mem_pool_host.free(host_indices)
-
-        _drain_revoke()
-        _drain_backup()
-        _drain_release()
+        events = self.cache_controller.drain_storage_control_events(
+            n_revoke=n_revoke,
+            n_backup=n_backup,
+            n_release=n_release,
+        )
+        self._apply_storage_control_events(events, log_metrics=log_metrics)
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -1199,16 +1138,11 @@ class HiRadixCache(RadixCache):
         Combine prefetch revoke, backup ack, and host mem release checks
         to minimize TP synchronization and Python overhead.
         """
-        cc = self.cache_controller
-        revoke_q = getattr(cc, "prefetch_revoke_queue", None)
-        ack_backup_q = getattr(cc, "ack_backup_queue", None)
-        host_release_q = getattr(cc, "host_mem_release_queue", None)
-
-        # During transitional states (e.g., detach in progress), queue attributes
-        # may be absent. Treat missing queues as empty for idempotent cleanup.
-        revoke_qsize = 0 if revoke_q is None else revoke_q.qsize()
-        ack_backup_qsize = 0 if ack_backup_q is None else ack_backup_q.qsize()
-        host_release_qsize = 0 if host_release_q is None else host_release_q.qsize()
+        (
+            revoke_qsize,
+            ack_backup_qsize,
+            host_release_qsize,
+        ) = self.cache_controller.get_storage_control_queue_sizes()
 
         qsizes = torch.tensor(
             [

@@ -146,10 +146,17 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
 
     @staticmethod
     def _http_delete_with_headers(
-        url: str, timeout: int = 30, headers: dict | None = None
+        url: str,
+        timeout: int = 30,
+        headers: dict | None = None,
+        payload: dict | None = None,
     ):
         all_headers = dict(headers or {})
-        req = request.Request(url, headers=all_headers, method="DELETE")
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            all_headers["Content-Type"] = "application/json"
+        req = request.Request(url, data=data, headers=all_headers, method="DELETE")
         try:
             with request.urlopen(req, timeout=timeout) as resp:
                 return resp.getcode(), resp.read().decode("utf-8", errors="replace")
@@ -186,11 +193,17 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             headers=headers,
         )
 
-    def _detach_backend(self, base_url: str, headers: dict | None = None):
+    def _detach_backend(
+        self,
+        base_url: str,
+        headers: dict | None = None,
+        force: bool = False,
+    ):
         return self._http_delete_with_headers(
             f"{base_url}/hicache/storage-backend",
             timeout=30,
             headers=headers,
+            payload={"force": True} if force else None,
         )
 
     def test_runtime_attach_detach(self):
@@ -352,6 +365,16 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             )
             self.assertEqual(status4.get("hicache_storage_prefetch_policy"), "timeout")
             self.assertEqual(status4.get("hicache_write_policy"), "write_through")
+
+            # 7) Force detach should also succeed when idle and accept JSON body.
+            code_force_detach, body_force_detach = self._detach_backend(
+                base_url2, headers=admin_headers, force=True
+            )
+            self.assertEqual(
+                code_force_detach,
+                200,
+                f"{code_force_detach} - {body_force_detach}",
+            )
 
             # Cleanup: detach for test isolation
             code_detach2, body_detach2 = self._detach_backend(
