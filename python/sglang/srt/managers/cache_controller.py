@@ -244,12 +244,6 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-class StorageControlEvents(NamedTuple):
-    revoked_request_ids: List[str]
-    backup_acks: List[StorageOperation]
-    host_indices_to_release: List[torch.Tensor]
-
-
 class HiCacheController:
 
     def __init__(
@@ -387,50 +381,6 @@ class HiCacheController:
         ):
             pending += self._safe_storage_queue_size(name)
         return pending
-
-    def get_storage_control_queue_sizes(self) -> tuple[int, int, int]:
-        return (
-            self._safe_storage_queue_size("prefetch_revoke_queue"),
-            self._safe_storage_queue_size("ack_backup_queue"),
-            self._safe_storage_queue_size("host_mem_release_queue"),
-        )
-
-    def _drain_storage_queue(self, name: str, limit: Optional[int]) -> list:
-        q = getattr(self, name, None)
-        if q is None:
-            return []
-
-        items = []
-        while limit is None or len(items) < limit:
-            try:
-                items.append(q.get_nowait())
-            except Empty:
-                break
-        return items
-
-    def drain_storage_control_events(
-        self,
-        *,
-        n_revoke: Optional[int],
-        n_backup: Optional[int],
-        n_release: Optional[int],
-    ) -> StorageControlEvents:
-        return StorageControlEvents(
-            revoked_request_ids=self._drain_storage_queue(
-                "prefetch_revoke_queue", n_revoke
-            ),
-            backup_acks=self._drain_storage_queue("ack_backup_queue", n_backup),
-            host_indices_to_release=self._drain_storage_queue(
-                "host_mem_release_queue", n_release
-            ),
-        )
-
-    def drain_storage_control_events_local(self) -> StorageControlEvents:
-        return self.drain_storage_control_events(
-            n_revoke=None,
-            n_backup=None,
-            n_release=None,
-        )
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.

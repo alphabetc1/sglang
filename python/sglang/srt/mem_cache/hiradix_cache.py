@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+from queue import Empty
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
 import torch
@@ -193,9 +194,6 @@ class HiRadixCache(RadixCache):
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
 
-    def _count_pending_storage_bookkeeping(self) -> int:
-        return len(self.ongoing_backup) + len(self.ongoing_prefetch)
-
     def _wait_storage_ops_idle(
         self, timeout_s: float = 10.0, poll_interval_s: float = 0.1
     ) -> tuple[bool, str]:
@@ -204,7 +202,8 @@ class HiRadixCache(RadixCache):
             self._drain_storage_control_queues_local()
             pending = (
                 self.cache_controller.count_pending_storage_ops()
-                + self._count_pending_storage_bookkeeping()
+                + len(self.ongoing_backup)
+                + len(self.ongoing_prefetch)
             )
 
             if pending == 0:
@@ -498,34 +497,12 @@ class HiRadixCache(RadixCache):
         This is intended for shutdown/detach paths where we want to make best-effort
         cleanup even if queue sizes temporarily differ across ranks.
         """
-        events = self.cache_controller.drain_storage_control_events_local()
-        self._apply_storage_control_events(events, log_metrics=False)
-
-    def _apply_storage_control_events(self, events, *, log_metrics: bool):
-        cc = self.cache_controller
-
-        for req_id in events.revoked_request_ids:
-            info = self.ongoing_prefetch.pop(req_id, None)
-            if info is not None:
-                last_host_node, token_ids, _, _ = info
-                last_host_node.release_host()
-                cc.prefetch_tokens_occupied -= len(token_ids)
-                if cc.prefetch_tokens_occupied < 0:
-                    cc.prefetch_tokens_occupied = 0
-
-        for operation in events.backup_acks:
-            ack_id = operation.id
-            entry = self.ongoing_backup.pop(ack_id, None)
-            if entry is not None:
-                entry.release_host()
-            if log_metrics and self.enable_storage_metrics:
-                self.storage_metrics_collector.log_backuped_tokens(
-                    operation.completed_tokens
-                )
-
-        if events.host_indices_to_release:
-            host_indices = torch.cat(events.host_indices_to_release, dim=0)
-            cc.mem_pool_host.free(host_indices)
+        self._drain_storage_control_queues_impl(
+            n_revoke=None,
+            n_backup=None,
+            n_release=None,
+            log_metrics=False,
+        )
 
     def _drain_storage_control_queues_impl(
         self,
@@ -534,12 +511,55 @@ class HiRadixCache(RadixCache):
         n_release: Optional[int],
         log_metrics: bool,
     ):
-        events = self.cache_controller.drain_storage_control_events(
-            n_revoke=n_revoke,
-            n_backup=n_backup,
-            n_release=n_release,
-        )
-        self._apply_storage_control_events(events, log_metrics=log_metrics)
+        cc = self.cache_controller
+
+        def _drain_queue(q, limit: Optional[int]):
+            if q is None:
+                return
+            drained = 0
+            while limit is None or drained < limit:
+                try:
+                    item = q.get_nowait()
+                except Empty:
+                    break
+                drained += 1
+                yield item
+
+        def _drain_revoke():
+            revoke_q = getattr(cc, "prefetch_revoke_queue", None)
+            for req_id in _drain_queue(revoke_q, n_revoke):
+                info = self.ongoing_prefetch.pop(req_id, None)
+                if info is not None:
+                    last_host_node, token_ids, _, _ = info
+                    last_host_node.release_host()
+                    cc.prefetch_tokens_occupied -= len(token_ids)
+                    if cc.prefetch_tokens_occupied < 0:
+                        cc.prefetch_tokens_occupied = 0
+
+        def _drain_backup():
+            ack_backup_q = getattr(cc, "ack_backup_queue", None)
+            for operation in _drain_queue(ack_backup_q, n_backup):
+                ack_id = operation.id
+                entry = self.ongoing_backup.pop(ack_id, None)
+                if entry is not None:
+                    entry.release_host()
+                if log_metrics and self.enable_storage_metrics:
+                    self.storage_metrics_collector.log_backuped_tokens(
+                        operation.completed_tokens
+                    )
+
+        def _drain_release():
+            host_indices_list = []
+            host_release_q = getattr(cc, "host_mem_release_queue", None)
+            for host_indices in _drain_queue(host_release_q, n_release):
+                host_indices_list.append(host_indices)
+            if host_indices_list:
+                host_indices = torch.cat(host_indices_list, dim=0)
+                cc.mem_pool_host.free(host_indices)
+
+        _drain_revoke()
+        _drain_backup()
+        _drain_release()
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -1138,11 +1158,14 @@ class HiRadixCache(RadixCache):
         Combine prefetch revoke, backup ack, and host mem release checks
         to minimize TP synchronization and Python overhead.
         """
-        (
-            revoke_qsize,
-            ack_backup_qsize,
-            host_release_qsize,
-        ) = self.cache_controller.get_storage_control_queue_sizes()
+        cc = self.cache_controller
+        revoke_q = getattr(cc, "prefetch_revoke_queue", None)
+        ack_backup_q = getattr(cc, "ack_backup_queue", None)
+        host_release_q = getattr(cc, "host_mem_release_queue", None)
+
+        revoke_qsize = 0 if revoke_q is None else revoke_q.qsize()
+        ack_backup_qsize = 0 if ack_backup_q is None else ack_backup_q.qsize()
+        host_release_qsize = 0 if host_release_q is None else host_release_q.qsize()
 
         qsizes = torch.tensor(
             [
