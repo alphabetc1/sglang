@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from queue import Empty
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -112,9 +112,11 @@ class HiRadixCache(RadixCache):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
+            warmup_ratio,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
+        self.warmup_ratio = warmup_ratio
         # TODO: support more timeout check functions
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
@@ -180,6 +182,53 @@ class HiRadixCache(RadixCache):
         )
 
         super().__init__(params=params)
+
+        # Start warmup from storage if configured
+        self._warmup_queue = None
+        self._warmup_done = True
+        self.warmup_from_storage()
+
+    def warmup_from_storage(self):
+        """Initiate non-blocking warmup from storage on cold start."""
+        if not self.enable_storage or self.warmup_ratio <= 0:
+            return
+
+        max_tokens = int(self.token_to_kv_pool_host.size * self.warmup_ratio)
+        if max_tokens <= 0:
+            return
+
+        logger.info("Starting HiCache warmup (budget=%d tokens)", max_tokens)
+
+        self._warmup_queue = Queue()
+        self._warmup_done = False
+
+        # Create a separate TP group for warmup thread sync
+        warmup_tp_group = None
+        if self.tp_world_size > 1:
+            warmup_tp_group = torch.distributed.new_group(
+                torch.distributed.get_process_group_ranks(self.tp_group)
+            )
+
+        self._warmup_thread = self.cache_controller.start_warmup(
+            max_tokens, self._warmup_queue, warmup_tp_group
+        )
+
+    def _drain_warmup_queue(self):
+        """Process warmup results from queue, insert into radix tree."""
+        if self._warmup_queue is None or self._warmup_done:
+            return
+        while True:
+            try:
+                item = self._warmup_queue.get_nowait()
+            except Empty:
+                break
+            if item is None:
+                self._warmup_done = True
+                logger.info("HiCache warmup completed.")
+                break
+            token_ids, hash_chain, host_indices, priority = item
+            key = RadixKey(token_ids=token_ids)
+            self._insert_helper_host(self.root_node, key, host_indices, hash_chain)
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -561,6 +610,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
+        warmup_ratio = extra_config.pop("warmup_ratio", 0.0)
 
         if not isinstance(prefetch_threshold, int):
             raise ValueError(
@@ -579,6 +629,13 @@ class HiRadixCache(RadixCache):
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
+        if not isinstance(warmup_ratio, (int, float)):
+            raise ValueError(
+                f"warmup_ratio must be number, got {type(warmup_ratio).__name__}"
+            )
+        warmup_ratio = float(warmup_ratio)
+        if warmup_ratio < 0 or warmup_ratio >= 1:
+            raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}")
 
         return (
             extra_config,
@@ -586,6 +643,7 @@ class HiRadixCache(RadixCache):
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            warmup_ratio,
         )
 
     def reset(self):
@@ -656,9 +714,14 @@ class HiRadixCache(RadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        priority = 1 if self._is_pinned(node) else 0
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value, node.key, node.hash_value, prefix_keys
+            node.host_value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
+            priority=priority,
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
@@ -1092,6 +1155,8 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        if not self._warmup_done:
+            self._drain_warmup_queue()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

@@ -1,6 +1,9 @@
 import hashlib
+import json
 import logging
 import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -62,6 +65,16 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
+
+
+@dataclass
+class WarmupEntry:
+    """An entry available for warmup loading from storage."""
+
+    token_ids: List[int]
+    hash_chain: List[str]
+    priority: int
+    num_tokens: int
 
 
 class HiCacheStorage(ABC):
@@ -177,6 +190,34 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def record_warmup_metadata(
+        self,
+        keys: List[str],
+        extra_info: Optional["HiCacheStorageExtraInfo"],
+    ):
+        """Record metadata for warmup after a successful batch write.
+
+        Called by the cache controller after each successful page backup batch.
+        Default implementation does nothing. Storage backends that support warmup
+        should override this to persist metadata for later enumeration.
+        """
+        pass
+
+    def list_warmup_entries(
+        self,
+        max_tokens: int = 0,
+    ) -> List[WarmupEntry]:
+        """List stored entries for warmup, ordered by priority desc then recency desc.
+
+        Args:
+            max_tokens: Max total tokens to return (0 = unlimited).
+
+        Returns:
+            List of WarmupEntry, sorted by priority desc then recency desc.
+            Storage backends that don't support warmup return [].
+        """
+        return []
+
     def clear(self) -> None:
         pass
 
@@ -207,8 +248,109 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        self._manifest_path = os.path.join(
+            self.file_path, f"__warmup_manifest__{self.config_suffix}.jsonl"
+        )
+        self._manifest_lock = threading.Lock()
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _append_manifest(
+        self,
+        keys: List[str],
+        token_ids: List[int],
+        priority: int,
+    ):
+        """Append an entry to the warmup manifest file."""
+        record = {
+            "hash_chain": keys,
+            "token_ids": token_ids,
+            "priority": priority,
+            "timestamp": time.time(),
+        }
+        try:
+            with self._manifest_lock:
+                with open(self._manifest_path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+        except Exception:
+            logger.debug("Failed to append warmup manifest entry.", exc_info=True)
+
+    def record_warmup_metadata(
+        self,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ):
+        """Record metadata for warmup after a successful batch write."""
+        if extra_info is None or extra_info.extra_info is None:
+            return
+        info = extra_info.extra_info
+        token_ids = info.get("token_ids")
+        priority = info.get("priority", 0)
+        if token_ids is None:
+            return
+        self._append_manifest(keys, token_ids, priority)
+
+    def list_warmup_entries(
+        self,
+        max_tokens: int = 0,
+    ) -> List[WarmupEntry]:
+        """Read the JSONL manifest and return deduplicated, sorted warmup entries."""
+        if not os.path.exists(self._manifest_path):
+            return []
+
+        # Read all records, keeping latest per hash_chain prefix (dedup)
+        seen = {}  # key: tuple of hash_chain -> record
+        try:
+            with self._manifest_lock:
+                with open(self._manifest_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        chain_key = tuple(record["hash_chain"])
+                        # Later entries overwrite earlier (dedup by recency)
+                        seen[chain_key] = record
+        except Exception:
+            logger.warning("Failed to read warmup manifest.", exc_info=True)
+            return []
+
+        # Sort by priority desc, then timestamp desc
+        records = sorted(
+            seen.values(),
+            key=lambda r: (r.get("priority", 0), r.get("timestamp", 0)),
+            reverse=True,
+        )
+
+        entries = []
+        total_tokens = 0
+        for r in records:
+            token_ids = r["token_ids"]
+            num_tokens = len(token_ids)
+            if max_tokens > 0 and total_tokens + num_tokens > max_tokens:
+                # Take partial if possible
+                remaining = max_tokens - total_tokens
+                if remaining <= 0:
+                    break
+                # Don't take partial entries — skip
+                continue
+            entries.append(
+                WarmupEntry(
+                    token_ids=token_ids,
+                    hash_chain=r["hash_chain"],
+                    priority=r.get("priority", 0),
+                    num_tokens=num_tokens,
+                )
+            )
+            total_tokens += num_tokens
+            if max_tokens > 0 and total_tokens >= max_tokens:
+                break
+
+        return entries
 
     def get(
         self,

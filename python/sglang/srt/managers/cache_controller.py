@@ -197,6 +197,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        priority: int = 0,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -204,6 +205,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.priority = priority
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -983,12 +985,17 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        priority: int = 0,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            priority=priority,
         )
         self.backup_queue.put(operation)
         return operation.id
@@ -1017,13 +1024,22 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
+            token_start = i * self.page_size
+            token_end = (i + len(batch_hashes)) * self.page_size
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info.extra_info = {
+                "priority": operation.priority,
+                "token_ids": list(operation.token_ids[token_start:token_end]),
+            }
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            # Record warmup metadata for this batch
+            self.storage_backend.record_warmup_metadata(batch_hashes, extra_info)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
@@ -1045,3 +1061,101 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def start_warmup(self, max_tokens, result_queue, tp_group=None):
+        """Start background warmup thread. Returns the thread handle."""
+        thread = threading.Thread(
+            target=self._warmup_thread_func,
+            args=(max_tokens, result_queue, tp_group),
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _warmup_thread_func(self, max_tokens, result_queue, tp_group):
+        """Background thread: query storage, load entries, push to result_queue."""
+        try:
+            entries = self.storage_backend.list_warmup_entries(max_tokens)
+            if not entries:
+                logger.info("Warmup: no entries available from storage.")
+                return
+
+            loaded_tokens = 0
+            for entry in entries:
+                if loaded_tokens >= max_tokens:
+                    break
+
+                # Align to page_size
+                alloc_len = min(entry.num_tokens, max_tokens - loaded_tokens)
+                alloc_len = (alloc_len // self.page_size) * self.page_size
+                if alloc_len == 0:
+                    continue
+
+                host_indices = self.mem_pool_host.alloc(alloc_len)
+                if host_indices is None:
+                    logger.info("Warmup: host memory exhausted, stopping.")
+                    break
+
+                # Verify pages exist in storage
+                hash_chain = entry.hash_chain[: alloc_len // self.page_size]
+                hit_count = self.storage_backend.batch_exists(hash_chain)
+
+                # TP sync: ensure all ranks see the same hit count
+                if tp_group is not None:
+                    try:
+                        world_size = torch.distributed.get_world_size(tp_group)
+                        if world_size > 1:
+                            t = torch.tensor(hit_count, dtype=torch.int)
+                            torch.distributed.all_reduce(
+                                t,
+                                op=torch.distributed.ReduceOp.MIN,
+                                group=tp_group,
+                            )
+                            hit_count = t.item()
+                    except Exception:
+                        logger.debug(
+                            "Warmup: TP sync failed, using local hit_count.",
+                            exc_info=True,
+                        )
+
+                if hit_count == 0:
+                    self.mem_pool_host.free(host_indices)
+                    continue
+
+                # Trim to actual hits
+                actual_tokens = hit_count * self.page_size
+                if actual_tokens < alloc_len:
+                    self.mem_pool_host.free(host_indices[actual_tokens:])
+                    host_indices = host_indices[:actual_tokens]
+                    hash_chain = hash_chain[:hit_count]
+
+                # Load KV data from storage into host memory
+                results = self.storage_backend.batch_get_v1(hash_chain, host_indices)
+
+                # Count consecutive successes
+                success_count = 0
+                if results is not None:
+                    for r in results:
+                        if not r:
+                            break
+                        success_count += 1
+
+                if success_count == 0:
+                    self.mem_pool_host.free(host_indices)
+                    continue
+
+                final_tokens = success_count * self.page_size
+                if final_tokens < actual_tokens:
+                    self.mem_pool_host.free(host_indices[final_tokens:])
+                    host_indices = host_indices[:final_tokens]
+                    hash_chain = hash_chain[:success_count]
+
+                token_ids = entry.token_ids[:final_tokens]
+                result_queue.put((token_ids, hash_chain, host_indices, entry.priority))
+                loaded_tokens += final_tokens
+
+            logger.info("Warmup: loaded %d tokens from storage.", loaded_tokens)
+        except Exception:
+            logger.exception("Warmup thread failed.")
+        finally:
+            result_queue.put(None)  # Sentinel: warmup done
