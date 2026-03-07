@@ -786,7 +786,7 @@ async def clear_hicache_storage_backend():
 async def attach_hicache_storage_backend(obj: AttachHiCacheStorageReqInput):
     """Attach (enable) HiCache storage backend at runtime.
 
-    Only allowed when there are NO running / queued requests.
+    Only allowed when there are NO running / queued requests unless force=true.
     """
     if not _global_state.tokenizer_manager.server_args.admin_api_key:
         return _admin_api_key_missing_response()

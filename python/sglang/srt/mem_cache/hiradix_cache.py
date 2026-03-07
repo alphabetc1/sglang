@@ -195,7 +195,7 @@ class HiRadixCache(RadixCache):
             logger.exception("Failed to detach storage backend on process shutdown.")
 
     def _wait_storage_ops_idle(
-        self, timeout_s: float = 10.0, poll_interval_s: float = 0.1
+        self, timeout_s: float = 5.0, poll_interval_s: float = 0.1
     ) -> tuple[bool, str]:
         start = time.monotonic()
         while True:
@@ -412,7 +412,7 @@ class HiRadixCache(RadixCache):
         """
         with self._storage_io_blocked(force):
             if force:
-                drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=10.0)
+                drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=5.0)
                 if not drain_ok:
                     logger.warning(
                         "Force detach: storage ops still in-flight after wait: %s",

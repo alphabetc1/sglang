@@ -13,9 +13,7 @@ You can optionally enable a **force mode** (`"force": true`) to switch even unde
 
 - The idle check is **bypassed**
 - New storage IO is **blocked** immediately (new prefetch/backup will be skipped)
-- The request goes directly to runtime attach/detach logic
-- On force detach, the system waits briefly (up to 10 s) for in-flight storage ops to drain; timeout only logs a warning
-- On detach, if storage threads do not stop in time, the switch **fails** instead of force-releasing the backend
+- On force detach, the system waits briefly (up to 5s) for in-flight storage ops to drain; if storage threads do not stop in time, the switch **fails** instead of force-releasing the backend
 
 ---
 
