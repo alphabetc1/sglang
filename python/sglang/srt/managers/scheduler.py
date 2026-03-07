@@ -2558,7 +2558,8 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic attach.",
             )
 
-        if (not recv_req.force) and (not self._is_idle_for_hicache_storage_op()):
+        idle_for_storage_op = self._is_idle_for_hicache_storage_op()
+        if (not recv_req.force) and (not idle_for_storage_op):
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2568,6 +2569,10 @@ class Scheduler(
                 ),
             )
 
+        # Keep attach/detach semantics aligned: only enable force behavior when the
+        # scheduler is actually non-idle. If already idle, use the normal path.
+        effective_force = bool(recv_req.force) and (not idle_for_storage_op)
+
         try:
             ok, msg = self.tree_cache.attach_storage_backend(
                 storage_backend=recv_req.hicache_storage_backend,
@@ -2575,7 +2580,7 @@ class Scheduler(
                 served_model_name=self.server_args.served_model_name,
                 hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
                 hicache_write_policy=recv_req.hicache_write_policy,
-                force=recv_req.force,
+                force=effective_force,
             )
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
@@ -2595,7 +2600,10 @@ class Scheduler(
             if recv_req.hicache_write_policy is not None:
                 self.server_args.hicache_write_policy = recv_req.hicache_write_policy
             logger.info(
-                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
+                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}, "
+                f"prefetch_policy: {recv_req.hicache_storage_prefetch_policy},"
+                f"write_policy: {recv_req.hicache_write_policy},"
+                f"force: {effective_force}"
             )
         return AttachHiCacheStorageReqOutput(success=ok, message=msg)
 
@@ -2614,7 +2622,6 @@ class Scheduler(
             )
 
         idle_for_storage_op = self._is_idle_for_hicache_storage_op()
-
         if (not recv_req.force) and (not idle_for_storage_op):
             return DetachHiCacheStorageReqOutput(
                 success=False,
@@ -2642,7 +2649,9 @@ class Scheduler(
             self.enable_hicache_storage = False
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
-            logger.info("Detached HiCache storage backend.")
+            logger.info(
+                f"Detached HiCache storage backend: {msg}, force: {effective_force}"
+            )
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."
             )

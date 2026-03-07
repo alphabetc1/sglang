@@ -14,6 +14,7 @@ import os
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from urllib import error, request
 
 from sglang.srt.utils import kill_process_tree
@@ -28,10 +29,12 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=300, suite="stage-b-test-large-2-gpu")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
+    ADMIN_KEY = "sglang-test-admin-key"
+
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.mkdtemp()
@@ -83,21 +86,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
     def _http_get(url: str, timeout: int = 10, headers: dict | None = None):
         try:
             req = request.Request(url, headers=headers or {}, method="GET")
-            with request.urlopen(req, timeout=timeout) as resp:
-                return resp.getcode(), resp.read().decode("utf-8", errors="replace")
-        except error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            return e.code, body
-
-    @staticmethod
-    def _http_post_json(url: str, payload: dict | None = None, timeout: int = 30):
-        data = None
-        headers = {}
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = request.Request(url, data=data, headers=headers, method="POST")
-        try:
             with request.urlopen(req, timeout=timeout) as resp:
                 return resp.getcode(), resp.read().decode("utf-8", errors="replace")
         except error.HTTPError as e:
@@ -164,6 +152,33 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             body = e.read().decode("utf-8", errors="replace")
             return e.code, body
 
+    def _default_extra_cfg(self):
+        return {
+            "hicache_storage_pass_prefix_keys": True,
+            "prefetch_threshold": 256,
+            "prefetch_timeout_base": 3,
+            "prefetch_timeout_per_ki_token": 0.01,
+        }
+
+    def _admin_headers(self):
+        return {"Authorization": f"Bearer {self.ADMIN_KEY}"}
+
+    def _launch_server(self, port_offset: int, with_admin_key: bool):
+        default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
+        base_url = f"http://127.0.0.1:{find_available_port(default_port + port_offset)}"
+        other_args = list(self.other_args)
+        if with_admin_key:
+            other_args += ["--admin-api-key", self.ADMIN_KEY]
+        process = popen_launch_server(
+            self.model,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=self.env,
+        )
+        self._wait_for_server_ready(base_url, process=process)
+        return base_url, process
+
     def _get_backend_status(self, base_url: str, headers: dict | None = None):
         code, body = self._http_get(
             f"{base_url}/hicache/storage-backend", timeout=10, headers=headers
@@ -179,17 +194,20 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         prefetch_policy: str = "timeout",
         write_policy: str = "write_through",
         headers: dict | None = None,
+        force: bool = False,
+        timeout: int = 60,
     ):
         payload = {
             "hicache_storage_backend": backend,
             "hicache_storage_backend_extra_config_json": json.dumps(extra_cfg),
             "hicache_storage_prefetch_policy": prefetch_policy,
             "hicache_write_policy": write_policy,
+            "force": force,
         }
         return self._http_put_json_with_headers(
             f"{base_url}/hicache/storage-backend",
             payload,
-            timeout=30,
+            timeout=timeout,
             headers=headers,
         )
 
@@ -198,16 +216,50 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
         base_url: str,
         headers: dict | None = None,
         force: bool = False,
+        timeout: int = 60,
     ):
         return self._http_delete_with_headers(
             f"{base_url}/hicache/storage-backend",
-            timeout=30,
+            timeout=timeout,
             headers=headers,
             payload={"force": True} if force else None,
         )
 
+    def _generate_long_running(
+        self,
+        base_url: str,
+        timeout: int = 240,
+        headers: dict | None = None,
+        max_new_tokens: int = 1024,
+    ):
+        payload = {
+            "text": (
+                "Count from 1 to 10000 in order, one number at a time, separated by "
+                "commas, and do not stop early."
+            ),
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+        }
+        return self._http_post_json_with_headers(
+            f"{base_url}/generate",
+            payload=payload,
+            timeout=timeout,
+            headers=headers,
+        )
+
+    def _assert_generate_success(self, result):
+        code, body = result
+        self.assertEqual(code, 200, body)
+        self.assertIn("text", json.loads(body))
+
+    def _assert_all_generations_success(self, futures, timeout: int = 240):
+        for future in futures:
+            self._assert_generate_success(future.result(timeout=timeout))
+
     def test_runtime_attach_detach(self):
-        # Phase A: WITHOUT --admin-api-key, ADMIN_FORCE endpoints must be forbidden (403).
         process1 = popen_launch_server(
             self.model,
             self.base_url,
@@ -234,40 +286,19 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             kill_process_tree(process1.pid)
             time.sleep(2)
 
-        # Phase B: WITH --admin-api-key, must provide Authorization: Bearer <admin_key>.
-        admin_key = "sglang-test-admin-key"
-        base_url2 = f"http://127.0.0.1:{find_available_port(int(self.base_url.rsplit(':', 1)[1]) + 1)}"
-        other_args2 = list(self.other_args) + ["--admin-api-key", admin_key]
-        process2 = popen_launch_server(
-            self.model,
-            base_url2,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args2,
-            env=self.env,
-        )
+        base_url2, process2 = self._launch_server(port_offset=1, with_admin_key=True)
         try:
-            self._wait_for_server_ready(base_url2, process=process2)
-
-            # 1) Initially disabled (but unauthorized without admin key)
             code_info2_unauth, _ = self._http_get(
                 f"{base_url2}/hicache/storage-backend", timeout=10
             )
             self.assertEqual(code_info2_unauth, 401)
 
-            admin_headers = {"Authorization": f"Bearer {admin_key}"}
+            admin_headers = self._admin_headers()
             status0 = self._get_backend_status(base_url2, headers=admin_headers)
             self.assertIsNone(status0.get("hicache_storage_backend"))
 
-            # 2) Attach should succeed when idle
-            extra_cfg = {
-                "hicache_storage_pass_prefix_keys": True,
-                # keep knobs small and stable
-                "prefetch_threshold": 256,
-                "prefetch_timeout_base": 3,
-                "prefetch_timeout_per_ki_token": 0.01,
-            }
+            extra_cfg = self._default_extra_cfg()
 
-            # Unauthorized attach must fail.
             code_attach_unauth, _ = self._attach_backend(
                 base_url=base_url2, backend="file", extra_cfg=extra_cfg
             )
@@ -292,7 +323,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             self.assertEqual(status1.get("hicache_storage_prefetch_policy"), "timeout")
             self.assertEqual(status1.get("hicache_write_policy"), "write_back")
 
-            # 3) Attach again succeeds with policies updated
             code_attach_again, body_attach_again = self._attach_backend(
                 base_url=base_url2,
                 backend="file",
@@ -317,7 +347,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
                 status2.get("hicache_write_policy"), "write_through_selective"
             )
 
-            # 4) Attach again with different backend should be rejected
             code_attach_again, body_attach_again = self._attach_backend(
                 base_url=base_url2,
                 backend="mooncake",
@@ -326,7 +355,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             )
             self.assertNotEqual(code_attach_again, 200, body_attach_again)
 
-            # 5) Detach should succeed and be idempotent
             code_detach, body_detach = self._detach_backend(
                 base_url2, headers=admin_headers
             )
@@ -349,7 +377,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
                 f"{code_detach_again} - {body_detach_again}",
             )
 
-            # 6) Re-attach after detach should succeed
             code_attach2, body_attach2 = self._attach_backend(
                 base_url=base_url2,
                 backend="file",
@@ -366,7 +393,6 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
             self.assertEqual(status4.get("hicache_storage_prefetch_policy"), "timeout")
             self.assertEqual(status4.get("hicache_write_policy"), "write_through")
 
-            # 7) Force detach should also succeed when idle and accept JSON body.
             code_force_detach, body_force_detach = self._detach_backend(
                 base_url2, headers=admin_headers, force=True
             )
@@ -376,13 +402,111 @@ class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):
                 f"{code_force_detach} - {body_force_detach}",
             )
 
-            # Cleanup: detach for test isolation
             code_detach2, body_detach2 = self._detach_backend(
                 base_url2, headers=admin_headers
             )
             self.assertEqual(code_detach2, 200, f"{code_detach2} - {body_detach2}")
         finally:
             kill_process_tree(process2.pid)
+            time.sleep(2)
+
+    def test_runtime_force_attach_detach_with_inflight_request(self):
+        base_url, process = self._launch_server(port_offset=2, with_admin_key=True)
+        try:
+            admin_headers = self._admin_headers()
+            extra_cfg = self._default_extra_cfg()
+            num_inflight_requests = 2
+
+            code_attach, body_attach = self._attach_backend(
+                base_url=base_url,
+                backend="file",
+                extra_cfg=extra_cfg,
+                headers=admin_headers,
+            )
+            self.assertEqual(code_attach, 200, f"{code_attach} - {body_attach}")
+
+            with ThreadPoolExecutor(max_workers=num_inflight_requests) as executor:
+                futures = [
+                    executor.submit(self._generate_long_running, base_url)
+                    for _ in range(num_inflight_requests)
+                ]
+                # Give concurrent decode requests time to enter running state.
+                time.sleep(3)
+
+                code_detach_reject, body_detach_reject = self._detach_backend(
+                    base_url, headers=admin_headers
+                )
+                self.assertEqual(
+                    code_detach_reject,
+                    400,
+                    f"{code_detach_reject} - {body_detach_reject}",
+                )
+
+                code_force_detach, body_force_detach = self._detach_backend(
+                    base_url, headers=admin_headers, force=True
+                )
+                self.assertEqual(
+                    code_force_detach,
+                    200,
+                    f"{code_force_detach} - {body_force_detach}",
+                )
+                status_after_detach = self._get_backend_status(
+                    base_url, headers=admin_headers
+                )
+                self.assertIsNone(status_after_detach.get("hicache_storage_backend"))
+
+                self._assert_all_generations_success(futures)
+
+            with ThreadPoolExecutor(max_workers=num_inflight_requests) as executor:
+                futures = [
+                    executor.submit(self._generate_long_running, base_url)
+                    for _ in range(num_inflight_requests)
+                ]
+                time.sleep(3)
+
+                code_attach_reject, body_attach_reject = self._attach_backend(
+                    base_url=base_url,
+                    backend="file",
+                    extra_cfg=extra_cfg,
+                    headers=admin_headers,
+                )
+                self.assertEqual(
+                    code_attach_reject,
+                    400,
+                    f"{code_attach_reject} - {body_attach_reject}",
+                )
+
+                code_force_attach, body_force_attach = self._attach_backend(
+                    base_url=base_url,
+                    backend="file",
+                    extra_cfg=extra_cfg,
+                    headers=admin_headers,
+                    force=True,
+                )
+                self.assertEqual(
+                    code_force_attach,
+                    200,
+                    f"{code_force_attach} - {body_force_attach}",
+                )
+                status_after_attach = self._get_backend_status(
+                    base_url, headers=admin_headers
+                )
+                self.assertEqual(
+                    status_after_attach.get("hicache_storage_backend"), "file"
+                )
+
+                self._assert_all_generations_success(futures)
+
+            code_cleanup_detach, body_cleanup_detach = self._detach_backend(
+                base_url, headers=admin_headers, force=True
+            )
+            self.assertEqual(
+                code_cleanup_detach,
+                200,
+                f"{code_cleanup_detach} - {body_cleanup_detach}",
+            )
+        finally:
+            kill_process_tree(process.pid)
             time.sleep(2)
 
 
