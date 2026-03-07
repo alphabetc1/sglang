@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import atexit
-from contextlib import contextmanager
 import heapq
 import json
 import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Tuple
 
@@ -271,6 +271,23 @@ class HiRadixCache(RadixCache):
                     sorted(labels.keys()),
                 )
 
+    def _apply_storage_policies(
+        self,
+        hicache_storage_prefetch_policy: Optional[str],
+        hicache_write_policy: Optional[str],
+    ) -> None:
+        if hicache_storage_prefetch_policy is not None:
+            self.prefetch_stop_policy = hicache_storage_prefetch_policy
+            logger.info(
+                f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
+            )
+        if hicache_write_policy is not None:
+            self.cache_controller.write_policy = hicache_write_policy
+            self.write_through_threshold = (
+                1 if hicache_write_policy == "write_through" else 2
+            )
+            logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -316,19 +333,10 @@ class HiRadixCache(RadixCache):
                 current_backend = self.cache_controller.storage_backend_type
 
                 if current_backend == storage_backend:
-                    if hicache_storage_prefetch_policy is not None:
-                        self.prefetch_stop_policy = hicache_storage_prefetch_policy
-                        logger.info(
-                            f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
-                        )
-                    if hicache_write_policy is not None:
-                        self.cache_controller.write_policy = hicache_write_policy
-                        self.write_through_threshold = (
-                            1 if hicache_write_policy == "write_through" else 2
-                        )
-                        logger.info(
-                            f"Set hicache_write_policy to {hicache_write_policy}"
-                        )
+                    self._apply_storage_policies(
+                        hicache_storage_prefetch_policy,
+                        hicache_write_policy,
+                    )
                     return (
                         True,
                         "HiCache storage backend already enabled with same backend; policies updated.",
@@ -341,17 +349,10 @@ class HiRadixCache(RadixCache):
                 )
 
             # Not enabled: update policies before controller attach so storage threads observe new values.
-            if hicache_storage_prefetch_policy is not None:
-                self.prefetch_stop_policy = hicache_storage_prefetch_policy
-                logger.info(
-                    f"Set hicache_storage_prefetch_policy to {hicache_storage_prefetch_policy}"
-                )
-            if hicache_write_policy is not None:
-                self.cache_controller.write_policy = hicache_write_policy
-                self.write_through_threshold = (
-                    1 if hicache_write_policy == "write_through" else 2
-                )
-                logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
+            self._apply_storage_policies(
+                hicache_storage_prefetch_policy,
+                hicache_write_policy,
+            )
 
             logger.info(f"Attaching HiCache storage backend: {storage_backend}")
             try:

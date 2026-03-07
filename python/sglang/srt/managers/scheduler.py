@@ -2629,6 +2629,8 @@ class Scheduler(
         # This avoids unnecessary force-drain waits on stale async bookkeeping.
         effective_force = bool(recv_req.force) and (not idle_for_storage_op)
 
+        # Idempotent detach: even if scheduler thinks storage is disabled, we still
+        # attempt best-effort cleanup in tree_cache (it may have leftover state).
         try:
             ok, msg = self.tree_cache.detach_storage_backend(force=effective_force)
         except Exception as e:

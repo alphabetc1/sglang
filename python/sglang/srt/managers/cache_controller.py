@@ -556,6 +556,9 @@ class HiCacheController:
         Returns:
             True if resources are released cleanly.
         """
+        # Idempotent cleanup: even if `enable_storage` is already False,
+        # we may still have leftover resources (threads/backend/process group) from a
+        # previous partial detach. We attempt cleanup whenever possible.
         try:
             self._stop_storage_threads()
         except Exception as e:
