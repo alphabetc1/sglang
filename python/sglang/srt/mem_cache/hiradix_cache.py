@@ -102,23 +102,11 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.enable_storage = server_args.hicache_storage_backend is not None
-        self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
 
-        (
-            extra_config,
-            prefetch_threshold,
-            prefetch_timeout_base,
-            prefetch_timeout_per_ki_token,
-            hicache_storage_pass_prefix_keys,
-        ) = self._parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
-        )
-        warmup_ratio = float(extra_config.pop("warmup_ratio", 0.0))
-        if warmup_ratio < 0 or warmup_ratio >= 1:
-            raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}")
-        # TODO: support more timeout check functions
+        # Defaults for fields that attach_storage_backend will set.
+        self.enable_storage = False
+        self.enable_storage_metrics = False
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
@@ -131,22 +119,8 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-        )
-        self._apply_storage_runtime_config(
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
-            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
-            enable_storage=self.enable_storage,
-            enable_storage_metrics=self.enable_storage_metrics,
-            extra_metric_labels=self.extra_metric_labels,
         )
 
         # record the nodes with ongoing write through
@@ -159,7 +133,6 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
@@ -184,31 +157,34 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
-        # Start warmup from storage if configured
-        if self.enable_storage and warmup_ratio > 0:
-            max_tokens = int(self.token_to_kv_pool_host.size * warmup_ratio)
-            if max_tokens > 0:
-                logger.info("Starting HiCache warmup (budget=%d tokens)", max_tokens)
-                warmup_tp_group = None
-                if self.tp_world_size > 1:
-                    from sglang.srt.distributed.parallel_state import (
-                        create_custom_parallel_group,
-                    )
+        # Attach storage backend if configured — single entry point for both
+        # init and runtime attach (follows HiCacheController's pattern).
+        if server_args.hicache_storage_backend is not None:
+            ok, msg = self.attach_storage_backend(
+                storage_backend=server_args.hicache_storage_backend,
+                storage_backend_extra_config_json=server_args.hicache_storage_backend_extra_config,
+                served_model_name=server_args.served_model_name,
+                hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
+                hicache_write_policy=server_args.hicache_write_policy,
+            )
+            if not ok:
+                raise ValueError(msg)
 
-                    warmup_tp_group = create_custom_parallel_group(
-                        group_ranks=torch.distributed.get_process_group_ranks(
-                            self.tp_group
-                        ),
-                        backend="gloo",
-                    )
-                self.cache_controller.start_warmup(max_tokens, warmup_tp_group)
+    def _create_warmup_tp_group(self):
+        """Create a separate gloo TP group for warmup thread sync, or None."""
+        if self.tp_world_size <= 1:
+            return None
+        from sglang.srt.distributed.parallel_state import (
+            create_custom_parallel_group,
+        )
+
+        return create_custom_parallel_group(
+            group_ranks=torch.distributed.get_process_group_ranks(self.tp_group),
+            backend="gloo",
+        )
 
     def shutdown(self):
-        """Best-effort auto-detach of storage backend on process shutdown.
-
-        This keeps startup and runtime behavior consistent: if a backend was attached
-        (either via CLI args or via admin API), we attempt to detach it on exit.
-        """
+        """Best-effort auto-detach of storage backend on process shutdown."""
         try:
             if self.enable_storage:
                 self.detach_storage_backend()
@@ -355,7 +331,7 @@ class HiRadixCache(RadixCache):
                 f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
             )
 
-        warmup_ratio = float(extra_config.pop("warmup_ratio", 0.0))
+        warmup_ratio = float(extra_config.pop("warmup_ratio", 0.8))
         if warmup_ratio < 0 or warmup_ratio >= 1:
             raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}")
 
@@ -383,24 +359,8 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
-        # Trigger warmup if configured (default off for attach path)
-        if warmup_ratio > 0:
-            max_tokens = int(self.token_to_kv_pool_host.size * warmup_ratio)
-            if max_tokens > 0:
-                logger.info("Starting HiCache warmup (budget=%d tokens)", max_tokens)
-                warmup_tp_group = None
-                if self.tp_world_size > 1:
-                    from sglang.srt.distributed.parallel_state import (
-                        create_custom_parallel_group,
-                    )
-
-                    warmup_tp_group = create_custom_parallel_group(
-                        group_ranks=torch.distributed.get_process_group_ranks(
-                            self.tp_group
-                        ),
-                        backend="gloo",
-                    )
-                self.cache_controller.start_warmup(max_tokens, warmup_tp_group)
+        # Start warmup (no-op when warmup_ratio <= 0).
+        self.cache_controller.start_warmup(warmup_ratio, self._create_warmup_tp_group())
 
         return True, "Attached HiCache storage backend successfully."
 
@@ -645,7 +605,6 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
-        self.cache_controller.stop_warmup()
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts

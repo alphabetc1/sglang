@@ -1169,14 +1169,41 @@ class HiCacheController:
             success_count += 1
         return success_count
 
-    def start_warmup(self, max_tokens, tp_group=None):
-        """Start background warmup thread."""
+    # Warmup stops after this many seconds regardless of progress.
+    _WARMUP_TIMEOUT_SECONDS = 300
+
+    def start_warmup(self, warmup_ratio, tp_group=None):
+        """Start background warmup thread.
+
+        Args:
+            warmup_ratio: GPU KV usage threshold in [0, 1). Warmup continues
+                while GPU usage < warmup_ratio. Also used as host memory budget
+                ratio (warmup_ratio * host_pool_size).
+            tp_group: Optional separate TP group for warmup sync.
+        """
+        if warmup_ratio <= 0:
+            return
+        max_tokens = int(self.mem_pool_host.size * warmup_ratio)
+        if max_tokens <= 0:
+            return
+
+        logger.info(
+            "Starting HiCache warmup (budget=%d tokens, gpu_threshold=%.0f%%)",
+            max_tokens,
+            warmup_ratio * 100,
+        )
         self._warmup_queue = Queue()
         self._warmup_done = False
         self._warmup_stop_event.clear()
         self._warmup_thread = threading.Thread(
             target=self._warmup_thread_func,
-            args=(max_tokens, self._warmup_queue, tp_group, self._warmup_stop_event),
+            args=(
+                max_tokens,
+                self._warmup_queue,
+                tp_group,
+                self._warmup_stop_event,
+                warmup_ratio,
+            ),
             daemon=True,
         )
         self._warmup_thread.start()
@@ -1191,8 +1218,16 @@ class HiCacheController:
         )
         return int(t.item())
 
+    def _gpu_kv_usage(self) -> float:
+        """Return current GPU KV cache usage ratio in [0, 1]."""
+        alloc = self.mem_pool_device_allocator
+        total = alloc.size
+        if total <= 0:
+            return 0.0
+        return 1.0 - alloc.available_size() / total
+
     def _warmup_thread_func(
-        self, max_tokens, result_queue, tp_group, warmup_stop_event
+        self, max_tokens, result_queue, tp_group, warmup_stop_event, warmup_ratio
     ):
         """Background thread: query storage, load entries, push to result_queue.
 
@@ -1200,6 +1235,7 @@ class HiCacheController:
         every all_reduce together.  We use -1 as a "stop" sentinel through
         MIN-reduce so that if *any* rank cannot continue, all ranks stop.
         """
+        deadline = time.monotonic() + self._WARMUP_TIMEOUT_SECONDS
         try:
             entries = self.storage_backend.list_warmup_entries(max_tokens)
             if not entries:
@@ -1216,6 +1252,8 @@ class HiCacheController:
                     (warmup_stop_event is not None and warmup_stop_event.is_set())
                     or loaded_tokens >= max_tokens
                     or self.storage_stop_event.is_set()
+                    or time.monotonic() >= deadline
+                    or self._gpu_kv_usage() >= warmup_ratio
                 )
                 local_hit = 0
                 if not should_stop:
