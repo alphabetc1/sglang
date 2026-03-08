@@ -6,7 +6,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -63,7 +63,7 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
 
 
@@ -71,10 +71,11 @@ class HiCacheStorageExtraInfo:
 class WarmupEntry:
     """An entry available for warmup loading from storage."""
 
-    token_ids: List[int]
+    token_ids: List[Any]
     hash_chain: List[str]
     priority: int
     num_tokens: int
+    extra_key: Optional[str] = None
 
 
 class HiCacheStorage(ABC):
@@ -259,15 +260,18 @@ class HiCacheFile(HiCacheStorage):
     def _append_manifest(
         self,
         keys: List[str],
-        token_ids: List[int],
+        token_ids: List[Any],
         priority: int,
+        extra_key: Optional[str],
     ):
         """Append an entry to the warmup manifest file."""
         record = {
             "hash_chain": keys,
             "token_ids": token_ids,
+            "num_tokens": len(token_ids),
             "priority": priority,
             "timestamp": time.time(),
+            "extra_key": extra_key,
         }
         try:
             with self._manifest_lock:
@@ -287,63 +291,132 @@ class HiCacheFile(HiCacheStorage):
         info = extra_info.extra_info
         token_ids = info.get("token_ids")
         priority = info.get("priority", 0)
+        extra_key = info.get("extra_key")
         if token_ids is None:
             return
-        self._append_manifest(keys, token_ids, priority)
+        self._append_manifest(keys, token_ids, priority, extra_key)
+
+    def _normalize_manifest_token_ids(
+        self, token_ids: List[Any]
+    ) -> Optional[List[Any]]:
+        normalized = []
+        for token in token_ids:
+            if isinstance(token, int):
+                normalized.append(token)
+                continue
+            if isinstance(token, tuple):
+                if not all(isinstance(x, int) for x in token):
+                    return None
+                normalized.append(token)
+                continue
+            if isinstance(token, list):
+                # JSON serializes Python tuples as lists.
+                if not all(isinstance(x, int) for x in token):
+                    return None
+                normalized.append(tuple(token))
+                continue
+            return None
+        return normalized
+
+    def _parse_warmup_manifest_line(
+        self, line: str, include_token_ids: bool
+    ) -> Optional[Tuple[Tuple[str, ...], Dict[str, Any]]]:
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        hash_chain = record.get("hash_chain")
+        token_ids = record.get("token_ids")
+        if not isinstance(hash_chain, list) or len(hash_chain) == 0:
+            return None
+        if not isinstance(token_ids, list):
+            return None
+        token_ids = self._normalize_manifest_token_ids(token_ids)
+        if token_ids is None:
+            return None
+
+        if not all(isinstance(h, str) for h in hash_chain):
+            return None
+        dedup_key = tuple(hash_chain)
+
+        extra_key = record.get("extra_key", None)
+        if extra_key is not None and not isinstance(extra_key, str):
+            return None
+
+        try:
+            priority = int(record.get("priority", 0))
+            timestamp = float(record.get("timestamp", 0))
+            num_tokens = int(record.get("num_tokens", len(token_ids)))
+        except (TypeError, ValueError):
+            return None
+
+        if num_tokens < 0:
+            return None
+
+        num_tokens = min(num_tokens, len(token_ids))
+        parsed = {
+            "hash_chain": hash_chain,
+            "priority": priority,
+            "timestamp": timestamp,
+            "num_tokens": num_tokens,
+            "extra_key": extra_key,
+        }
+        if include_token_ids:
+            parsed["token_ids"] = token_ids[:num_tokens]
+        return dedup_key, parsed
 
     def list_warmup_entries(
         self,
         max_tokens: int = 0,
     ) -> List[WarmupEntry]:
-        """Read the JSONL manifest and return deduplicated, sorted warmup entries."""
+        """Read manifest in one pass and return deduped, sorted entries."""
         if not os.path.exists(self._manifest_path):
             return []
 
-        # Read all records, keeping latest per hash_chain prefix (dedup)
-        seen = {}  # key: tuple of hash_chain -> record
+        # Single pass: read all records, deduplicate (last write wins).
+        latest_by_key: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         try:
             with self._manifest_lock:
                 with open(self._manifest_path, "r") as f:
                     for line in f:
-                        line = line.strip()
-                        if not line:
+                        parsed = self._parse_warmup_manifest_line(
+                            line, include_token_ids=True
+                        )
+                        if parsed is None:
                             continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        chain_key = tuple(record["hash_chain"])
-                        # Later entries overwrite earlier (dedup by recency)
-                        seen[chain_key] = record
+                        dedup_key, record = parsed
+                        latest_by_key[dedup_key] = record
         except Exception:
             logger.warning("Failed to read warmup manifest.", exc_info=True)
             return []
 
-        # Sort by priority desc, then timestamp desc
-        records = sorted(
-            seen.values(),
-            key=lambda r: (r.get("priority", 0), r.get("timestamp", 0)),
+        if not latest_by_key:
+            return []
+
+        # Sort by (priority desc, timestamp desc).
+        ranked = sorted(
+            latest_by_key.items(),
+            key=lambda kv: (kv[1]["priority"], kv[1]["timestamp"]),
             reverse=True,
         )
 
-        entries = []
+        entries: List[WarmupEntry] = []
         total_tokens = 0
-        for r in records:
-            token_ids = r["token_ids"]
-            num_tokens = len(token_ids)
+        for _dedup_key, record in ranked:
+            num_tokens = record["num_tokens"]
             if max_tokens > 0 and total_tokens + num_tokens > max_tokens:
-                # Take partial if possible
-                remaining = max_tokens - total_tokens
-                if remaining <= 0:
-                    break
-                # Don't take partial entries — skip
-                continue
+                break
             entries.append(
                 WarmupEntry(
-                    token_ids=token_ids,
-                    hash_chain=r["hash_chain"],
-                    priority=r.get("priority", 0),
+                    token_ids=record["token_ids"],
+                    hash_chain=record["hash_chain"],
+                    priority=record["priority"],
                     num_tokens=num_tokens,
+                    extra_key=record.get("extra_key"),
                 )
             )
             total_tokens += num_tokens
