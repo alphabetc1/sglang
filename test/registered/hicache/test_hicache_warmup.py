@@ -12,8 +12,11 @@ import json
 import os
 import random
 import tempfile
+import threading
 import time
 import unittest
+from queue import Queue
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import requests
@@ -241,6 +244,61 @@ class TestHiCacheWarmupUnit(CustomTestCase):
         )
         self.assertEqual(op_extra_key.extra_key, "tenant-a")
 
+    def test_warmup_ratio_zero_attach_detach_loop_skips_warmup_tp_group(self):
+        """Attach/detach style loop with warmup_ratio=0 must not create warmup TP group."""
+        old_flag = os.environ.get("SGLANG_IS_FLASHINFER_AVAILABLE")
+        os.environ["SGLANG_IS_FLASHINFER_AVAILABLE"] = "false"
+        from sglang.srt.utils.common import is_flashinfer_available
+
+        is_flashinfer_available.cache_clear()
+        try:
+            from sglang.srt.managers.cache_controller import HiCacheController
+
+            controller = HiCacheController.__new__(HiCacheController)
+            controller.enable_storage = True
+            controller.storage_backend = object()
+            controller.mem_pool_host = SimpleNamespace(size=4096)
+            controller._warmup_done = True
+            controller._warmup_queue = Queue()
+            controller._warmup_stop_event = threading.Event()
+            controller._warmup_thread = None
+            controller.storage_stop_event = threading.Event()
+            controller._warmup_manifest_supported = True
+            controller._warmup_ratio = 0.0
+            controller.tp_world_size = 8
+
+            create_calls = {"count": 0}
+            destroy_calls = {"count": 0}
+
+            def _create_group():
+                create_calls["count"] += 1
+                return object()
+
+            def _destroy_group(_group):
+                destroy_calls["count"] += 1
+
+            controller._create_warmup_tp_group = _create_group
+            controller._destroy_warmup_tp_group = _destroy_group
+
+            for _ in range(20):
+                # Simulate runtime attach.
+                controller.enable_storage = True
+                controller.storage_backend = object()
+                controller.start_warmup()
+                # Simulate runtime detach.
+                controller.enable_storage = False
+                controller.storage_backend = None
+                controller.stop_warmup()
+
+            self.assertEqual(create_calls["count"], 0)
+            self.assertEqual(destroy_calls["count"], 0)
+        finally:
+            if old_flag is None:
+                os.environ.pop("SGLANG_IS_FLASHINFER_AVAILABLE", None)
+            else:
+                os.environ["SGLANG_IS_FLASHINFER_AVAILABLE"] = old_flag
+            is_flashinfer_available.cache_clear()
+
     def test_hicache_file_warmup_defaults_on_empty(self):
         """Test that warmup methods return safe defaults on a fresh HiCacheFile."""
         from sglang.srt.mem_cache.hicache_storage import (
@@ -264,6 +322,47 @@ class TestHiCacheWarmupUnit(CustomTestCase):
             # Empty list on fresh storage
             self.assertEqual(s.list_warmup_entries(), [])
             self.assertEqual(s.list_warmup_entries(max_tokens=100), [])
+
+    def test_warmup_manifest_support_capability(self):
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorage,
+            HiCacheStorageConfig,
+        )
+
+        class DummyStorage(HiCacheStorage):
+            def get(self, key, target_location=None, target_sizes=None):
+                return None
+
+            def batch_get(self, keys, target_locations=None, target_sizes=None):
+                return [None for _ in keys]
+
+            def set(self, key, value=None, target_location=None, target_sizes=None):
+                return False
+
+            def batch_set(
+                self, keys, values=None, target_locations=None, target_sizes=None
+            ):
+                return False
+
+            def exists(self, key):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = HiCacheStorageConfig(
+                tp_rank=0,
+                tp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name="test-model",
+            )
+            file_storage = HiCacheFile(config, file_path=tmpdir)
+            self.assertTrue(file_storage.supports_warmup_manifest())
+
+            dummy_storage = DummyStorage()
+            self.assertFalse(dummy_storage.supports_warmup_manifest())
 
     def test_list_warmup_entries_legacy_manifest_compat(self):
         """Test backward compatibility with manifest lines missing num_tokens."""
@@ -371,8 +470,103 @@ class TestHiCacheWarmupUnit(CustomTestCase):
             entries = s.list_warmup_entries()
             self.assertEqual(len(entries), 2)
 
-    def test_list_warmup_entries_preserve_extra_key(self):
-        """Warmup manifest preserves extra_key namespace for radix insertion."""
+    def test_list_warmup_entries_tail_scan_bootstrap(self):
+        """Initial manifest bootstrap should support tail-only scan for large files."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = HiCacheStorageConfig(
+                tp_rank=0,
+                tp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name="test-model",
+            )
+            s = HiCacheFile(config, file_path=tmpdir)
+            old_record = {
+                "hash_chain": ["old"],
+                "token_ids": list(range(300)),
+                "num_tokens": 300,
+                "priority": 1,
+                "timestamp": time.time(),
+            }
+            new_record = {
+                "hash_chain": ["new"],
+                "token_ids": list(range(300)),
+                "num_tokens": 300,
+                "priority": 2,
+                "timestamp": time.time() + 1,
+            }
+            with open(s._manifest_path, "w") as f:
+                f.write(json.dumps(old_record) + "\n")
+                f.write(json.dumps(new_record) + "\n")
+
+            with open(s._manifest_path, "r") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 2)
+
+            # Scan only enough bytes to cover the latest line.
+            s._manifest_scan_bytes = len(lines[-1]) + 16
+            s._manifest_cursor_offset = 0
+            s._manifest_latest_by_key = {}
+
+            entries = s.list_warmup_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].hash_chain, ["new"])
+
+    def test_list_warmup_entries_incremental_append(self):
+        """Subsequent list calls should incrementally consume appended manifest lines."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = HiCacheStorageConfig(
+                tp_rank=0,
+                tp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name="test-model",
+            )
+            s = HiCacheFile(config, file_path=tmpdir)
+            record1 = {
+                "hash_chain": ["h1"],
+                "token_ids": list(range(300)),
+                "num_tokens": 300,
+                "priority": 1,
+                "timestamp": time.time(),
+            }
+            record2 = {
+                "hash_chain": ["h2"],
+                "token_ids": list(range(320)),
+                "num_tokens": 320,
+                "priority": 1,
+                "timestamp": time.time() + 1,
+            }
+            with open(s._manifest_path, "w") as f:
+                f.write(json.dumps(record1) + "\n")
+            entries1 = s.list_warmup_entries()
+            self.assertEqual(len(entries1), 1)
+
+            with open(s._manifest_path, "a") as f:
+                f.write(json.dumps(record2) + "\n")
+            entries2 = s.list_warmup_entries()
+            self.assertEqual(len(entries2), 2)
+            self.assertEqual(
+                {tuple(entry.hash_chain) for entry in entries2},
+                {("h1",), ("h2",)},
+            )
+
+    def test_list_warmup_entries_extra_key_omitted_in_new_writes(self):
+        """New warmup metadata writes intentionally omit extra_key for now."""
         from sglang.srt.mem_cache.hicache_storage import (
             HiCacheFile,
             HiCacheStorageConfig,
@@ -393,14 +587,14 @@ class TestHiCacheWarmupUnit(CustomTestCase):
             ei = HiCacheStorageExtraInfo()
             ei.extra_info = {
                 "priority": 1,
-                "token_ids": [1, 2, 3],
+                "token_ids": list(range(300)),
                 "extra_key": "lora:adapter-a",
             }
             s.record_warmup_metadata(["h1"], ei)
 
             entries = s.list_warmup_entries()
             self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0].extra_key, "lora:adapter-a")
+            self.assertIsNone(entries[0].extra_key)
 
     def test_list_warmup_entries_restore_bigram_tokens(self):
         """JSON-serialized bigram tokens should be restored as tuples."""
@@ -431,6 +625,145 @@ class TestHiCacheWarmupUnit(CustomTestCase):
             entries = s.list_warmup_entries()
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].token_ids, [(10, 11), (20, 21)])
+
+    def test_record_warmup_metadata_with_extra_info(self):
+        """extra_info dict should round-trip through the manifest."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+            HiCacheStorageExtraInfo,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = HiCacheStorageConfig(
+                tp_rank=0,
+                tp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name="test-model",
+            )
+            s = HiCacheFile(config, file_path=tmpdir)
+            s.record_warmup_metadata(
+                ["h1", "h2"],
+                HiCacheStorageExtraInfo(
+                    extra_info={
+                        "token_ids": list(range(300)),
+                        "priority": 7,
+                    }
+                ),
+            )
+
+            entries = s.list_warmup_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].priority, 7)
+            self.assertIsNone(entries[0].extra_key)
+
+    def test_record_storage_metadata_warmup_field(self):
+        """Generic storage metadata API should route warmup field."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            HiCacheFile,
+            HiCacheStorageConfig,
+            StorageMetadataRequest,
+            WarmupStorageMetadata,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = HiCacheStorageConfig(
+                tp_rank=0,
+                tp_size=1,
+                pp_rank=0,
+                pp_size=1,
+                is_mla_model=False,
+                is_page_first_layout=False,
+                model_name="test-model",
+            )
+            s = HiCacheFile(config, file_path=tmpdir)
+            s.record_storage_metadata(
+                keys=["h1", "h2"],
+                storage_metadata=StorageMetadataRequest(
+                    warmup=WarmupStorageMetadata(
+                        token_ids=list(range(300)),
+                        priority=9,
+                    )
+                ),
+            )
+
+            entries = s.list_warmup_entries()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].priority, 9)
+
+    def test_default_warmup_selector_prefers_priority_and_recency(self):
+        from sglang.srt.mem_cache.hicache_storage import (
+            DefaultWarmupEntrySelector,
+            WarmupEntry,
+        )
+
+        selector = DefaultWarmupEntrySelector()
+        entries = [
+            WarmupEntry(
+                token_ids=list(range(128)),
+                hash_chain=["short"],
+                priority=100,
+                num_tokens=128,
+                timestamp=10,
+            ),
+            WarmupEntry(
+                token_ids=list(range(512)),
+                hash_chain=["prio"],
+                priority=5,
+                num_tokens=512,
+                timestamp=5,
+            ),
+            WarmupEntry(
+                token_ids=list(range(512)),
+                hash_chain=["recent"],
+                priority=5,
+                num_tokens=512,
+                timestamp=6,
+            ),
+            WarmupEntry(
+                token_ids=list(range(512)),
+                hash_chain=["low"],
+                priority=3,
+                num_tokens=512,
+                timestamp=100,
+            ),
+        ]
+
+        selected = selector.select_entries(entries, max_tokens=0)
+        self.assertEqual(
+            [entry.hash_chain[0] for entry in selected],
+            ["recent", "prio", "low"],
+        )
+
+    def test_default_warmup_selector_budget_skips_oversized_entry(self):
+        from sglang.srt.mem_cache.hicache_storage import (
+            DefaultWarmupEntrySelector,
+            WarmupEntry,
+        )
+
+        selector = DefaultWarmupEntrySelector()
+        entries = [
+            WarmupEntry(
+                token_ids=list(range(512)),
+                hash_chain=["too-big"],
+                priority=10,
+                num_tokens=512,
+                timestamp=10,
+            ),
+            WarmupEntry(
+                token_ids=list(range(256)),
+                hash_chain=["fits"],
+                priority=1,
+                num_tokens=256,
+                timestamp=1,
+            ),
+        ]
+
+        selected = selector.select_entries(entries, max_tokens=256)
+        self.assertEqual([entry.hash_chain[0] for entry in selected], ["fits"])
 
 
 class TestHiCacheWarmupE2E(CustomTestCase):

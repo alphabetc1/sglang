@@ -24,6 +24,9 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    StorageMetadataRequest,
+    TokenId,
+    WarmupStorageMetadata,
 )
 
 if TYPE_CHECKING:
@@ -193,7 +196,7 @@ class StorageOperation:
     def __init__(
         self,
         host_indices: torch.Tensor,
-        token_ids: List[int],
+        token_ids: List[TokenId],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -221,8 +224,8 @@ class StorageOperation:
 class WarmupResult(NamedTuple):
     """A single warmup entry loaded from storage, ready for tree insertion."""
 
-    token_ids: list
-    hash_chain: list
+    token_ids: List[TokenId]
+    hash_chain: List[str]
     host_indices: torch.Tensor
     priority: int
     extra_key: Optional[str]
@@ -301,6 +304,8 @@ class HiCacheController:
         self._warmup_done = True
         self._warmup_thread = None
         self._warmup_stop_event = threading.Event()
+        self._warmup_manifest_supported = False
+        self._warmup_ratio = 0.0
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -438,6 +443,8 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
+        self.stop_warmup()
+
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
         try:
@@ -471,6 +478,7 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.mem_pool_host
             )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            self._warmup_manifest_supported = self._query_warmup_manifest_support()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -536,6 +544,8 @@ class HiCacheController:
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
+            self._warmup_manifest_supported = False
+            self._warmup_ratio = 0.0
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
@@ -546,6 +556,7 @@ class HiCacheController:
         Requirement: no in-flight requests. This will stop storage threads and release
         the backend instance (best-effort close).
         """
+        self.stop_warmup()
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
         # previous partial detach. We attempt cleanup whenever possible.
@@ -588,6 +599,8 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
+        self._warmup_manifest_supported = False
+        self._warmup_ratio = 0.0
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
@@ -620,6 +633,7 @@ class HiCacheController:
             )
         # Do not mutate caller-owned config.
         backend_extra_config = dict(backend_extra_config)
+        self._warmup_ratio = self._parse_warmup_ratio(backend_extra_config)
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
@@ -651,7 +665,13 @@ class HiCacheController:
         )
 
     def stop_warmup(self, timeout: float = 5.0) -> bool:
-        """Stop warmup thread, drain queue, free leaked host indices."""
+        """Stop warmup thread, drain queue, free leaked host indices.
+
+        This operation is idempotent.
+        """
+        if self._warmup_done:
+            return True
+
         self._warmup_stop_event.set()
         if self._warmup_thread is not None and self._warmup_thread.is_alive():
             self._warmup_thread.join(timeout=timeout)
@@ -687,20 +707,99 @@ class HiCacheController:
             results.append(item)
         return results, self._warmup_done
 
-    def _record_warmup_metadata(self, operation):
-        """Record warmup metadata for a completed backup operation."""
+    def _build_warmup_storage_metadata(
+        self, operation
+    ) -> tuple[list[str], Optional[WarmupStorageMetadata]]:
+        """Build warmup metadata payload from a completed backup operation."""
         if operation.completed_tokens <= 0:
-            return
+            return [], None
+        if not self._supports_warmup_manifest():
+            return [], None
         completed_pages = operation.completed_tokens // self.page_size
-        warmup_info = HiCacheStorageExtraInfo()
-        warmup_info.extra_info = {
-            "priority": operation.priority,
-            "token_ids": list(operation.token_ids[: operation.completed_tokens]),
-            "extra_key": operation.extra_key,
-        }
-        self.storage_backend.record_warmup_metadata(
-            operation.hash_value[:completed_pages], warmup_info
+        if completed_pages <= 0:
+            return [], None
+        warmup_metadata = WarmupStorageMetadata(
+            token_ids=list(operation.token_ids[: operation.completed_tokens]),
+            priority=operation.priority,
         )
+        return operation.hash_value[:completed_pages], warmup_metadata
+
+    def _record_storage_metadata(self, operation) -> None:
+        """Generic metadata recording hook for storage-owned modules."""
+        if self.storage_backend is None:
+            return
+
+        keys, warmup_metadata = self._build_warmup_storage_metadata(operation)
+        if not keys or warmup_metadata is None:
+            return
+
+        storage_metadata = StorageMetadataRequest(warmup=warmup_metadata)
+        try:
+            self.storage_backend.record_storage_metadata(
+                keys=keys,
+                storage_metadata=storage_metadata,
+            )
+        except Exception:
+            logger.warning(
+                "Storage metadata recording failed.",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _parse_warmup_ratio(extra_config: dict, default_ratio: float = 0.0) -> float:
+        """Pop and validate warmup_ratio from backend extra config.
+
+        Warmup is disabled by default unless explicitly configured.
+        """
+        warmup_ratio = float(extra_config.pop("warmup_ratio", default_ratio))
+        if warmup_ratio < 0 or warmup_ratio >= 1:
+            raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}")
+        return warmup_ratio
+
+    def _query_warmup_manifest_support(self) -> bool:
+        if self.storage_backend is None:
+            return False
+        supports = getattr(self.storage_backend, "supports_warmup_manifest", None)
+        if not callable(supports):
+            return False
+        try:
+            return bool(supports())
+        except Exception:
+            logger.warning(
+                "Warmup manifest capability check failed; treat as unsupported.",
+                exc_info=True,
+            )
+            return False
+
+    def _supports_warmup_manifest(self) -> bool:
+        return bool(
+            self.storage_backend is not None and self._warmup_manifest_supported
+        )
+
+    def _create_warmup_tp_group(self):
+        """Create a dedicated gloo TP group for warmup sync, or None."""
+        if getattr(self, "tp_world_size", 1) <= 1:
+            return None
+        from sglang.srt.distributed.parallel_state import (
+            create_custom_parallel_group,
+        )
+
+        return create_custom_parallel_group(
+            group_ranks=torch.distributed.get_process_group_ranks(self.tp_group),
+            backend="gloo",
+        )
+
+    def _destroy_warmup_tp_group(self, tp_group) -> None:
+        """Best-effort destroy of a dedicated warmup TP group."""
+        if tp_group is None or tp_group is self.tp_group:
+            return
+        try:
+            torch.distributed.destroy_process_group(tp_group)
+        except Exception:
+            logger.debug(
+                "Warmup: failed to destroy warmup TP group.",
+                exc_info=True,
+            )
 
     def reset(self):
         self.stop_warmup()
@@ -1068,7 +1167,7 @@ class HiCacheController:
     def write_storage(
         self,
         host_indices: torch.Tensor,
-        token_ids: List[int],
+        token_ids: List[TokenId],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         priority: int = 0,
@@ -1133,7 +1232,7 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                    self._record_warmup_metadata(operation)
+                    self._record_storage_metadata(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
@@ -1172,23 +1271,35 @@ class HiCacheController:
     # Warmup stops after this many seconds regardless of progress.
     _WARMUP_TIMEOUT_SECONDS = 300
 
-    def start_warmup(self, warmup_ratio, tp_group=None):
-        """Start background warmup thread.
-
-        Args:
-            warmup_ratio: GPU KV usage threshold in [0, 1). Warmup continues
-                while GPU usage < warmup_ratio. Also used as host memory budget
-                ratio (warmup_ratio * host_pool_size).
-            tp_group: Optional separate TP group for warmup sync.
-        """
+    def start_warmup(self):
+        """Start background warmup thread with configured host warmup ratio."""
+        if not self.enable_storage or self.storage_backend is None:
+            return
+        if not self._supports_warmup_manifest():
+            logger.info(
+                "Storage backend does not support warmup manifest. Skip warmup."
+            )
+            return
+        warmup_ratio = self._warmup_ratio
         if warmup_ratio <= 0:
             return
         max_tokens = int(self.mem_pool_host.size * warmup_ratio)
         if max_tokens <= 0:
             return
+        if not self._warmup_done:
+            logger.info("Warmup is already running; skip duplicate start.")
+            return
+        try:
+            tp_group = self._create_warmup_tp_group()
+        except Exception:
+            logger.warning(
+                "Warmup: failed to create dedicated TP group. Skip warmup.",
+                exc_info=True,
+            )
+            return
 
         logger.info(
-            "Starting HiCache warmup (budget=%d tokens, gpu_threshold=%.0f%%)",
+            "Starting HiCache warmup (host_budget=%d tokens, host_ratio=%.0f%%)",
             max_tokens,
             warmup_ratio * 100,
         )
@@ -1202,11 +1313,16 @@ class HiCacheController:
                 self._warmup_queue,
                 tp_group,
                 self._warmup_stop_event,
-                warmup_ratio,
             ),
             daemon=True,
         )
-        self._warmup_thread.start()
+        try:
+            self._warmup_thread.start()
+        except Exception:
+            self._warmup_done = True
+            self._warmup_thread = None
+            self._destroy_warmup_tp_group(tp_group)
+            logger.exception("Warmup: failed to start warmup thread.")
 
     def _warmup_sync_value(self, tp_group, value: int) -> int:
         """All-reduce a scalar across the warmup TP group (MIN). Returns synced value."""
@@ -1218,16 +1334,8 @@ class HiCacheController:
         )
         return int(t.item())
 
-    def _gpu_kv_usage(self) -> float:
-        """Return current GPU KV cache usage ratio in [0, 1]."""
-        alloc = self.mem_pool_device_allocator
-        total = alloc.size
-        if total <= 0:
-            return 0.0
-        return 1.0 - alloc.available_size() / total
-
     def _warmup_thread_func(
-        self, max_tokens, result_queue, tp_group, warmup_stop_event, warmup_ratio
+        self, max_tokens, result_queue, tp_group, warmup_stop_event
     ):
         """Background thread: query storage, load entries, push to result_queue.
 
@@ -1237,7 +1345,7 @@ class HiCacheController:
         """
         deadline = time.monotonic() + self._WARMUP_TIMEOUT_SECONDS
         try:
-            entries = self.storage_backend.list_warmup_entries(max_tokens)
+            entries = self.storage_backend.list_warmup_entries(max_tokens=max_tokens)
             if not entries:
                 logger.info("Warmup: no entries available from storage.")
                 return
@@ -1253,7 +1361,6 @@ class HiCacheController:
                     or loaded_tokens >= max_tokens
                     or self.storage_stop_event.is_set()
                     or time.monotonic() >= deadline
-                    or self._gpu_kv_usage() >= warmup_ratio
                 )
                 local_hit = 0
                 if not should_stop:
@@ -1338,12 +1445,5 @@ class HiCacheController:
         except Exception:
             logger.exception("Warmup thread failed.")
         finally:
-            if tp_group is not None:
-                try:
-                    torch.distributed.destroy_process_group(tp_group)
-                except Exception:
-                    logger.debug(
-                        "Warmup: failed to destroy warmup TP group.",
-                        exc_info=True,
-                    )
+            self._destroy_warmup_tp_group(tp_group)
             result_queue.put(None)  # Sentinel: warmup done

@@ -6,7 +6,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -15,8 +15,11 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
+# Token ids can be plain ints or tuple-packed ids (e.g. EAGLE bigram mode).
+TokenId: TypeAlias = int | tuple[int, ...]
 
-def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
+
+def get_hash_str(token_ids: List[TokenId], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
@@ -67,15 +70,82 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
+class BaseStorageMetadata:
+    """Base class for storage metadata payloads."""
+
+
+@dataclass
+class WarmupStorageMetadata(BaseStorageMetadata):
+    token_ids: List[TokenId]
+    priority: int = 0
+
+
+@dataclass
+class StorageMetadataRequest:
+    warmup: Optional[WarmupStorageMetadata] = None
+
+
 @dataclass
 class WarmupEntry:
     """An entry available for warmup loading from storage."""
 
-    token_ids: List[Any]
+    token_ids: List[TokenId]
     hash_chain: List[str]
     priority: int
     num_tokens: int
     extra_key: Optional[str] = None
+    timestamp: float = 0.0
+
+
+class WarmupEntrySelector(ABC):
+    @abstractmethod
+    def select_entries(
+        self, entries: List[WarmupEntry], max_tokens: int = 0
+    ) -> List[WarmupEntry]:
+        """Select warmup entries under the given token budget."""
+
+
+class DefaultWarmupEntrySelector(WarmupEntrySelector):
+    """Default warmup policy.
+
+    Priority order:
+    1. higher-priority entries
+    2. more recent entries
+    """
+
+    # TODO: expose this threshold through backend config once policy semantics stabilize.
+    MIN_WARMUP_PREFIX_TOKENS = 256
+
+    def _is_eligible(self, entry: WarmupEntry) -> bool:
+        return entry.num_tokens >= self.MIN_WARMUP_PREFIX_TOKENS
+
+    def select_entries(
+        self, entries: List[WarmupEntry], max_tokens: int = 0
+    ) -> List[WarmupEntry]:
+        ranked = sorted(
+            (entry for entry in entries if self._is_eligible(entry)),
+            key=lambda entry: (entry.priority, entry.timestamp),
+            reverse=True,
+        )
+
+        if max_tokens <= 0:
+            return ranked
+
+        selected: List[WarmupEntry] = []
+        total_tokens = 0
+        for entry in ranked:
+            if total_tokens + entry.num_tokens > max_tokens:
+                if total_tokens >= max_tokens:
+                    break
+                continue
+            selected.append(entry)
+            total_tokens += entry.num_tokens
+            if total_tokens >= max_tokens:
+                break
+        return selected
+
+
+DEFAULT_WARMUP_ENTRY_SELECTOR = DefaultWarmupEntrySelector()
 
 
 class HiCacheStorage(ABC):
@@ -204,6 +274,44 @@ class HiCacheStorage(ABC):
         """
         pass
 
+    def record_storage_metadata(
+        self,
+        keys: List[str],
+        storage_metadata: StorageMetadataRequest,
+    ) -> None:
+        """Generic metadata recording entrypoint for storage-owned modules.
+
+        Default behavior routes the `warmup` payload to the legacy warmup API.
+        Backends may override this method to support additional metadata fields while
+        keeping `record_warmup_metadata` backward compatible.
+        """
+        if not isinstance(storage_metadata, StorageMetadataRequest):
+            return
+        warmup_metadata = storage_metadata.warmup
+        if warmup_metadata is not None:
+            self.record_warmup_metadata(
+                keys,
+                HiCacheStorageExtraInfo(
+                    extra_info={
+                        "token_ids": list(warmup_metadata.token_ids),
+                        "priority": int(warmup_metadata.priority),
+                    }
+                ),
+            )
+
+    def supports_warmup_manifest(self) -> bool:
+        """Whether this backend supports warmup manifest read/write.
+
+        Backward compatibility: infer support when subclass overrides both
+        `record_warmup_metadata` and `list_warmup_entries`.
+        """
+        cls = type(self)
+        has_record = (
+            cls.record_warmup_metadata is not HiCacheStorage.record_warmup_metadata
+        )
+        has_list = cls.list_warmup_entries is not HiCacheStorage.list_warmup_entries
+        return has_record and has_list
+
     def list_warmup_entries(
         self,
         max_tokens: int = 0,
@@ -227,6 +335,7 @@ class HiCacheStorage(ABC):
 
 
 class HiCacheFile(HiCacheStorage):
+    _DEFAULT_MANIFEST_SCAN_BYTES = 64 * 1024 * 1024
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -253,25 +362,47 @@ class HiCacheFile(HiCacheStorage):
             self.file_path, f"__warmup_manifest__{self.config_suffix}.jsonl"
         )
         self._manifest_lock = threading.Lock()
+        extra_config = storage_config.extra_config or {}
+        self._manifest_scan_bytes = self._parse_non_negative_int(
+            extra_config.get(
+                "warmup_manifest_scan_bytes", self._DEFAULT_MANIFEST_SCAN_BYTES
+            ),
+            default=self._DEFAULT_MANIFEST_SCAN_BYTES,
+        )
+        self._manifest_cursor_offset = 0
+        self._manifest_latest_by_key: Dict[Tuple[str, ...], Dict[str, Any]] = {}
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
+    @staticmethod
+    def _parse_non_negative_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed < 0:
+            return default
+        return parsed
+
     def _append_manifest(
         self,
         keys: List[str],
-        token_ids: List[Any],
-        priority: int,
-        extra_key: Optional[str],
+        info: Dict[str, Any],
     ):
-        """Append an entry to the warmup manifest file."""
+        """Append an entry to the warmup manifest file.
+
+        Args:
+            keys: Hash chain for the entry.
+            info: Dict with keys: token_ids, priority.
+        """
+        token_ids = info.get("token_ids", [])
         record = {
             "hash_chain": keys,
             "token_ids": token_ids,
             "num_tokens": len(token_ids),
-            "priority": priority,
+            "priority": info.get("priority", 0),
             "timestamp": time.time(),
-            "extra_key": extra_key,
         }
         try:
             with self._manifest_lock:
@@ -289,12 +420,9 @@ class HiCacheFile(HiCacheStorage):
         if extra_info is None or extra_info.extra_info is None:
             return
         info = extra_info.extra_info
-        token_ids = info.get("token_ids")
-        priority = info.get("priority", 0)
-        extra_key = info.get("extra_key")
-        if token_ids is None:
+        if not isinstance(info.get("token_ids"), list):
             return
-        self._append_manifest(keys, token_ids, priority, extra_key)
+        self._append_manifest(keys, info)
 
     def _normalize_manifest_token_ids(
         self, token_ids: List[Any]
@@ -331,6 +459,8 @@ class HiCacheFile(HiCacheStorage):
 
         hash_chain = record.get("hash_chain")
         token_ids = record.get("token_ids")
+        raw_priority = record.get("priority", 0)
+        extra_key = record.get("extra_key")
         if not isinstance(hash_chain, list) or len(hash_chain) == 0:
             return None
         if not isinstance(token_ids, list):
@@ -341,14 +471,12 @@ class HiCacheFile(HiCacheStorage):
 
         if not all(isinstance(h, str) for h in hash_chain):
             return None
-        dedup_key = tuple(hash_chain)
-
-        extra_key = record.get("extra_key", None)
         if extra_key is not None and not isinstance(extra_key, str):
             return None
+        dedup_key = tuple(hash_chain)
 
         try:
-            priority = int(record.get("priority", 0))
+            priority = int(raw_priority)
             timestamp = float(record.get("timestamp", 0))
             num_tokens = int(record.get("num_tokens", len(token_ids)))
         except (TypeError, ValueError):
@@ -369,19 +497,46 @@ class HiCacheFile(HiCacheStorage):
             parsed["token_ids"] = token_ids[:num_tokens]
         return dedup_key, parsed
 
+    def supports_warmup_manifest(self) -> bool:
+        return True
+
     def list_warmup_entries(
         self,
         max_tokens: int = 0,
     ) -> List[WarmupEntry]:
-        """Read manifest in one pass and return deduped, sorted entries."""
-        if not os.path.exists(self._manifest_path):
-            return []
-
-        # Single pass: read all records, deduplicate (last write wins).
-        latest_by_key: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        """Read manifest incrementally and return deduped, selected entries."""
         try:
             with self._manifest_lock:
+                if not os.path.exists(self._manifest_path):
+                    self._manifest_cursor_offset = 0
+                    self._manifest_latest_by_key = {}
+                    return []
+
+                file_size = os.path.getsize(self._manifest_path)
+                if self._manifest_cursor_offset > file_size:
+                    # Manifest might be truncated/recreated; restart incremental state.
+                    self._manifest_cursor_offset = 0
+                    self._manifest_latest_by_key = {}
+
+                start_offset = self._manifest_cursor_offset
+                if (
+                    start_offset == 0
+                    and self._manifest_scan_bytes > 0
+                    and file_size > self._manifest_scan_bytes
+                ):
+                    # Bootstrap from tail only to avoid scanning huge manifests.
+                    start_offset = file_size - self._manifest_scan_bytes
+                    self._manifest_latest_by_key = {}
+                skip_partial_line = start_offset > 0 and (
+                    start_offset != self._manifest_cursor_offset
+                )
+
                 with open(self._manifest_path, "r") as f:
+                    if start_offset > 0:
+                        f.seek(start_offset)
+                        if skip_partial_line:
+                            # Skip a potential partial line from mid-file seek.
+                            _ = f.readline()
                     for line in f:
                         parsed = self._parse_warmup_manifest_line(
                             line, include_token_ids=True
@@ -389,7 +544,10 @@ class HiCacheFile(HiCacheStorage):
                         if parsed is None:
                             continue
                         dedup_key, record = parsed
-                        latest_by_key[dedup_key] = record
+                        self._manifest_latest_by_key[dedup_key] = record
+                    self._manifest_cursor_offset = f.tell()
+
+                latest_by_key = dict(self._manifest_latest_by_key)
         except Exception:
             logger.warning("Failed to read warmup manifest.", exc_info=True)
             return []
@@ -397,33 +555,20 @@ class HiCacheFile(HiCacheStorage):
         if not latest_by_key:
             return []
 
-        # Sort by (priority desc, timestamp desc).
-        ranked = sorted(
-            latest_by_key.items(),
-            key=lambda kv: (kv[1]["priority"], kv[1]["timestamp"]),
-            reverse=True,
-        )
-
-        entries: List[WarmupEntry] = []
-        total_tokens = 0
-        for _dedup_key, record in ranked:
-            num_tokens = record["num_tokens"]
-            if max_tokens > 0 and total_tokens + num_tokens > max_tokens:
-                break
-            entries.append(
-                WarmupEntry(
-                    token_ids=record["token_ids"],
-                    hash_chain=record["hash_chain"],
-                    priority=record["priority"],
-                    num_tokens=num_tokens,
-                    extra_key=record.get("extra_key"),
-                )
+        entries = [
+            WarmupEntry(
+                token_ids=record["token_ids"],
+                hash_chain=record["hash_chain"],
+                priority=record["priority"],
+                num_tokens=record["num_tokens"],
+                extra_key=record.get("extra_key"),
+                timestamp=record["timestamp"],
             )
-            total_tokens += num_tokens
-            if max_tokens > 0 and total_tokens >= max_tokens:
-                break
-
-        return entries
+            for record in latest_by_key.values()
+        ]
+        return DEFAULT_WARMUP_ENTRY_SELECTOR.select_entries(
+            entries, max_tokens=max_tokens
+        )
 
     def get(
         self,
@@ -500,6 +645,8 @@ class HiCacheFile(HiCacheStorage):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
+            self._manifest_cursor_offset = 0
+            self._manifest_latest_by_key = {}
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True
         except Exception as e:

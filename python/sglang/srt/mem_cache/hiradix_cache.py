@@ -170,19 +170,6 @@ class HiRadixCache(RadixCache):
             if not ok:
                 raise ValueError(msg)
 
-    def _create_warmup_tp_group(self):
-        """Create a separate gloo TP group for warmup thread sync, or None."""
-        if self.tp_world_size <= 1:
-            return None
-        from sglang.srt.distributed.parallel_state import (
-            create_custom_parallel_group,
-        )
-
-        return create_custom_parallel_group(
-            group_ranks=torch.distributed.get_process_group_ranks(self.tp_group),
-            backend="gloo",
-        )
-
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown."""
         try:
@@ -331,10 +318,6 @@ class HiRadixCache(RadixCache):
                 f"Failed to parse storage_backend_extra_config_json '{storage_backend_extra_config_json}': {e}",
             )
 
-        warmup_ratio = float(extra_config.pop("warmup_ratio", 0.8))
-        if warmup_ratio < 0 or warmup_ratio >= 1:
-            raise ValueError(f"warmup_ratio must be in [0, 1), got {warmup_ratio}")
-
         try:
             self.cache_controller.attach_storage_backend(
                 storage_backend=storage_backend,
@@ -359,8 +342,8 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
-        # Start warmup (no-op when warmup_ratio <= 0).
-        self.cache_controller.start_warmup(warmup_ratio, self._create_warmup_tp_group())
+        # Start warmup (no-op when configured warmup_ratio <= 0).
+        self.cache_controller.start_warmup()
 
         return True, "Attached HiCache storage backend successfully."
 
@@ -671,7 +654,7 @@ class HiRadixCache(RadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
-        priority = 1 if self._is_pinned(node) else 0
+        priority = int(node.priority)
 
         operation_id = self.cache_controller.write_storage(
             node.host_value,
@@ -1113,7 +1096,6 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
-        if not self.cache_controller._warmup_done:
             results, _ = self.cache_controller.drain_warmup()
             for result in results:
                 try:
