@@ -96,6 +96,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    wait_for_scheduler_processes_ready,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
@@ -1156,23 +1157,14 @@ def _wait_for_scheduler_ready(
     scheduler_procs: List,
 ) -> List[Dict]:
     """Wait for the model to finish loading and return scheduler infos."""
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
+    scheduler_infos = wait_for_scheduler_processes_ready(
+        scheduler_pipe_readers, scheduler_procs
+    )
+    for data in scheduler_infos:
         if data["status"] != "ready":
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )
-        scheduler_infos.append(data)
     return scheduler_infos
 
 

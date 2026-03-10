@@ -15,7 +15,11 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, numa_utils
+from sglang.srt.utils import (
+    configure_logger,
+    numa_utils,
+    wait_for_scheduler_processes_ready,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -172,23 +176,14 @@ def launch_scheduler_process_only(
     # TODO(CatherineSue): handle cases for multi-node
 
     # Wait for all scheduler processes to be ready
-    scheduler_infos = []
-    for i, reader in enumerate(scheduler_pipe_readers):
-        try:
-            data = reader.recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise RuntimeError(f"Failed to initialize scheduler rank {i}")
-
+    scheduler_infos = wait_for_scheduler_processes_ready(
+        scheduler_pipe_readers, scheduler_procs
+    )
+    for i, data in enumerate(scheduler_infos):
         if data.get("status") != "ready":
             raise RuntimeError(
                 f"Scheduler rank {i} initialization failed: {data.get('error', 'Unknown error')}"
             )
-        scheduler_infos.append(data)
 
     logger.info(
         f"All {len(scheduler_procs)} scheduler process(es) initialized successfully"
