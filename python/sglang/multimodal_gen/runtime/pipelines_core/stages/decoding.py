@@ -214,7 +214,7 @@ class DecodingStage(PipelineStage):
             elif ndim == 5:
                 # Image latents (no frames dim): [B, T, C, H, W]
                 B, T, C, H, W = batch.trajectory_latents.shape
-                flat_latents = batch.trajectory_latents.view(B * T, C, 1, H, W)
+                flat_latents = batch.trajectory_latents.view(B * T, C, H, W)
             else:
                 # Packed / non-standard latent layout (e.g. Qwen-Image stores
                 # packed 3-D per-step latents → 4-D after stack).  VAE decode
