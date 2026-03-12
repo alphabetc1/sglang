@@ -2691,7 +2691,8 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic attach.",
             )
 
-        if not self.is_fully_idle():
+        force = bool(recv_req.force)
+        if not self.is_fully_idle() and not force:
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2701,9 +2702,6 @@ class Scheduler(
                 ),
             )
 
-        # When force is requested but scheduler is already idle, skip force behavior.
-        effective_force = bool(recv_req.force) and (not self.is_fully_idle())
-
         try:
             ok, msg = self.tree_cache.attach_storage_backend(
                 storage_backend=recv_req.hicache_storage_backend,
@@ -2711,7 +2709,7 @@ class Scheduler(
                 served_model_name=self.server_args.served_model_name,
                 hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
                 hicache_write_policy=recv_req.hicache_write_policy,
-                force=effective_force,
+                force=force,
             )
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
@@ -2748,7 +2746,8 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic detach.",
             )
 
-        if not self.is_fully_idle():
+        force = bool(recv_req.force)
+        if not self.is_fully_idle() and not force:
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -2758,13 +2757,10 @@ class Scheduler(
                 ),
             )
 
-        # When force is requested but scheduler is already idle, skip force behavior.
-        effective_force = bool(recv_req.force) and (not self.is_fully_idle())
-
         # Idempotent detach: even if scheduler thinks storage is disabled, we still
         # attempt best-effort cleanup in tree_cache (it may have leftover state).
         try:
-            ok, msg = self.tree_cache.detach_storage_backend(force=effective_force)
+            ok, msg = self.tree_cache.detach_storage_backend(force=force)
         except Exception as e:
             logger.exception("Detach HiCache storage backend failed with exception.")
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
