@@ -261,10 +261,16 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
-        self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -274,6 +280,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.enable_storage_metrics = enable_storage_metrics
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -352,6 +359,7 @@ class HiCacheController:
         self.backup_thread.start()
 
     def set_storage_io_blocked(self, blocked: bool):
+        """Block or unblock new storage IO (prefetch/backup submissions)."""
         if blocked:
             self.storage_io_blocked.set()
         else:
@@ -360,16 +368,8 @@ class HiCacheController:
     def is_storage_io_blocked(self) -> bool:
         return self.storage_io_blocked.is_set()
 
-    def _safe_storage_queue_size(self, name: str) -> int:
-        q = getattr(self, name, None)
-        if q is None:
-            return 0
-        try:
-            return q.qsize()
-        except Exception:
-            return 0
-
     def count_pending_storage_ops(self) -> int:
+        """Count pending items across all storage-related queues."""
         pending = 0
         for name in (
             "backup_queue",
@@ -379,7 +379,12 @@ class HiCacheController:
             "prefetch_revoke_queue",
             "host_mem_release_queue",
         ):
-            pending += self._safe_storage_queue_size(name)
+            q = getattr(self, name, None)
+            if q is not None:
+                try:
+                    pending += q.qsize()
+                except Exception:
+                    pass
         return pending
 
     def _stop_storage_threads(self):
@@ -546,15 +551,11 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
             raise
 
-    def detach_storage_backend(self, force: bool = False) -> bool:
+    def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 
-        Args:
-            force: Reserved for compatibility with upper layers. In strict mode,
-                detach still fails if storage threads cannot be joined.
-
-        Returns:
-            True if resources are released cleanly.
+        Requirement: no in-flight requests. This will stop storage threads and release
+        the backend instance (best-effort close).
         """
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
@@ -602,13 +603,14 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
-        return True
 
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -641,6 +643,7 @@ class HiCacheController:
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
+            enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
@@ -821,6 +824,7 @@ class HiCacheController:
     ) -> Optional[PrefetchOperation]:
         """
         Prefetch KV caches from storage backend to host memory.
+        Returns None if storage IO is blocked (force attach/detach in progress).
         """
         if self.storage_io_blocked.is_set():
             return None
@@ -1022,6 +1026,7 @@ class HiCacheController:
     ) -> Optional[int]:
         """
         Write KV caches from host memory to storage backend.
+        Returns None if storage IO is blocked (force attach/detach in progress).
         """
         if self.storage_io_blocked.is_set():
             return None
