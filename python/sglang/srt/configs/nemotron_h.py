@@ -32,6 +32,7 @@ MLP = "-"
 MOE = "E"
 DEFAULT_LAYERS_BLOCK_TYPE = ["mamba", "moe", "attention", "moe"]
 DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
+DEFAULT_MAMBA_CHUNK_SIZE = 256
 
 
 class NemotronHConfig(PretrainedConfig):
@@ -255,7 +256,7 @@ class NemotronHConfig(PretrainedConfig):
         mamba_dt_init_floor=1e-4,
         mamba_conv_bias=True,
         mamba_proj_bias=False,
-        mamba_chunk_size=256,
+        mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
         rescale_prenorm_residual=True,
         n_routed_experts=8,
         n_shared_experts=1,
@@ -271,6 +272,18 @@ class NemotronHConfig(PretrainedConfig):
         mtp_layers_block_type=DEFAULT_MTP_LAYERS_BLOCK_TYPE,
         **kwargs,
     ):
+        chunk_size = kwargs.pop("chunk_size", None)
+        if chunk_size is not None:
+            if mamba_chunk_size == DEFAULT_MAMBA_CHUNK_SIZE:
+                mamba_chunk_size = chunk_size
+            elif mamba_chunk_size != chunk_size:
+                logger.warning(
+                    "Both chunk_size=%s and mamba_chunk_size=%s were provided. "
+                    "Using mamba_chunk_size.",
+                    chunk_size,
+                    mamba_chunk_size,
+                )
+
         # Compatibility parsing: normalize legacy pattern fields into canonical list fields.
         layers_block_type = self._resolve_layers_block_type(
             layers_block_type, hybrid_override_pattern, kwargs
