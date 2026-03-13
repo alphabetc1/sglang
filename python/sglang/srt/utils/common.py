@@ -2486,6 +2486,47 @@ def nullable_str(val: str):
     return val
 
 
+def human_readable_int(value: str) -> int:
+    """Parse human-readable integers like '1k', '1M', etc.
+
+    Lowercase suffixes use decimal (SI) multipliers,
+    uppercase suffixes use binary (IEC) multipliers.
+    Decimal values are supported with SI suffixes (e.g. '25.6k' -> 25600).
+
+    Examples:
+        '1k'  -> 1,000       '1K'  -> 1,024
+        '1m'  -> 1,000,000   '1M'  -> 1,048,576
+        '100k' -> 100,000    '128K' -> 131,072
+        '25.6k' -> 25,600
+    """
+    value = value.strip()
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmMgGtT])", value)
+    if match:
+        decimal_multiplier = {"k": 10**3, "m": 10**6, "g": 10**9, "t": 10**12}
+        binary_multiplier = {"K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+
+        number, suffix = match.groups()
+        if suffix in decimal_multiplier:
+            return int(float(number) * decimal_multiplier[suffix])
+        elif suffix in binary_multiplier:
+            try:
+                return int(number) * binary_multiplier[suffix]
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with binary suffixes like "
+                    f"'{suffix}'. Did you mean '{number}{suffix.lower()}'?"
+                )
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer or a suffixed value like '1k', '1M'."
+        )
+
+
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
     try:
