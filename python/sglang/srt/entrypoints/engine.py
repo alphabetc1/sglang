@@ -96,7 +96,6 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
-    wait_for_scheduler_processes_ready,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
@@ -1184,10 +1183,44 @@ def _wait_for_scheduler_ready(
     scheduler_pipe_readers: List,
     scheduler_procs: List,
 ) -> List[Dict]:
-    """Wait for the model to finish loading and return scheduler infos."""
-    scheduler_infos = wait_for_scheduler_processes_ready(
-        scheduler_pipe_readers, scheduler_procs
-    )
+    """Wait for the model to finish loading and return scheduler infos.
+
+    Uses polling to detect child process death quickly, rather than blocking
+    indefinitely on pipe recv(). This prevents the launch from hanging when
+    a child process is killed (e.g. by OOM killer via SIGKILL) before it can
+    send any data through the pipe.
+
+    On each poll timeout, checks ALL processes (not just the current one) so that
+    a death in any rank is detected promptly regardless of iteration order.
+    """
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        while True:
+            if scheduler_pipe_readers[i].poll(timeout=5.0):
+                try:
+                    data = scheduler_pipe_readers[i].recv()
+                except EOFError:
+                    scheduler_procs[i].join(timeout=10)
+                    raise RuntimeError(
+                        f"Rank {i} scheduler died during initialization "
+                        f"(exit code: {scheduler_procs[i].exitcode}). "
+                        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+                        f"Run `dmesg -T | grep -i oom` to check."
+                    )
+                scheduler_infos.append(data)
+                break
+            else:
+                # Check ALL processes, not just the current one
+                for j in range(len(scheduler_procs)):
+                    if not scheduler_procs[j].is_alive():
+                        scheduler_procs[j].join(timeout=10)
+                        raise RuntimeError(
+                            f"Rank {j} scheduler died during initialization "
+                            f"(exit code: {scheduler_procs[j].exitcode}). "
+                            f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+                            f"Run `dmesg -T | grep -i oom` to check."
+                        )
+
     for data in scheduler_infos:
         if data["status"] != "ready":
             raise RuntimeError(
