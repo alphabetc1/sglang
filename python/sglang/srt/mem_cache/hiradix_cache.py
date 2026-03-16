@@ -364,6 +364,12 @@ class HiRadixCache(RadixCache):
 
         if force:
             self.cache_controller.set_storage_io_blocked(True)
+            drain_ok, drain_msg = self._wait_storage_ops_idle(timeout_s=5.0)
+            if not drain_ok:
+                logger.warning(
+                    "Force attach: storage ops still in-flight after wait: %s",
+                    drain_msg,
+                )
 
         try:
             self.cache_controller.attach_storage_backend(
@@ -522,6 +528,8 @@ class HiRadixCache(RadixCache):
         log_metrics: bool,
     ):
         cc = self.cache_controller
+        if not hasattr(cc, "prefetch_revoke_queue"):
+            return
 
         def _drain_queue(q, limit: Optional[int]):
             drained = 0
