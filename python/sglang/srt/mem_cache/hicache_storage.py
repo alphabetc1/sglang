@@ -13,11 +13,14 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 logger = logging.getLogger(__name__)
 
 
-def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
+def get_hash_str(token_ids: List[int], prior_hash: str = None, extra_key: Optional[str] = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
+
+    if extra_key is not None:
+        hasher.update(extra_key.encode("utf-8"))
 
     for t in token_ids:
         if isinstance(t, tuple):
@@ -61,8 +64,9 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    prefix_keys: Optional[List[str]] = (None,)
+    prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
+    extra_key: Optional[str] = None
 
 
 class HiCacheStorage(ABC):

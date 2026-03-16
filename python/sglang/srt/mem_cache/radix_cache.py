@@ -237,6 +237,7 @@ def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
         List of SHA256 hex strings, one per page
     """
     hash_values = []
+    extra_key = node.key.extra_key if hasattr(node.key, 'extra_key') else None
 
     # Get parent's last hash value if parent exists
     parent_hash = None
@@ -246,13 +247,14 @@ def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
             parent_hash = node.parent.hash_value[-1]
 
     # Iterate through node's pages
-    for start in range(0, len(node.key), page_size):
+    for i, start in enumerate(range(0, len(node.key), page_size)):
         page_tokens = node.key.token_ids[start : start + page_size]
         if not page_tokens:
             continue
 
-        # Use SHA256-based chaining via get_hash_str
-        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        # extra_key only passed on first page when there's no parent_hash
+        page_extra_key = extra_key if (i == 0 and parent_hash is None) else None
+        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash, extra_key=page_extra_key)
         hash_values.append(hash_val)
         parent_hash = hash_val
 

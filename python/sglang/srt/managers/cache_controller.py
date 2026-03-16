@@ -853,6 +853,7 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        extra_key = operation.token_ids.extra_key if hasattr(operation.token_ids, 'extra_key') else None
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -860,7 +861,7 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys, extra_key=extra_key)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -904,9 +905,11 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        extra_key = operation.token_ids.extra_key if hasattr(operation.token_ids, 'extra_key') else None
 
         storage_query_count = 0
         hash_value = []
+        is_first_page = True
 
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
@@ -917,11 +920,14 @@ class HiCacheController:
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
             for i in range(0, len(batch_tokens), self.page_size):
+                # Pass extra_key only on the first page when there's no prior hash
+                page_extra_key = extra_key if (is_first_page and operation.last_hash is None) else None
                 last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
+                    batch_tokens[i : i + self.page_size], last_hash, extra_key=page_extra_key
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                is_first_page = False
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys, extra_key=extra_key)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -1015,6 +1021,7 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        extra_key = operation.token_ids.extra_key if hasattr(operation.token_ids, 'extra_key') else None
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -1022,7 +1029,7 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys, extra_key=extra_key)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(
