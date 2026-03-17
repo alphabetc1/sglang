@@ -198,15 +198,11 @@ class HiRadixCache(RadixCache):
             logger.exception("Failed to detach storage backend on process shutdown.")
 
     def _wait_storage_ops_idle(
-        self, timeout_s: float = 5.0, poll_interval_s: float = 0.2
+        self, timeout_s: float = 5.0, poll_interval_s: float = 0.1
     ) -> tuple[bool, str]:
         """Best-effort wait for in-flight storage ops to drain (used by force detach)."""
         start = time.monotonic()
         while True:
-            # Pump GPU↔Host transfer completions so in-flight ops can make progress
-            # even though the normal scheduler loop is blocked by this wait.
-            self.writing_check()
-            self.loading_check()
             self._drain_storage_control_queues_local()
             pending = (
                 self.cache_controller.count_pending_storage_ops()
