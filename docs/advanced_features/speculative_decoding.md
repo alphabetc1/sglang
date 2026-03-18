@@ -1,6 +1,6 @@
 # Speculative Decoding
 
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, PEAGLE, MTP, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -11,6 +11,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-2 Decoding with torch.compile](#eagle-2-decoding-with-torchcompile)
   - [EAGLE-2 Decoding via Frequency-Ranked Speculative Sampling](#eagle-2-decoding-via-frequency-ranked-speculative-sampling)
   - [EAGLE-3 Decoding](#eagle-3-decoding)
+  - [PEAGLE Decoding](#peagle-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
@@ -22,6 +23,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 ### Quick guidance
 
 - **Best speed/quality (recommended)**: Use **EAGLE-3** with `--speculative-algorithm EAGLE3`.
+- **Single-path parallel drafting**: Use **PEAGLE** with `--speculative-algorithm PEAGLE` when you have a PEAGLE draft checkpoint.
 - **Strong default / broad compatibility**: Use **EAGLE-2** with `--speculative-algorithm EAGLE`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
@@ -37,9 +39,10 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-2 + `torch.compile` | Same as EAGLE-2 | Typically yes | Add `--enable-torch-compile` (optionally `--torch-compile-max-bs`) | Benefit varies by hardware/model; benchmark to verify |
 | EAGLE-2 + FR-Spec | Same as EAGLE-2 + token subset | Typically yes | Add `--speculative-token-map ...` | Reduces `lm_head` overhead with high-frequency token vocab |
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
+| PEAGLE | Parallel-drafting EAGLE model | Yes | `--speculative-algorithm PEAGLE` + `--speculative-draft-model-path ...` | Initial support is linear drafting with `--speculative-eagle-topk 1`; requires a draft checkpoint with `ptd_token_id`/`pard_token` |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
-| SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
+| SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `PEAGLE`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
 ### Performance Highlights
@@ -61,7 +64,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
 
 | Parameter | Description | Default |
 |---|---|---|
-| `--speculative-draft-model-path` | Draft model path/weights. **Typically required** for EAGLE/EAGLE3 and STANDALONE. For some MTP-enabled models, this can be omitted. | `None` |
+| `--speculative-draft-model-path` | Draft model path/weights. **Typically required** for EAGLE/EAGLE3/PEAGLE and STANDALONE. For some MTP-enabled models, this can be omitted. | `None` |
 | `--speculative-num-steps` | Depth of autoregressive drafting. Increases speculation range but risks rejection cascades. | Auto (`5` for Llama/Grok; `3` for many other models) |
 | `--speculative-eagle-topk` | Branching factor per step. Improves candidate diversity and acceptance rate, but increases memory/compute consumption. | Auto (`4` for Llama/Grok; `1` for many other models) |
 | `--speculative-num-draft-tokens` | Maximum parallel verification capacity. Allows deeper tree evaluation but increases GPU memory usage. | Auto (`8` for Llama/Grok; `4` for many other models). If `topk=1`, it is adjusted to `num_steps + 1`. |
@@ -73,7 +76,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
 | `--speculative-draft-model-revision` | Specific revision/commit of the draft model to load. | `None` (auto-set to `"main"` when `--speculative-draft-model-path` is set and revision is omitted) |
 | `--speculative-draft-load-format` | Load format for the draft model weights. | `None` |
 
-These parameters are mostly the same for EAGLE-2 and EAGLE-3. `--speculative-token-map` is ignored for EAGLE-3 models.
+These parameters are mostly the same for EAGLE-2, EAGLE-3, and PEAGLE. `--speculative-token-map` is ignored for EAGLE-3 and PEAGLE models.
 For `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`: leave all three unset to use auto-tuning, or set all three explicitly when tuning.
 
 You can find the best combinations of these parameters with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py).
@@ -243,6 +246,32 @@ print(response.choices[0].message.content)
 
 ---
 
+### PEAGLE Decoding
+
+You can enable PEAGLE decoding by setting `--speculative-algorithm PEAGLE` and providing a PEAGLE draft model checkpoint.
+
+Current implementation notes:
+
+- PEAGLE currently supports linear parallel drafting only, so `--speculative-eagle-topk` must be `1`.
+- The draft checkpoint must expose `ptd_token_id` (or `pard_token`) in `config.json`.
+- PEAGLE runs on the overlap worker path and normalizes `--speculative-num-draft-tokens` to `num_steps + 1`.
+
+```bash
+python3 -m sglang.launch_server \
+    --model <target-model> \
+    --speculative-algorithm PEAGLE \
+    --speculative-draft-model-path <peagle-draft-model> \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --mem-fraction-static 0.7 \
+    --dtype bfloat16
+```
+
+For performance validation, compare PEAGLE against the same target model with `EAGLE3` or without speculative decoding, and track at least decode latency, tokens/s, and `avg_spec_accept_length`.
+
+---
+
 ## Multi Token Prediction
 
 We support [MTP (Multi-Token Prediction)](https://arxiv.org/pdf/2404.19737) in SGLang by using speculative decoding. We use `XiaomiMiMo/MiMo-7B-RL` as an example here (for DeepSeek MTP usage, refer to [deepseek_v32 doc](../basic_usage/deepseek_v32.md#multi-token-prediction)).
@@ -340,7 +369,7 @@ Notes:
 - SpecV2 currently only supports `--speculative-eagle-topk 1`. When SpecV2 is enabled, **set `--speculative-eagle-topk 1` explicitly**.
 - If you explicitly set `--speculative-eagle-topk > 1`, the server will error.
 - If you omit `--speculative-eagle-topk`, auto-tuning may pick `topk > 1` for some models (e.g. Llama). This is incompatible with SpecV2 and may not always trigger an immediate config error, so set `--speculative-eagle-topk 1` explicitly.
-- This applies to `EAGLE`, `EAGLE3`, and `STANDALONE`.
+- This applies to `EAGLE`, `EAGLE3`, `PEAGLE`, and `STANDALONE`.
 
 ```bash
 SGLANG_ENABLE_SPEC_V2=True python3 -m sglang.launch_server \
@@ -444,7 +473,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
+| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `PEAGLE`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |

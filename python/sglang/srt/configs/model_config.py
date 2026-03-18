@@ -277,6 +277,12 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
+        if is_draft_model and (
+            hasattr(self.hf_config, "ptd_token_id") or hasattr(self.hf_config, "pard_token")
+        ):
+            if self.hf_config.architectures[0] == "LlamaForCausalLM":
+                self.hf_config.architectures[0] = "LlamaForCausalLMPeagle"
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "GlmMoeDsaForCausalLM",

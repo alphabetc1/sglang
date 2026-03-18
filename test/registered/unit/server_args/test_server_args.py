@@ -1,8 +1,10 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -330,6 +332,52 @@ class TestSSLArgs(unittest.TestCase):
             ]
         )
         self.assertTrue(server_args.enable_ssl_refresh)
+
+
+class TestPEagleServerArgs(unittest.TestCase):
+    @patch.object(ServerArgs, "get_model_config")
+    def test_peagle_requires_draft_model_path(self, mock_get_model_config):
+        mock_get_model_config.return_value = MagicMock(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="not_dummy", speculative_algorithm="PEAGLE")
+        self.assertIn("speculative-draft-model-path", str(context.exception))
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_peagle_rejects_topk_gt_one(self, mock_get_model_config):
+        mock_get_model_config.return_value = MagicMock(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="not_dummy",
+                speculative_algorithm="PEAGLE",
+                speculative_draft_model_path="draft",
+                speculative_num_steps=4,
+                speculative_eagle_topk=2,
+            )
+        self.assertIn("topk = 1", str(context.exception))
+
+    @patch.object(ServerArgs, "get_model_config")
+    def test_peagle_enables_overlap_and_normalizes_draft_tokens(
+        self, mock_get_model_config
+    ):
+        mock_get_model_config.return_value = MagicMock(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            server_args = ServerArgs(
+                model_path="not_dummy",
+                speculative_algorithm="PEAGLE",
+                speculative_draft_model_path="draft",
+                speculative_num_steps=4,
+                speculative_num_draft_tokens=9,
+            )
+
+        self.assertEqual(server_args.speculative_eagle_topk, 1)
+        self.assertEqual(server_args.speculative_num_draft_tokens, 5)
+        self.assertFalse(server_args.disable_overlap_schedule)
 
 
 if __name__ == "__main__":

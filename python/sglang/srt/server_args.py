@@ -2765,12 +2765,29 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "PEAGLE", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
                 )
+            if self.speculative_algorithm == "PEAGLE":
+                if self.speculative_draft_model_path is None:
+                    raise ValueError(
+                        "PEAGLE speculative decoding requires --speculative-draft-model-path."
+                    )
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk != 1
+                ):
+                    raise ValueError(
+                        "PEAGLE currently only supports speculative_eagle_topk = 1."
+                    )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for PEAGLE speculative decoding."
+                    )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -2779,12 +2796,13 @@ class ServerArgs:
                 )
 
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
+                self.speculative_algorithm
+                in ["EAGLE", "EAGLE3", "PEAGLE", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
                 self.disable_overlap_schedule = False
                 logger.warning(
-                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
+                    "Spec v2 is enabled for eagle/eagle3/peagle speculative decoding and overlap schedule is turned on."
                 )
                 if (
                     self.speculative_eagle_topk is not None
@@ -2842,6 +2860,13 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+
+            if self.speculative_algorithm == "PEAGLE":
+                if self.speculative_eagle_topk != 1:
+                    logger.warning(
+                        "speculative_eagle_topk is adjusted to 1 for PEAGLE speculative decoding."
+                    )
+                    self.speculative_eagle_topk = 1
 
             if (
                 self.attention_backend == "trtllm_mha"
@@ -4443,7 +4468,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "PEAGLE", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

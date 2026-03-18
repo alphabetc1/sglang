@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -164,6 +165,21 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         self.init_token_map()
         self.init_lm_head()
+        self.peagle_draft_token_id = None
+        if self.speculative_algorithm.is_peagle():
+            self.peagle_draft_token_id = getattr(
+                self.draft_runner.model_config.hf_config,
+                "ptd_token_id",
+                getattr(self.draft_runner.model_config.hf_config, "pard_token", None),
+            )
+            if self.peagle_draft_token_id is None:
+                raise ValueError(
+                    "PEAGLE draft model config must provide ptd_token_id or pard_token."
+                )
+            if not hasattr(self.draft_runner.model.model, "mask_hidden"):
+                raise ValueError(
+                    "PEAGLE draft model must provide a learnable mask_hidden tensor."
+                )
 
         # Init attention backend and cuda graphs
         self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
@@ -318,6 +334,9 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        if self.speculative_algorithm.is_peagle():
+            return self._draft_peagle(model_worker_batch)
+
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -394,6 +413,154 @@ class EagleDraftWorker(BaseDraftWorker):
             capture_hidden_mode=None,
             seq_lens_sum=None,
             seq_lens_cpu=None,
+        )
+
+    def _build_peagle_linear_tree(
+        self,
+        draft_input: EagleDraftInput,
+        draft_tokens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+    ) -> EagleVerifyInput:
+        batch_size = draft_tokens.shape[0]
+        device = draft_tokens.device
+        top_scores_index = torch.arange(
+            self.speculative_num_steps,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(batch_size, -1)
+        parent_list = (
+            top_scores_index - 1
+        )
+
+        tree_mask_buf, position_buf = (
+            self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
+        )
+        (
+            tree_mask,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            flat_draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.verified_id,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            seq_lens,
+            seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.tree_mask_mode,
+            tree_mask_buf,
+            position_buf,
+        )
+
+        return EagleVerifyInput(
+            draft_token=flat_draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=None,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+
+    def _prepare_peagle_forward_batch(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> Tuple[ForwardBatch, bool]:
+        draft_input: EagleDraftInput = model_worker_batch.spec_info
+        batch_size = len(model_worker_batch.seq_lens)
+        num_parallel_tokens = self.speculative_num_steps + 1
+
+        input_ids = torch.full(
+            (batch_size, num_parallel_tokens),
+            self.peagle_draft_token_id,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        input_ids[:, 0] = draft_input.verified_id.to(dtype=torch.int64)
+
+        mask_hidden = self.draft_runner.model.model.mask_hidden.to(
+            device=draft_input.hidden_states.device,
+            dtype=draft_input.hidden_states.dtype,
+        )
+        hidden_states = mask_hidden.view(1, 1, -1).expand(
+            batch_size, num_parallel_tokens, -1
+        )
+        hidden_states = hidden_states.clone()
+        hidden_states[:, 0] = draft_input.hidden_states
+
+        peagle_input = EagleDraftInput(
+            hidden_states=hidden_states.reshape(batch_size * num_parallel_tokens, -1),
+            num_tokens_per_req=num_parallel_tokens,
+            num_tokens_for_logprob_per_req=num_parallel_tokens,
+        )
+        temp_batch = copy.copy(model_worker_batch)
+        forward_batch = peagle_input.prepare_for_extend_to_fill_draft_kvcache(
+            temp_batch,
+            input_ids.reshape(-1),
+            num_parallel_tokens,
+            self.draft_runner,
+            self.cuda_graph_runner_for_draft_extend,
+        )
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+        )
+        return forward_batch, can_cuda_graph
+
+    def _draft_peagle(self, model_worker_batch: ModelWorkerBatch):
+        if model_worker_batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+
+        forward_batch, can_cuda_graph = self._prepare_peagle_forward_batch(
+            model_worker_batch
+        )
+
+        if can_cuda_graph:
+            draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
+            )
+        else:
+            draft_logits_output = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+
+        maybe_detect_nan(
+            draft_logits_output.next_token_logits,
+            "draft_peagle: draft model logits",
+        )
+
+        batch_size = len(model_worker_batch.seq_lens)
+        num_parallel_tokens = self.speculative_num_steps + 1
+        draft_logits = draft_logits_output.next_token_logits.view(
+            batch_size, num_parallel_tokens, -1
+        )
+        draft_tokens = torch.argmax(
+            draft_logits[:, : self.speculative_num_steps], dim=-1
+        )
+        if self.hot_token_id is not None:
+            draft_tokens = self.hot_token_id[draft_tokens]
+
+        return self._build_peagle_linear_tree(
+            model_worker_batch.spec_info,
+            draft_tokens,
+            model_worker_batch.seq_lens,
+            model_worker_batch.seq_lens_sum,
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -536,12 +703,15 @@ class EagleDraftWorker(BaseDraftWorker):
         logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
+        next_draft_input.hidden_states = logits_output.hidden_states
+        if self.speculative_algorithm.is_peagle():
+            return next_draft_input
+
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
             probs, self.topk, dim=-1
         )
-        next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
     def _draft_extend_for_decode(
@@ -604,21 +774,24 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
         ]
-        probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
-        ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
-        (
-            next_draft_input.topk_p,
-            next_draft_input.topk_index,
-            next_draft_input.hidden_states,
-        ) = (
-            ret_topk_p,
-            ret_topk_index,
-            ret_hidden_states,
-        )
+        if self.speculative_algorithm.is_peagle():
+            next_draft_input.hidden_states = ret_hidden_states
+        else:
+            probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+            (
+                next_draft_input.topk_p,
+                next_draft_input.topk_index,
+                next_draft_input.hidden_states,
+            ) = (
+                ret_topk_p,
+                ret_topk_index,
+                ret_hidden_states,
+            )
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
