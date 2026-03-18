@@ -761,27 +761,41 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        def _get_batch_size() -> int:
+            for tensor in (self.topk_p, self.hidden_states, self.verified_id):
+                if tensor is not None:
+                    return len(tensor)
+            return 0
+
+        def _filter_optional_tensor(tensor: Optional[torch.Tensor]):
+            if tensor is None:
+                return None
+            if has_been_filtered:
+                return tensor[: len(new_indices)]
+            return tensor[new_indices]
+
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
+        batch_size = _get_batch_size()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
+            error_msg = f"length of new_indices: {len(new_indices)} != batch size: {batch_size}, this should not happen"
+            if len(new_indices) != batch_size:
                 if strict_check:
                     raise ValueError(error_msg)
                 else:
                     logger.warning(error_msg)
 
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+            self.topk_p = _filter_optional_tensor(self.topk_p)
+            self.topk_index = _filter_optional_tensor(self.topk_index)
+            self.hidden_states = _filter_optional_tensor(self.hidden_states)
+            self.verified_id = _filter_optional_tensor(self.verified_id)
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+            self.topk_p = _filter_optional_tensor(self.topk_p)
+            self.topk_index = _filter_optional_tensor(self.topk_index)
+            self.hidden_states = _filter_optional_tensor(self.hidden_states)
+            self.verified_id = _filter_optional_tensor(self.verified_id)
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -801,12 +815,26 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
         if spec_info.hidden_states is None:
             return
+
+        def _merge_optional_tensor(
+            lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor], name: str
+        ):
+            if lhs is None and rhs is None:
+                return None
+            if lhs is None or rhs is None:
+                raise ValueError(
+                    f"Inconsistent EagleDraftInput.{name} when merging batches"
+                )
+            return torch.cat([lhs, rhs])
+
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        self.topk_p = _merge_optional_tensor(self.topk_p, spec_info.topk_p, "topk_p")
+        self.topk_index = _merge_optional_tensor(
+            self.topk_index, spec_info.topk_index, "topk_index"
+        )
 
 
 @dataclass
