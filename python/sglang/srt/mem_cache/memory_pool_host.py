@@ -146,23 +146,33 @@ class HostKVCache(abc.ABC):
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        slot_capacity: Optional[int] = None,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
+        self.allocator_type = allocator_type
         self.allocator = get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+        if slot_capacity is not None:
+            self.size = slot_capacity
+            if self.size % self.page_size != 0:
+                raise ValueError(
+                    f"slot_capacity must be page aligned, got {self.size=} and {self.page_size=}"
+                )
+            self.page_num = self.size // self.page_size
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
+            if host_size > 0:
+                self.size = int(host_size * 1e9 // self.size_per_token)
+            else:
+                self.size = int(device_pool.size * host_to_device_ratio)
+            # Align up the host memory pool size to the page size.
+            self.page_num = self.size // self.page_size + 1
+            self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -285,6 +295,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        slot_capacity: Optional[int] = None,
     ):
         super().__init__(
             device_pool,
@@ -295,6 +306,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            slot_capacity,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -746,6 +758,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        slot_capacity: Optional[int] = None,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -757,6 +770,7 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            slot_capacity,
         )
         self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
@@ -1087,6 +1101,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        slot_capacity: Optional[int] = None,
     ):
         # Initialize indexer metadata before HostKVCache.__init__ calls get_size_per_token.
         self.index_head_dim = device_pool.index_head_dim
@@ -1106,6 +1121,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device,
             allocator_type,
             override_kv_cache_dim=device_pool.kv_cache_dim,
+            slot_capacity=slot_capacity,
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize

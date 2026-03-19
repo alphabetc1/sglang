@@ -8,12 +8,16 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheController,
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -47,6 +51,7 @@ from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
@@ -54,6 +59,45 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+
+    def _create_token_to_kv_pool_host(
+        self,
+        kv_cache,
+        server_args: ServerArgs,
+        storage_backend: Optional[str],
+        slot_capacity: Optional[int] = None,
+    ):
+        if isinstance(kv_cache, MHATokenToKVPool):
+            return MHATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=storage_backend,
+                slot_capacity=slot_capacity,
+            )
+        if isinstance(kv_cache, NSATokenToKVPool):
+            return NSATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=storage_backend,
+                slot_capacity=slot_capacity,
+            )
+        if isinstance(kv_cache, MLATokenToKVPool):
+            return MLATokenToKVPoolHost(
+                kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=storage_backend,
+                slot_capacity=slot_capacity,
+            )
+        raise ValueError("HiRadixCache only supports MHA and MLA yet")
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -70,42 +114,30 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.companion_allocators: Tuple[BaseTokenToKVPoolAllocator, ...] = (
+            params.token_to_kv_pool_allocator.get_companion_allocators()
+        )
+        requested_storage_backend = server_args.hicache_storage_backend
+        self.enable_companion_hicache = len(self.companion_allocators) > 0
+        if self.enable_companion_hicache and requested_storage_backend is not None:
+            logger.warning(
+                "Disable HiCache storage backend for speculative decoding: "
+                "paired target/draft host backing is enabled, but storage pairing "
+                "is not yet supported."
+            )
+            requested_storage_backend = None
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
-            self.token_to_kv_pool_host = NSATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
-        elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
-            )
-        else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+        self.token_to_kv_pool_host = self._create_token_to_kv_pool_host(
+            self.kv_cache,
+            server_args,
+            requested_storage_backend,
+        )
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.enable_storage = server_args.hicache_storage_backend is not None
+        self.enable_storage = requested_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
 
@@ -131,7 +163,7 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=server_args.hicache_write_policy,
             io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
+            storage_backend=requested_storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
@@ -139,8 +171,35 @@ class HiRadixCache(RadixCache):
             pp_size=self.pp_size,
             enable_storage_metrics=self.enable_storage_metrics,
         )
+        self.companion_cache_controllers = []
+        for secondary_allocator in self.companion_allocators:
+            secondary_kv_cache = secondary_allocator.get_kvcache()
+            secondary_host_pool = self._create_token_to_kv_pool_host(
+                secondary_kv_cache,
+                server_args,
+                None,
+                slot_capacity=self.token_to_kv_pool_host.size,
+            )
+            self.companion_cache_controllers.append(
+                HiCacheController(
+                    secondary_allocator,
+                    secondary_host_pool,
+                    self.page_size,
+                    self.tp_group,
+                    load_cache_event=threading.Event(),
+                    write_policy=server_args.hicache_write_policy,
+                    io_backend=server_args.hicache_io_backend,
+                    storage_backend=None,
+                    prefetch_threshold=prefetch_threshold,
+                    model_name=server_args.served_model_name,
+                    storage_backend_extra_config=extra_config,
+                    pp_rank=self.pp_rank,
+                    pp_size=self.pp_size,
+                    enable_storage_metrics=False,
+                )
+            )
         self._apply_storage_runtime_config(
-            storage_backend=server_args.hicache_storage_backend,
+            storage_backend=requested_storage_backend,
             prefetch_threshold=prefetch_threshold,
             prefetch_timeout_base=prefetch_timeout_base,
             prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
@@ -257,6 +316,12 @@ class HiRadixCache(RadixCache):
         prefetch/backup paths. Caller must ensure there are no running/queued
         requests to avoid races.
         """
+        if self.enable_companion_hicache:
+            return (
+                False,
+                "HiCache storage backend is currently disabled when speculative decoding "
+                "uses paired target/draft host backing.",
+            )
         # Validate inputs first (no side effects).
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
@@ -596,11 +661,72 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        for controller in self.companion_cache_controllers:
+            controller.reset()
+        # Companion host pools reuse the primary host slot namespace and do not
+        # allocate/free host indices independently.
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.ongoing_write_through.clear()
+        self.ongoing_load_back.clear()
+        self.ongoing_prefetch.clear()
+        self.ongoing_backup.clear()
         self.pinned_size_ = 0
         super().reset()
+
+    def _all_cache_controllers(self) -> List[HiCacheController]:
+        return [self.cache_controller, *self.companion_cache_controllers]
+
+    def _has_complete_host_backing(self, node: TreeNode) -> bool:
+        return node is self.root_node or node.backuped
+
+    def _enqueue_write_into(
+        self,
+        controller: HiCacheController,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+    ) -> None:
+        controller.write_queue.append(CacheOperation(host_indices, device_indices, node_id))
+        controller.start_writing()
+
+    def _enqueue_load_into(
+        self,
+        controller: HiCacheController,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+    ) -> None:
+        controller.load_queue.append(CacheOperation(host_indices, device_indices, node_id))
+
+    def _count_ready_acks(self, ack_queue: List) -> int:
+        ready = 0
+        for _, finish_event, _ in ack_queue:
+            if not finish_event.query():
+                break
+            ready += 1
+        return ready
+
+    def _paired_ready_ack_count(self, ack_attr: str) -> int:
+        controllers = self._all_cache_controllers()
+        if len(controllers) == 1:
+            return self._count_ready_acks(getattr(controllers[0], ack_attr))
+        return min(
+            self._count_ready_acks(getattr(controller, ack_attr))
+            for controller in controllers
+        )
+
+    def _pop_paired_acks(self, ack_attr: str) -> List[int]:
+        ack_node_ids = None
+        for controller in self._all_cache_controllers():
+            ack = getattr(controller, ack_attr).pop(0)
+            ack.finish_event.synchronize()
+            if ack_node_ids is None:
+                ack_node_ids = ack.node_ids
+            else:
+                assert ack_node_ids == ack.node_ids
+        return ack_node_ids or []
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -632,25 +758,33 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-        )
+        host_indices = self.cache_controller.mem_pool_host.alloc(len(node.value))
         if host_indices is None:
             self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
-                device_indices=node.value,
-                node_id=node.id,
-            )
-        if host_indices is not None:
-            node.host_value = host_indices
-            assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
-            if not write_back:
-                # no need to lock nodes if write back
-                self.inc_lock_ref(node)
-        else:
+            host_indices = self.cache_controller.mem_pool_host.alloc(len(node.value))
+        if host_indices is None:
             return 0
+
+        self._enqueue_write_into(
+            self.cache_controller,
+            host_indices,
+            node.value,
+            node.id,
+        )
+        for controller in self.companion_cache_controllers:
+            self._enqueue_write_into(
+                controller,
+                host_indices,
+                node.value,
+                node.id,
+            )
+
+        node.host_value = host_indices
+        assert len(node.host_value) > 0
+        self.ongoing_write_through[node.id] = node
+        if not write_back:
+            # no need to lock nodes if write back
+            self.inc_lock_ref(node)
 
         return len(host_indices)
 
@@ -682,25 +816,18 @@ class HiRadixCache(RadixCache):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
-                for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
-                        if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
-                self.cache_controller.ack_write_queue.clear()
-                assert len(self.ongoing_write_through) == 0
+                ack_list = self._pop_paired_acks("ack_write_queue")
+                for ack_id in ack_list:
+                    backuped_node = self.ongoing_write_through.pop(ack_id)
+                    if self.enable_storage:
+                        self.write_backup_storage(backuped_node)
             return
 
         # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
         if len(self.ongoing_write_through) == 0:
             return
 
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        finish_count = self._paired_ready_ack_count("ack_write_queue")
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
             # synchronize TP workers to make the same update to radix cache
@@ -712,8 +839,7 @@ class HiRadixCache(RadixCache):
 
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
+            ack_list = self._pop_paired_acks("ack_write_queue")
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
@@ -722,19 +848,13 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
-                # the KV cache loading is still ongoing
-                break
-            finish_count += 1
-            # no need to sync across TP workers as batch forwarding is synced
+        finish_count = self._paired_ready_ack_count("ack_load_queue")
+        while finish_count > 0:
+            ack_list = self._pop_paired_acks("ack_load_queue")
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        # ACK until all events are processed
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def evictable_size(self):
         return self.evictable_size_
@@ -859,7 +979,11 @@ class HiRadixCache(RadixCache):
         return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if (
+            not node.evicted
+            or node.lock_ref > 0
+            or not self._has_complete_host_backing(node)
+        ):
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
             return
@@ -1048,6 +1172,14 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        for controller in self.companion_cache_controllers:
+            self._enqueue_load_into(
+                controller,
+                host_indices,
+                device_indices,
+                last_hit_node.id,
+            )
+
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
@@ -1092,7 +1224,17 @@ class HiRadixCache(RadixCache):
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        return self.cache_controller.start_loading()
+        consumer_index = self.cache_controller.start_loading()
+        for controller in self.companion_cache_controllers:
+            companion_consumer_index = controller.start_loading()
+            if companion_consumer_index >= 0:
+                assert companion_consumer_index == consumer_index
+        return consumer_index
+
+    def set_hicache_consumer(self, consumer_index: int) -> None:
+        self.cache_controller.layer_done_counter.set_consumer(consumer_index)
+        for controller in self.companion_cache_controllers:
+            controller.layer_done_counter.set_consumer(consumer_index)
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
@@ -1288,10 +1430,10 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
-        while last_node.evicted:
+        while last_node.evicted and self._has_complete_host_backing(last_node):
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
-        while not last_host_node.backuped:
+        while not self._has_complete_host_backing(last_host_node):
             last_host_node = last_host_node.parent
 
         return MatchResult(

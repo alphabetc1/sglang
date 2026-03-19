@@ -360,6 +360,7 @@ class TpModelWorker(BaseTpWorker):
             memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
+        self.token_to_kv_pool_allocator = self._model_runner.token_to_kv_pool_allocator
 
     def _init_multi_layer_eagle_model_runners(self):
         from sglang.srt.model_executor.model_runner import ModelRunner

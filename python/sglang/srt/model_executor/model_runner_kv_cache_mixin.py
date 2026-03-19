@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
+    create_companion_token_to_kv_pool_allocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
@@ -689,10 +690,16 @@ class ModelRunnerKVCacheMixin:
 
         else:
             assert self.is_draft_worker
+            if self.server_args.enable_hierarchical_cache:
+                self.token_to_kv_pool_allocator = (
+                    create_companion_token_to_kv_pool_allocator(
+                        shared_allocator=self.token_to_kv_pool_allocator,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                )
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                assert isinstance(
+                    self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
                 )
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping

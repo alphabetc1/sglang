@@ -736,9 +736,6 @@ class Scheduler(
                     self.tree_cache = HiRadixCache(
                         params=params, server_args=server_args
                     )
-                self.tp_worker.register_hicache_layer_transfer_counter(
-                    self.tree_cache.cache_controller.layer_done_counter
-                )
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -2323,6 +2320,9 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            set_hicache_consumer = getattr(self.tree_cache, "set_hicache_consumer", None)
+            if set_hicache_consumer is not None:
+                set_hicache_consumer(new_batch.hicache_consumer_index)
 
         new_batch.prepare_for_extend()
 

@@ -20,7 +20,8 @@ Page-aligned memory pool.
 """
 
 import abc
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -32,8 +33,27 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+@dataclasses.dataclass
+class AllocatorLogicalState:
+    free_pages: Optional[torch.Tensor] = None
+    release_pages: Optional[torch.Tensor] = None
+    is_not_in_free_group: bool = True
+    free_group: List[torch.Tensor] = dataclasses.field(default_factory=list)
+
+
+class AllocatorReplicaGroup:
+    def __init__(self):
+        self._allocators = []
+
+    def register(self, allocator: "BaseTokenToKVPoolAllocator") -> None:
+        if allocator not in self._allocators:
+            self._allocators.append(allocator)
+
+    def get_allocators(self):
+        return tuple(self._allocators)
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
-    @abc.abstractmethod
     def __init__(
         self,
         size: int,
@@ -42,6 +62,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        logical_state: Optional[AllocatorLogicalState] = None,
+        replica_group: Optional[AllocatorReplicaGroup] = None,
     ):
         self.size = size
         self.page_size = page_size
@@ -49,11 +71,41 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.device = device
         self._kvcache = kvcache
         self.need_sort = need_sort
+        self._logical_state = logical_state or AllocatorLogicalState()
+        self._replica_group = replica_group or AllocatorReplicaGroup()
+        self._replica_group.register(self)
 
-        self.free_pages = None
-        self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
+    @property
+    def free_pages(self):
+        return self._logical_state.free_pages
+
+    @free_pages.setter
+    def free_pages(self, value):
+        self._logical_state.free_pages = value
+
+    @property
+    def release_pages(self):
+        return self._logical_state.release_pages
+
+    @release_pages.setter
+    def release_pages(self, value):
+        self._logical_state.release_pages = value
+
+    @property
+    def is_not_in_free_group(self):
+        return self._logical_state.is_not_in_free_group
+
+    @is_not_in_free_group.setter
+    def is_not_in_free_group(self, value):
+        self._logical_state.is_not_in_free_group = value
+
+    @property
+    def free_group(self):
+        return self._logical_state.free_group
+
+    @free_group.setter
+    def free_group(self, value):
+        self._logical_state.free_group = value
 
     def debug_print(self) -> str:
         return ""
@@ -63,6 +115,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def get_replica_allocators(self):
+        return self._replica_group.get_allocators()
+
+    def get_companion_allocators(self):
+        return tuple(
+            allocator
+            for allocator in self._replica_group.get_allocators()
+            if allocator is not self
+        )
 
     def restore_state(self, state):
         self.free_pages, self.release_pages = state
@@ -101,6 +163,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def make_logical_view(self, kvcache: "KVCache"):
+        raise NotImplementedError()
+
     @abc.abstractmethod
     def clear(self):
         raise NotImplementedError()
@@ -124,9 +189,21 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        logical_state: Optional[AllocatorLogicalState] = None,
+        replica_group: Optional[AllocatorReplicaGroup] = None,
     ):
-        super().__init__(size, 1, dtype, device, kvcache, need_sort)
-        self.clear()
+        super().__init__(
+            size,
+            1,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+            logical_state=logical_state,
+            replica_group=replica_group,
+        )
+        if logical_state is None:
+            self.clear()
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -169,6 +246,17 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def make_logical_view(self, kvcache: KVCache):
+        return type(self)(
+            self.size,
+            dtype=self.dtype,
+            device=self.device,
+            kvcache=kvcache,
+            need_sort=self.need_sort,
+            logical_state=self._logical_state,
+            replica_group=self._replica_group,
+        )
 
 
 def alloc_extend_naive(
@@ -371,11 +459,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        logical_state: Optional[AllocatorLogicalState] = None,
+        replica_group: Optional[AllocatorReplicaGroup] = None,
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+            logical_state=logical_state,
+            replica_group=replica_group,
+        )
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
-        self.clear()
+        if logical_state is None:
+            self.clear()
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
@@ -517,3 +617,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def make_logical_view(self, kvcache: KVCache):
+        return type(self)(
+            self.size,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            device=self.device,
+            kvcache=kvcache,
+            need_sort=self.need_sort,
+            logical_state=self._logical_state,
+            replica_group=self._replica_group,
+        )
+
+
+def create_companion_token_to_kv_pool_allocator(
+    shared_allocator: BaseTokenToKVPoolAllocator,
+    kvcache: "KVCache",
+) -> BaseTokenToKVPoolAllocator:
+    return shared_allocator.make_logical_view(kvcache)

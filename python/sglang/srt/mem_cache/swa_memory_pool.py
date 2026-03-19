@@ -6,6 +6,8 @@ import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
+    AllocatorLogicalState,
+    AllocatorReplicaGroup,
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -232,68 +234,78 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: SWAKVPool,
         need_sort: bool,
+        full_attn_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        swa_attn_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        shared_mapping: Optional[torch.Tensor] = None,
+        logical_state: Optional[AllocatorLogicalState] = None,
+        replica_group: Optional[AllocatorReplicaGroup] = None,
     ):
         assert isinstance(kvcache, SWAKVPool)
+        super().__init__(
+            min(size, size_swa),
+            page_size,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+            logical_state=logical_state or AllocatorLogicalState(),
+            replica_group=replica_group,
+        )
         self._size_full = size
         self._size_swa = size_swa
-        self.dtype = dtype
-        self.device = device
-        self.page_size = page_size
-
-        if page_size == 1:
-            self.full_attn_allocator = TokenToKVPoolAllocator(
-                size,
-                dtype,
-                device,
-                kvcache.full_kv_pool,
-                need_sort,
+        if full_attn_allocator is None or swa_attn_allocator is None:
+            if page_size == 1:
+                self.full_attn_allocator = TokenToKVPoolAllocator(
+                    size,
+                    dtype,
+                    device,
+                    kvcache.full_kv_pool,
+                    need_sort,
+                )
+                self.swa_attn_allocator = TokenToKVPoolAllocator(
+                    size_swa,
+                    dtype,
+                    device,
+                    kvcache.swa_kv_pool,
+                    need_sort,
+                )
+            else:
+                self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+                    size,
+                    page_size,
+                    dtype,
+                    device,
+                    kvcache.full_kv_pool,
+                    need_sort,
+                )
+                self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+                    size_swa,
+                    page_size,
+                    dtype,
+                    device,
+                    kvcache.swa_kv_pool,
+                    need_sort,
+                )
+            # Note: append one more item of value -1 in the end so -1 maps to -1.
+            # It is needed for the last_loc in alloc_extend, where the first
+            # full_last_loc is -1, and we need to map it to swa_last_loc -1 as well.
+            self.full_to_swa_index_mapping = torch.cat(
+                [
+                    torch.zeros(
+                        size + self.page_size,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    torch.tensor([-1], dtype=torch.int64, device=device),
+                ]
             )
-            self.swa_attn_allocator = TokenToKVPoolAllocator(
-                size_swa,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
-            )
+            self.clear()
         else:
-            self.full_attn_allocator = PagedTokenToKVPoolAllocator(
-                size,
-                page_size,
-                dtype,
-                device,
-                kvcache.full_kv_pool,
-                need_sort,
-            )
-            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
-                size_swa,
-                page_size,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
-            )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
-        self.full_to_swa_index_mapping = torch.cat(
-            [
-                torch.zeros(
-                    size + self.page_size,
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
-            ]
-        )
+            self.full_attn_allocator = full_attn_allocator
+            self.swa_attn_allocator = swa_attn_allocator
+            assert shared_mapping is not None
+            self.full_to_swa_index_mapping = shared_mapping
 
-        self.need_sort = need_sort
-        self.free_pages = None
-        self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-        self.clear()
-        self._kvcache = kvcache
         self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
 
     def available_size(self):
@@ -307,10 +319,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
-
-    @property
-    def size(self):
-        return min(self._size_full, self._size_swa)
 
     @property
     def size_swa(self):
@@ -459,3 +467,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+    def make_logical_view(self, kvcache: SWAKVPool):
+        assert isinstance(kvcache, SWAKVPool)
+        return type(self)(
+            size=self._size_full,
+            size_swa=self._size_swa,
+            page_size=self.page_size,
+            dtype=self.dtype,
+            device=self.device,
+            kvcache=kvcache,
+            need_sort=self.need_sort,
+            full_attn_allocator=self.full_attn_allocator.make_logical_view(
+                kvcache.full_kv_pool
+            ),
+            swa_attn_allocator=self.swa_attn_allocator.make_logical_view(
+                kvcache.swa_kv_pool
+            ),
+            shared_mapping=self.full_to_swa_index_mapping,
+            logical_state=self._logical_state,
+            replica_group=self._replica_group,
+        )

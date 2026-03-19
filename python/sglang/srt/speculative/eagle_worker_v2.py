@@ -1038,9 +1038,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accepted_out_cache_loc,
             next_power_of_2(size),
         )
-        self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-            tgt_cache_loc, accepted_out_cache_loc
-        )
+        (
+            self.draft_worker.draft_worker.token_to_kv_pool_allocator.get_kvcache()
+        ).move_kv_cache(tgt_cache_loc, accepted_out_cache_loc)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
