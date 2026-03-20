@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hi_draft import HiCacheDraftMixin
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HiRadixCache(RadixCache):
+class HiRadixCache(HiCacheDraftMixin, RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -70,6 +71,14 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+
+        # SWA pools wrap full-attention and sliding-window sub-pools.  HiCache
+        # only persists full-attention KV (the SWA layers rotate and are small),
+        # so unwrap here to get the underlying MHATokenToKVPool.
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        if isinstance(self.kv_cache, SWAKVPool):
+            self.kv_cache = self.kv_cache.full_kv_pool
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -184,6 +193,7 @@ class HiRadixCache(RadixCache):
         )
 
         super().__init__(params=params)
+        self._init_draft_state()
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -596,6 +606,7 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        self._reset_draft_state()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
@@ -652,6 +663,9 @@ class HiRadixCache(RadixCache):
         else:
             return 0
 
+        # Also backup companion (draft) KV at the same device indices.
+        self._draft_write_backup(node)
+
         return len(host_indices)
 
     def write_backup_storage(self, node: TreeNode):
@@ -666,6 +680,7 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        self._draft_write_backup_storage(node)
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -690,10 +705,12 @@ class HiRadixCache(RadixCache):
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            self._draft_poll()
             return
 
         # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
         if len(self.ongoing_write_through) == 0:
+            self._draft_poll()
             return
 
         finish_count = 0
@@ -721,6 +738,8 @@ class HiRadixCache(RadixCache):
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
+        self._draft_poll()
+
     def loading_check(self):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
@@ -735,6 +754,8 @@ class HiRadixCache(RadixCache):
 
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
+
+        self._draft_poll()
 
     def evictable_size(self):
         return self.evictable_size_
@@ -987,6 +1008,8 @@ class HiRadixCache(RadixCache):
             # emit BlockRemoved so the router removes this block from its index.
             self._record_remove_event(x)
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            # Also free companion (draft) host backing for this node.
+            self._draft_evict_host(x)
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -1051,8 +1074,13 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)].clone()
-            offset += len(node.host_value)
+            node_len = len(node.host_value)
+            node.value = device_indices[offset : offset + node_len].clone()
+            # Also queue companion (draft) KV restore to the same new device_indices,
+            # ensuring draft reads correct prefix KV after the shared page table is
+            # rewritten to these indices.
+            self._draft_load_at(node, device_indices[offset : offset + node_len])
+            offset += node_len
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
@@ -1092,7 +1120,10 @@ class HiRadixCache(RadixCache):
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        return self.cache_controller.start_loading()
+        consumer_idx = self.cache_controller.start_loading()
+        # Also start companion (draft) KV loads, which were queued in load_back().
+        self._draft_start_loading()
+        return consumer_idx
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
@@ -1227,6 +1258,13 @@ class HiRadixCache(RadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+        )
+
+        self._draft_prefetch_after_insert(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])

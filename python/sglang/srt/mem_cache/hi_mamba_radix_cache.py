@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hi_draft import HiCacheDraftMixin
 from sglang.srt.mem_cache.mamba_radix_cache import (
     MambaRadixCache,
     TreeNode,
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class HiMambaRadixCache(MambaRadixCache):
+class HiMambaRadixCache(HiCacheDraftMixin, MambaRadixCache):
     """Hierarchical cache for hybrid Mamba models.
 
     Only the Full (attention) KV cache is backed up to L2 (host) / L3 (storage).
@@ -150,11 +151,13 @@ class HiMambaRadixCache(MambaRadixCache):
         atexit.register(self.shutdown)
 
         super().__init__(params=params)
+        self._init_draft_state()
 
     def reset(self) -> None:
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.full_kv_pool_host.clear()
+        self._reset_draft_state()
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
@@ -184,6 +187,9 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.inc_lock_ref(node)
         else:
             return 0
+
+        # Also backup draft KV at the same device indices.
+        self._draft_write_backup(node)
 
         return len(host_indices)
 
@@ -233,6 +239,8 @@ class HiMambaRadixCache(MambaRadixCache):
         for n in nodes_to_load:
             n_len = len(n.host_value)
             n.value = full_device_indices[offset : offset + n_len].clone()
+            # Also queue draft KV restore to the same new device indices.
+            self._draft_load_at(n, full_device_indices[offset : offset + n_len])
             offset += n_len
 
             self.full_lru_list.insert_mru(n)
@@ -297,9 +305,11 @@ class HiMambaRadixCache(MambaRadixCache):
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            self._draft_poll()
             return
 
         if len(self.ongoing_write_through) == 0:
+            self._draft_poll()
             return
 
         finish_count = 0
@@ -327,6 +337,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
+        self._draft_poll()
+
     def loading_check(self):
         finish_count = 0
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
@@ -340,8 +352,12 @@ class HiMambaRadixCache(MambaRadixCache):
 
         del self.cache_controller.ack_load_queue[:finish_count]
 
+        self._draft_poll()
+
     def ready_to_load_host_cache(self) -> int:
-        return self.cache_controller.start_loading()
+        consumer_idx = self.cache_controller.start_loading()
+        self._draft_start_loading()
+        return consumer_idx
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
@@ -431,6 +447,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if node.backuped and node.host_ref_counter == 0:
             self.cache_controller.evict_host(node.host_value)
+            self._draft_evict_host(node)
             node.host_value = None
 
         self._update_leaf_status(parent)
@@ -513,6 +530,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     continue
 
                 num_evicted += self.cache_controller.evict_host(x.host_value)
+                self._draft_evict_host(x)
                 x.host_value = None
 
                 self.evictable_full_host_leaves.discard(x)
@@ -532,6 +550,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            self._draft_evict_host(x)
             x.host_value = None
 
             if x.mamba_value is not None:
@@ -1507,6 +1526,7 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         self.ongoing_backup[operation_id] = node
         self._protect_host_node(node)
+        self._draft_write_backup_storage(node)
 
     def prefetch_from_storage(
         self,
@@ -1585,6 +1605,13 @@ class HiMambaRadixCache(MambaRadixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+        )
+
+        self._draft_prefetch_after_insert(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
