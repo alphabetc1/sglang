@@ -860,13 +860,13 @@ class HiRadixCache(RadixCache):
         return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if node == self.root_node or not node.backuped or node.lock_ref > 0:
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
             return
 
         for child in node.children.values():
-            if child.evicted:
+            if child.backuped:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
@@ -972,8 +972,8 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
-            # only evict the host value of evicted nodes
-            if not x.evicted:
+            # Host pressure can reclaim both host-only nodes and clean L1+L2 duplicates.
+            if not x.backuped:
                 continue
 
             # Expire stale pins before checking host_ref_counter
@@ -984,19 +984,28 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
 
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit BlockRemoved so the router removes this block from its index.
-            self._record_remove_event(x)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            was_evicted = x.evicted
+            if was_evicted:
+                # Block deleted entirely (GPU already evicted, now CPU freed) --
+                # emit BlockRemoved so the router removes this block from its index.
+                self._record_remove_event(x)
 
-            key = self.get_child_key_fn(x.key)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
+            num_evicted += self.cache_controller.evict_host(x.host_value)
+            x.host_value = None
+
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
+
+            if was_evicted:
+                key = self.get_child_key_fn(x.key)
+                v = x.parent.children.pop(key, None)
+                assert v == x, f"parent does not have child key, {key}"
+            else:
+                self._update_host_leaf_status(x)
+
             self._update_host_leaf_status(x.parent)
 
-            if len(x.parent.children) == 0 and x.parent.evicted:
+            if x.parent in self.evictable_host_leaves:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
