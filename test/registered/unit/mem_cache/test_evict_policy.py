@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
+    BackupAwareStrategy,
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
@@ -24,6 +25,9 @@ def _make_node(**kwargs):
     node.hit_count = kwargs.get("hit_count", 0)
     node.creation_time = kwargs.get("creation_time", 0.0)
     node.priority = kwargs.get("priority", 0)
+    node.host_value = kwargs.get("host_value", None)
+    # backuped property: True when host_value is not None
+    type(node).backuped = property(lambda self: self.host_value is not None)
     return node
 
 
@@ -179,6 +183,138 @@ class TestSLRUStrategy(unittest.TestCase):
     def test_default_threshold_is_2(self):
         default = SLRUStrategy()
         self.assertEqual(default.protected_threshold, 2)
+
+
+class TestBackupAwareStrategy(unittest.TestCase):
+    """Tests for BackupAwareStrategy decorator."""
+
+    def test_backuped_node_has_lower_priority_lru(self):
+        """Backed-up nodes should be evicted before non-backed-up (lower priority value)."""
+        strategy = BackupAwareStrategy(LRUStrategy())
+        backuped = _make_node(last_access_time=10.0, host_value="some_indices")
+        not_backuped = _make_node(last_access_time=1.0)
+        # Even though not_backuped has older access time (normally evicted first),
+        # backuped node should have lower priority (evicted first from GPU).
+        self.assertLess(
+            strategy.get_priority(backuped), strategy.get_priority(not_backuped)
+        )
+
+    def test_same_backup_status_preserves_inner_order(self):
+        """Within the same backup tier, inner strategy ordering is preserved."""
+        strategy = BackupAwareStrategy(LRUStrategy())
+        old_backuped = _make_node(last_access_time=1.0, host_value="idx")
+        new_backuped = _make_node(last_access_time=10.0, host_value="idx")
+        self.assertLess(
+            strategy.get_priority(old_backuped),
+            strategy.get_priority(new_backuped),
+        )
+
+    def test_wraps_tuple_returning_strategy(self):
+        """Works correctly with strategies that return tuples (e.g., LFU, SLRU)."""
+        strategy = BackupAwareStrategy(LFUStrategy())
+        backuped = _make_node(hit_count=100, last_access_time=10.0, host_value="idx")
+        not_backuped = _make_node(hit_count=0, last_access_time=1.0)
+        # Backed-up hot node should still be evicted before cold non-backed-up node
+        self.assertLess(
+            strategy.get_priority(backuped), strategy.get_priority(not_backuped)
+        )
+
+    def test_wraps_float_returning_strategy(self):
+        """Priority tuple is (backup_tier, float) for float-returning strategies."""
+        strategy = BackupAwareStrategy(LRUStrategy())
+        node = _make_node(last_access_time=5.0, host_value="idx")
+        self.assertEqual(strategy.get_priority(node), (0, 5.0))
+
+        node_no_backup = _make_node(last_access_time=5.0)
+        self.assertEqual(strategy.get_priority(node_no_backup), (1, 5.0))
+
+    def test_wraps_slru_strategy(self):
+        """Priority tuple is (backup_tier, segment, time) for SLRU."""
+        strategy = BackupAwareStrategy(SLRUStrategy(protected_threshold=2))
+        node = _make_node(hit_count=3, last_access_time=5.0, host_value="idx")
+        self.assertEqual(strategy.get_priority(node), (0, 1, 5.0))
+
+    def test_full_ordering_mixed_nodes(self):
+        """Integration: sort mixed backed-up and non-backed-up nodes."""
+        strategy = BackupAwareStrategy(LRUStrategy())
+        nodes = [
+            _make_node(last_access_time=1.0),  # not backuped, old
+            _make_node(last_access_time=10.0, host_value="idx"),  # backuped, new
+            _make_node(last_access_time=5.0, host_value="idx"),  # backuped, old
+            _make_node(last_access_time=3.0),  # not backuped, newer
+        ]
+        eviction_order = sorted(nodes, key=strategy.get_priority)
+        expected_priorities = [
+            (0, 5.0),  # backuped, old  -> evict first
+            (0, 10.0),  # backuped, new
+            (1, 1.0),  # not backuped, old
+            (1, 3.0),  # not backuped, new -> evict last
+        ]
+        actual = [strategy.get_priority(n) for n in eviction_order]
+        self.assertEqual(actual, expected_priorities)
+
+
+class TestBackupAwareHeapSimulation(unittest.TestCase):
+    """Simulate the heapq-based eviction loop to verify backed-up nodes are popped first."""
+
+    def test_heapq_pops_backuped_before_non_backuped(self):
+        """Reproduce the exact heap pattern used in HiRadixCache.evict()."""
+        import heapq
+
+        strategy = BackupAwareStrategy(LRUStrategy())
+        # Mix of backed-up and non-backed-up nodes with various access times
+        nodes = [
+            _make_node(last_access_time=1.0),  # cold, not backuped
+            _make_node(last_access_time=8.0, host_value="idx"),  # warm, backuped
+            _make_node(last_access_time=3.0, host_value="idx"),  # cold, backuped
+            _make_node(last_access_time=6.0),  # warm, not backuped
+            _make_node(last_access_time=10.0, host_value="idx"),  # hot, backuped
+        ]
+        # Build heap exactly as evict() does
+        heap = [(strategy.get_priority(n), n) for n in nodes]
+        heapq.heapify(heap)
+
+        popped = []
+        while heap:
+            _pri, node = heapq.heappop(heap)
+            popped.append(node)
+
+        # First 3 popped must all be backed-up (tier 0), in LRU order
+        for node in popped[:3]:
+            self.assertTrue(node.backuped, "Expected backed-up node in first tier")
+        self.assertEqual([n.last_access_time for n in popped[:3]], [3.0, 8.0, 10.0])
+        # Last 2 must be non-backed-up (tier 1), in LRU order
+        for node in popped[3:]:
+            self.assertFalse(
+                node.backuped, "Expected non-backed-up node in second tier"
+            )
+        self.assertEqual([n.last_access_time for n in popped[3:]], [1.0, 6.0])
+
+    def test_himamba_heap_key_pops_backuped_first(self):
+        """Reproduce the exact heap pattern used in HiMambaRadixCache.evict()."""
+        import heapq
+
+        nodes = [
+            _make_node(last_access_time=2.0),  # not backuped
+            _make_node(last_access_time=9.0, host_value="idx"),  # backuped
+            _make_node(last_access_time=4.0, host_value="idx"),  # backuped
+            _make_node(last_access_time=7.0),  # not backuped
+        ]
+        # Build heap exactly as HiMambaRadixCache.evict() does (inline key)
+        heap = [((0 if n.backuped else 1, n.last_access_time), n) for n in nodes]
+        heapq.heapify(heap)
+
+        popped = []
+        while heap:
+            _pri, node = heapq.heappop(heap)
+            popped.append(node)
+
+        # Backed-up nodes first
+        self.assertTrue(popped[0].backuped)
+        self.assertTrue(popped[1].backuped)
+        self.assertFalse(popped[2].backuped)
+        self.assertFalse(popped[3].backuped)
+        self.assertEqual([n.last_access_time for n in popped], [4.0, 9.0, 2.0, 7.0])
 
 
 class TestEvictionOrdering(unittest.TestCase):

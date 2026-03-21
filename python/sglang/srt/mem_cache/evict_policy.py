@@ -63,3 +63,26 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+class BackupAwareStrategy(EvictionStrategy):
+    """Decorator that makes any strategy prefer evicting backed-up nodes first.
+
+    Backed-up nodes (host_value != None) can be evicted from GPU at near-zero
+    cost (just free device memory; data remains on host for load_back). Non-backed-up
+    nodes either require a blocking GPU->Host transfer (write_back) or lose data
+    permanently (write_through). Prepending a backup tier to the priority ensures
+    backed-up nodes are evicted before non-backed-up ones, with the inner strategy
+    as tiebreaker within each tier.
+    """
+
+    def __init__(self, inner: EvictionStrategy):
+        self.inner = inner
+
+    def get_priority(self, node: "TreeNode") -> Tuple:
+        inner_priority = self.inner.get_priority(node)
+        # Tier 0 = backed-up (evict first), Tier 1 = not backed-up (evict later)
+        backup_tier = 0 if node.backuped else 1
+        if isinstance(inner_priority, tuple):
+            return (backup_tier,) + inner_priority
+        return (backup_tier, inner_priority)

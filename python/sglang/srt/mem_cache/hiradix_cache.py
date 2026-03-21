@@ -179,6 +179,13 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
+        # Wrap the eviction strategy to prefer evicting backed-up nodes first.
+        # Backed-up nodes can be evicted from GPU at near-zero cost (data safe
+        # on host), avoiding blocking sync (write_back) or data loss (write_through).
+        from sglang.srt.mem_cache.evict_policy import BackupAwareStrategy
+
+        self.eviction_strategy = BackupAwareStrategy(self.eviction_strategy)
+
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
 
@@ -943,6 +950,8 @@ class HiRadixCache(RadixCache):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
+        if self.metrics_collector is not None:
+            self.metrics_collector.increment_eviction_backuped_tokens(num_evicted)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -951,6 +960,8 @@ class HiRadixCache(RadixCache):
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
+        if self.metrics_collector is not None:
+            self.metrics_collector.increment_eviction_regular_tokens(num_evicted)
         return num_evicted
 
     def evict_host(self, num_tokens: int):

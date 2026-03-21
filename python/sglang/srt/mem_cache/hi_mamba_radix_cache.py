@@ -478,7 +478,11 @@ class HiMambaRadixCache(MambaRadixCache):
 
         if full_num_tokens > 0:
             leaves = list(self.evictable_full_device_leaves)
-            eviction_heap = [(n.last_access_time, n) for n in leaves]
+            # Prefer evicting backed-up nodes first (tier 0): they can be freed
+            # from GPU at near-zero cost since data is safe on host.
+            eviction_heap = [
+                ((0 if n.backuped else 1, n.last_access_time), n) for n in leaves
+            ]
             heapq.heapify(eviction_heap)
 
             while full_num_evicted < full_num_tokens and eviction_heap:
@@ -491,7 +495,13 @@ class HiMambaRadixCache(MambaRadixCache):
 
                 parent = x.parent
                 if parent in self.evictable_full_device_leaves:
-                    heapq.heappush(eviction_heap, (parent.last_access_time, parent))
+                    heapq.heappush(
+                        eviction_heap,
+                        (
+                            (0 if parent.backuped else 1, parent.last_access_time),
+                            parent,
+                        ),
+                    )
 
         if params.mamba_num > 0:
             mamba_num_evicted = self.evict_mamba(params.mamba_num)
