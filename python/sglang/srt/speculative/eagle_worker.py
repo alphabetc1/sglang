@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -30,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -41,6 +42,10 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
+)
+from sglang.srt.speculative.eagle_runtime_state import (
+    AdaptiveRuntimeStateManager,
+    EAGLERuntimeState,
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -102,6 +107,21 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Adaptive speculative parameters (topk=1 only)
+        if server_args.speculative_adaptive and self.topk == 1:
+            self.adaptive_params = AdaptiveSpeculativeParams.create_for_eagle_topk1(
+                initial_steps=self.speculative_num_steps,
+            )
+        else:
+            self.adaptive_params = None
+            if server_args.speculative_adaptive and self.topk != 1:
+                logger.warning(
+                    "speculative_adaptive is only supported with topk=1. "
+                    f"Current topk={self.topk}. Falling back to static params."
+                )
+        self.runtime_states: Dict[int, EAGLERuntimeState] = {}
+        self._get_runtime_state_manager()
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -204,6 +224,20 @@ class EAGLEWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
+            self._register_runtime_state(
+                EAGLERuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self.draft_attn_backend,
+                    draft_extend_attn_backend=self.draft_extend_attn_backend,
+                    cuda_graph_runner=self.cuda_graph_runner,
+                    cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
+                    target_attn_backend=self.target_worker.model_runner.attn_backend,
+                    target_graph_runner=self.target_worker.model_runner.graph_runner,
+                )
+            )
+            self._init_adaptive_runtime_states()
+            self._activate_runtime_state(self.speculative_num_steps)
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -272,6 +306,67 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+    def _register_runtime_state(self, state: EAGLERuntimeState):
+        self._get_runtime_state_manager().register(state)
+
+    def _get_runtime_state_manager(self) -> AdaptiveRuntimeStateManager:
+        manager = getattr(self, "runtime_state_manager", None)
+        if manager is None:
+            manager = AdaptiveRuntimeStateManager(self)
+            manager.runtime_states = getattr(self, "runtime_states", {})
+            self.runtime_state_manager = manager
+            self.runtime_states = manager.runtime_states
+        return manager
+
+    def _build_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> EAGLERuntimeState:
+        return self._get_runtime_state_manager().build_runtime_state(
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            draft_backend_factory_cls=DraftBackendFactory,
+            capture_draft_cuda_graphs_fn=self._capture_draft_cuda_graphs_for_state,
+        )
+
+    def _capture_draft_cuda_graphs_for_state(
+        self,
+        draft_attn_backend,
+        draft_extend_attn_backend,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+    ):
+        return self._get_runtime_state_manager()._capture_draft_cuda_graphs_for_state(
+            draft_attn_backend,
+            draft_extend_attn_backend,
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+        )
+
+    def _init_adaptive_runtime_states(self):
+        if self.adaptive_params is None:
+            return
+
+        candidate_steps = self.adaptive_params.candidate_steps
+        step_values = (
+            candidate_steps
+            if candidate_steps is not None
+            else range(
+                self.adaptive_params.min_steps, self.adaptive_params.max_steps + 1
+            )
+        )
+
+        for speculative_num_steps in step_values:
+            if speculative_num_steps in self.runtime_states:
+                continue
+            runtime_state = self._build_runtime_state(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_steps + 1,
+            )
+            self._register_runtime_state(runtime_state)
+
+    def _activate_runtime_state(self, speculative_num_steps: int):
+        self._get_runtime_state_manager().activate_runtime_state(speculative_num_steps)
+
     @property
     def draft_model_runner(self):
         return self.model_runner
@@ -288,6 +383,9 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        if self.adaptive_params is not None:
+            self._activate_runtime_state(self.adaptive_params.current_steps)
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             (
                 logits_output,
@@ -320,6 +418,11 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
+            next_adaptive_steps = None
+            if self.adaptive_params is not None:
+                if self.adaptive_params.update(verify_output.accept_length_per_req_cpu):
+                    next_adaptive_steps = self.adaptive_params.current_steps
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -331,6 +434,9 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if next_adaptive_steps is not None:
+                self._activate_runtime_state(next_adaptive_steps)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -613,7 +719,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
@@ -923,7 +1029,11 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
+        accept_length_backup = (
+            batch.spec_info.accept_length.clone()
+            if batch.spec_info.accept_length is not None
+            else None
+        )
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -985,9 +1095,12 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
-                self.draft_model_runner.attn_backend.init_forward_metadata(
-                    forward_batch
+                attn_backend = (
+                    self.draft_extend_attn_backend
+                    or self.draft_model_runner.attn_backend
                 )
+                attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.attn_backend = attn_backend
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
