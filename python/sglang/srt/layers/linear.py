@@ -1067,12 +1067,33 @@ class QKVParallelLinear(ColumnParallelLinear):
         shard_offset = self._get_shard_offset_mapping(loaded_shard_id)
         shard_size = self._get_shard_size_mapping(loaded_shard_id)
 
+        loaded_start = None
+
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (shard_offset + block_n - 1) // block_n
             shard_size = (shard_size + block_n - 1) // block_n
+
+            # Non-aligned head_size: scale blocks may cross head
+            # boundaries, so check actual scale_dim to decide.
+            if not self.use_presharded_weights and self.head_size % block_n != 0:
+                replica_id = (
+                    self.tp_rank
+                    if loaded_shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                per_replica_rows = self._get_shard_size_mapping(loaded_shard_id)
+                total_shards = (
+                    self.total_num_heads
+                    if loaded_shard_id == "q"
+                    else self.total_num_kv_heads
+                )
+
+                scale_dim = loaded_weight.shape[param.output_dim]
+                if scale_dim < total_shards * shard_size:
+                    loaded_start = (replica_id * per_replica_rows) // block_n
 
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
@@ -1082,6 +1103,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             tp_rank=self.tp_rank,
             use_presharded_weights=self.use_presharded_weights,
+            loaded_start=loaded_start,
         )
 
     def weight_loader(

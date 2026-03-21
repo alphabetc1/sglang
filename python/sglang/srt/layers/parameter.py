@@ -230,6 +230,8 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         shard_size = kwargs.get("shard_size")
         shard_id = kwargs.get("shard_id")
         num_heads = kwargs.get("num_heads")
+        # Optional override for the start index when narrowing loaded_weight.
+        loaded_start = kwargs.get("loaded_start")
 
         if (
             isinstance(self, (PackedColumnParameter, PackedvLLMParameter))
@@ -243,6 +245,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
+        if loaded_start is None:
+            loaded_start = shard_id * shard_size
+
         if _is_cpu:
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
@@ -252,7 +257,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_id * shard_size,
+                loaded_start,
                 self.output_dim,
                 shard_size,
                 not use_presharded_weights,
@@ -260,7 +265,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         else:
             if not use_presharded_weights:
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, shard_id * shard_size, shard_size
+                    self.output_dim, loaded_start, shard_size
                 )
 
         assert (
