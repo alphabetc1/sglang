@@ -502,7 +502,14 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+        speculative_num_draft_tokens: Optional[int] = None,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -541,6 +548,17 @@ class CudaGraphRunner:
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.attn_backend = attn_backend or model_runner.attn_backend
+        self.speculative_num_steps = (
+            model_runner.server_args.speculative_num_steps
+            if speculative_num_steps is None
+            else speculative_num_steps
+        )
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+            if speculative_num_draft_tokens is None
+            else speculative_num_draft_tokens
+        )
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -554,9 +572,7 @@ class CudaGraphRunner:
                 raise RuntimeError("This should not happen")
             else:
                 self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
+                self.num_tokens_per_bs = self.speculative_num_draft_tokens
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -576,14 +592,12 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
+        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
         self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.attn_backend.get_cuda_graph_seq_len_fill_value()
             if self.dllm_config is None
             else self.dllm_config.block_size
         )
@@ -713,6 +727,9 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
+        is_num_tokens_supported = (
+            forward_batch.input_ids.numel() == cuda_graph_bs * self.num_tokens_per_bs
+        )
 
         return (
             is_bs_supported
@@ -720,6 +737,7 @@ class CudaGraphRunner:
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_num_tokens_supported
         )
 
     def _init_profile_context_and_memory_record(self):
@@ -916,7 +934,7 @@ class CudaGraphRunner:
         )
 
         if stream_idx is None:
-            attn_backend = self.model_runner.attn_backend
+            attn_backend = self.attn_backend
         else:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
@@ -1102,7 +1120,7 @@ class CudaGraphRunner:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
-            attn_backend = self.model_runner.attn_backend
+            attn_backend = self.attn_backend
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1183,9 +1201,9 @@ class CudaGraphRunner:
                     retrive_next_token=None,
                     retrive_next_sibling=None,
                     retrive_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    spec_steps=self.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    draft_token_num=self.speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
