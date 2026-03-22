@@ -150,8 +150,8 @@ class HiMambaRadixCache(HiCacheDraftMixin, MambaRadixCache):
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
-        super().__init__(params=params)
         self._init_draft_state()
+        super().__init__(params=params)
 
     def reset(self) -> None:
         TreeNode.counter = 0
@@ -356,7 +356,9 @@ class HiMambaRadixCache(HiCacheDraftMixin, MambaRadixCache):
 
     def ready_to_load_host_cache(self) -> int:
         consumer_idx = self.cache_controller.start_loading()
+        # TODO: layer-wise consumer handshake for draft KV
         self._draft_start_loading()
+        self._draft_wait_loading()
         return consumer_idx
 
     def flush_write_through_acks(self) -> None:

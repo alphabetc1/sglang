@@ -192,8 +192,8 @@ class HiRadixCache(HiCacheDraftMixin, RadixCache):
             "Pin budget: %d tokens (ratio=%.3f)", self._max_pinned_tokens, pin_ratio
         )
 
-        super().__init__(params=params)
         self._init_draft_state()
+        super().__init__(params=params)
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -1121,8 +1121,9 @@ class HiRadixCache(HiCacheDraftMixin, RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         consumer_idx = self.cache_controller.start_loading()
-        # Also start companion (draft) KV loads, which were queued in load_back().
+        # TODO: layer-wise consumer handshake for draft KV
         self._draft_start_loading()
+        self._draft_wait_loading()
         return consumer_idx
 
     def flush_write_through_acks(self) -> None:

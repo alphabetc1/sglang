@@ -41,9 +41,10 @@ class HiCacheDraftMixin:
     """
 
     def _init_draft_state(self) -> None:
-        self._draft_pool = None  # device pool
-        self._draft_host = None  # host pool
-        self._draft_io = None  # io backend str
+        self._has_draft = False
+        self._draft_pool = None
+        self._draft_host = None
+        self._draft_io = None
         self._draft_write_stream = None
         self._draft_load_stream = None
         self._draft_load_queue: list[CacheOperation] = []
@@ -52,7 +53,7 @@ class HiCacheDraftMixin:
         self._draft_host_map: Dict[int, torch.Tensor] = {}
 
     def _reset_draft_state(self) -> None:
-        if self._draft_host is None:
+        if not self._has_draft:
             return
         self._draft_host_map.clear()
         self._draft_host.clear()
@@ -91,16 +92,19 @@ class HiCacheDraftMixin:
         else:
             raise ValueError(f"Unsupported draft pool type: {type(pool).__name__}")
 
-        self._draft_pool = draft_device_pool
+        self._draft_pool = pool
         self._draft_host = host_pool
         self._draft_io = server_args.hicache_io_backend
         self._draft_write_stream = device_module.Stream()
         self._draft_load_stream = device_module.Stream()
+        self._has_draft = True
         logger.info(
             "HiCache draft KV registered: %s (%d host slots)",
             type(draft_device_pool).__name__,
             host_pool.size,
         )
+
+    # --- L2 (host) hooks ---
 
     def _draft_move_indices(self, host_indices, device_indices):
         """Move transfer indices to the backend-specific execution device."""
@@ -123,10 +127,10 @@ class HiCacheDraftMixin:
 
     def _draft_submit(self, stream, host_indices, device_indices, backup=True):
         """Submit an async device<->host transfer on *stream*, return finish event."""
+        h, d = self._draft_move_indices(host_indices, device_indices)
         start = device_module.Event()
         finish = device_module.Event()
         start.record()
-        h, d = self._draft_move_indices(host_indices, device_indices)
         with device_module.stream(stream):
             start.wait(stream)
             if backup:
@@ -144,10 +148,8 @@ class HiCacheDraftMixin:
                     t.record_stream(stream)
         return finish
 
-    # --- hooks called from HiRadixCache / HiMambaRadixCache ---
-
     def _draft_write_backup(self, node: "TreeNode") -> None:
-        if self._draft_host is None:
+        if not self._has_draft:
             return
         host_indices = self._draft_host.alloc(len(node.value))
         if host_indices is None:
@@ -159,14 +161,16 @@ class HiCacheDraftMixin:
         self._draft_host_map[node.id] = host_indices
 
     def _draft_load_at(self, node: "TreeNode", device_indices: torch.Tensor) -> None:
+        if not self._has_draft:
+            return
         host_indices = self._draft_host_map.get(node.id)
-        if self._draft_host is not None and host_indices is not None:
+        if host_indices is not None:
             self._draft_load_queue.append(
                 CacheOperation(host_indices, device_indices, node.id)
             )
 
     def _draft_start_loading(self) -> None:
-        if not self._draft_load_queue:
+        if not self._has_draft or not self._draft_load_queue:
             return
         op = CacheOperation.merge_ops(self._draft_load_queue)
         self._draft_load_queue.clear()
@@ -175,7 +179,15 @@ class HiCacheDraftMixin:
         )
         self._draft_ack_load.append(ev)
 
+    def _draft_wait_loading(self) -> None:
+        if not self._has_draft:
+            return
+        while self._draft_ack_load:
+            self._draft_ack_load.pop(0).synchronize()
+
     def _draft_poll(self) -> None:
+        if not self._has_draft:
+            return
         for q in (self._draft_ack_write, self._draft_ack_load):
             if not q:
                 continue
@@ -183,14 +195,16 @@ class HiCacheDraftMixin:
             del q[:n]
 
     def _draft_evict_host(self, node: "TreeNode") -> None:
+        if not self._has_draft:
+            return
         host_indices = self._draft_host_map.pop(node.id, None)
-        if self._draft_host is not None and host_indices is not None:
+        if host_indices is not None:
             self._draft_host.free(host_indices)
 
     # --- L3 (storage) hooks ---
 
     def _draft_write_backup_storage(self, node: "TreeNode") -> None:
-        if self._draft_host is None or not getattr(self, "enable_storage", False):
+        if not self._has_draft or not getattr(self, "enable_storage", False):
             return
         host_indices = self._draft_host_map.get(node.id)
         if host_indices is None or not node.hash_value:
@@ -205,7 +219,7 @@ class HiCacheDraftMixin:
     def _draft_prefetch_after_insert(
         self, last_host_node: "TreeNode", fetched_token_ids
     ) -> None:
-        if self._draft_host is None or not getattr(self, "enable_storage", False):
+        if not self._has_draft or not getattr(self, "enable_storage", False):
             return
         backend = self.cache_controller.storage_backend
         node, key = last_host_node, fetched_token_ids
