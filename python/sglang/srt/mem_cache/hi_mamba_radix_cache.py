@@ -341,8 +341,7 @@ class HiMambaRadixCache(MambaRadixCache):
         del self.cache_controller.ack_load_queue[:finish_count]
 
     def ready_to_load_host_cache(self) -> int:
-        consumer_idx = self.cache_controller.start_loading()
-        return consumer_idx
+        return self.cache_controller.start_loading()
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()

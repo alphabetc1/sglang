@@ -1051,9 +1051,8 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node_len = len(node.host_value)
-            node.value = device_indices[offset : offset + node_len].clone()
-            offset += node_len
+            node.value = device_indices[offset : offset + len(node.host_value)].clone()
+            offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
@@ -1093,8 +1092,7 @@ class HiRadixCache(RadixCache):
         Notify the cache controller to start the KV cache loading.
         Return the consumer index for the schedule batch manager to track.
         """
-        consumer_idx = self.cache_controller.start_loading()
-        return consumer_idx
+        return self.cache_controller.start_loading()
 
     def flush_write_through_acks(self) -> None:
         self.writing_check()
