@@ -805,19 +805,52 @@ class Scheduler(
         )
 
     def _maybe_register_hicache_draft(self) -> None:
-        """
-        Register the draft model's KV pool with HiRadixCache.
-        """
+        """Register draft KV pool with HiCacheController for piggyback L2/L3 ops."""
         if not self.enable_hierarchical_cache:
-            return
-        if not hasattr(self.tree_cache, "register_draft_kv_pool"):
             return
 
         draft_kv_pool, _ = self._get_draft_kv_pool()
         if draft_kv_pool is None:
             return
 
-        self.tree_cache.register_draft_kv_pool(draft_kv_pool, self.server_args)
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+            NSATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+            NSATokenToKVPoolHost,
+        )
+
+        pool = draft_kv_pool
+        if isinstance(pool, HybridLinearKVPool):
+            pool = pool.full_kv_pool
+
+        # Create host pool for draft with same ratio as target.
+        primary = self.tree_cache.cache_controller.mem_pool_host
+        kw = dict(
+            host_to_device_ratio=primary.size / pool.size,
+            host_size=0,
+            page_size=self.page_size,
+            layout=self.server_args.hicache_mem_layout,
+        )
+        if isinstance(pool, MHATokenToKVPool):
+            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        elif isinstance(pool, NSATokenToKVPool):
+            draft_host_pool = NSATokenToKVPoolHost(pool, **kw)
+        elif isinstance(pool, MLATokenToKVPool):
+            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
+        else:
+            logger.warning(
+                "Draft pool type %s not supported for HiCache, skipping.",
+                type(pool).__name__,
+            )
+            return
+
+        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
