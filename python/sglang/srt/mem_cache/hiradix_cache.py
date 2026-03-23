@@ -598,11 +598,11 @@ class HiRadixCache(HiCacheDraftMixin, RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
-        self._reset_draft_state()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         self.pinned_size_ = 0
+        self._reset_draft_state()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -655,7 +655,7 @@ class HiRadixCache(HiCacheDraftMixin, RadixCache):
         else:
             return 0
 
-        # Also backup companion (draft) KV at the same device indices.
+        # Also backup draft KV at the same device indices.
         self._draft_write_backup(node)
 
         return len(host_indices)

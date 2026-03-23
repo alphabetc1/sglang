@@ -157,7 +157,6 @@ class HiMambaRadixCache(HiCacheDraftMixin, MambaRadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.full_kv_pool_host.clear()
-        self._reset_draft_state()
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
@@ -165,6 +164,7 @@ class HiMambaRadixCache(HiCacheDraftMixin, MambaRadixCache):
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
+        self._reset_draft_state()
         super().reset()
 
     def write_backup(self, node: TreeNode, write_back=False):

@@ -786,7 +786,7 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _resolve_draft_kv_pool(self):
+    def _get_draft_kv_pool(self):
         """Return (draft_token_to_kv_pool, draft_model_config) for the current
         draft worker, or (None, None) when no draft KV pool is available."""
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
@@ -813,7 +813,7 @@ class Scheduler(
         if not hasattr(self.tree_cache, "register_draft_kv_pool"):
             return
 
-        draft_kv_pool, _ = self._resolve_draft_kv_pool()
+        draft_kv_pool, _ = self._get_draft_kv_pool()
         if draft_kv_pool is None:
             return
 
@@ -947,7 +947,8 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        draft_token_to_kv_pool, model_config = self._resolve_draft_kv_pool()
+        # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
+        draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
