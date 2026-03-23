@@ -1047,7 +1047,10 @@ class HiCacheController:
         )
 
     def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 with 'd:' prefixed keys."""
+        """Best-effort write draft KV pages to L3 with 'd:' prefixed keys.
+
+        TODO: support batch_set_v1 (zero-copy) for high-performance backends.
+        """
         try:
             draft_keys = [f"d:{h}" for h in hash_values]
             draft_data = [
@@ -1061,19 +1064,24 @@ class HiCacheController:
             )
 
     def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 with 'd:' prefixed keys."""
+        """Best-effort read draft KV pages from L3 with 'd:' prefixed keys.
+
+        TODO: support batch_get_v1 (zero-copy) for high-performance backends.
+        """
         try:
             draft_keys = [f"d:{h}" for h in hash_values]
             draft_dummy = [
                 self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
             ]
             draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-            if draft_pages:
-                for i, p in enumerate(draft_pages):
-                    if p is not None:
-                        self.mem_pool_host_draft.set_from_flat_data_page(
-                            host_indices[i * self.page_size], p
-                        )
+            if draft_pages is None:
+                return
+
+            for i, p in enumerate(draft_pages):
+                if p is not None:
+                    self.mem_pool_host_draft.set_from_flat_data_page(
+                        host_indices[i * self.page_size], p
+                    )
         except Exception:
             logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
 
