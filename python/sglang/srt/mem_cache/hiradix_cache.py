@@ -72,14 +72,6 @@ class HiRadixCache(HiCacheDraftMixin, RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        # SWA pools wrap full-attention and sliding-window sub-pools.  HiCache
-        # only persists full-attention KV (the SWA layers rotate and are small),
-        # so unwrap here to get the underlying MHATokenToKVPool.
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
-        if isinstance(self.kv_cache, SWAKVPool):
-            self.kv_cache = self.kv_cache.full_kv_pool
-
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,

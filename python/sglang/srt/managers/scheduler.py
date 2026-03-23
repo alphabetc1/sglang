@@ -377,7 +377,7 @@ class Scheduler(
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
-        # Register draft KV pool as HiCache companion (spec + HiCache co-enabled).
+        # Register draft KV pool (when spec + HiCache co-enabled).
         self._maybe_register_hicache_draft()
 
         # Init running status
@@ -786,32 +786,36 @@ class Scheduler(
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
-    def _maybe_register_hicache_draft(self) -> None:
-        """
-        Register the draft model's KV pool with HiRadixCache.
-
-        This fixes the accept_len regression that occurs when HiCache load_back
-        remaps target KV to new device indices while the shared req_to_token_pool
-        is updated, but draft KV is not restored to those new indices.
-
-        Only runs when HiCache and EAGLE-style speculative decoding are both active.
-        """
-        if not self.enable_hierarchical_cache:
-            return
-        if not hasattr(self.tree_cache, "register_draft_kv_pool"):
-            return
+    def _resolve_draft_kv_pool(self):
+        """Return (draft_token_to_kv_pool, draft_model_config) for the current
+        draft worker, or (None, None) when no draft KV pool is available."""
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
-            return
+            return None, None
 
-        # Mirror the logic in init_disaggregation() to locate the draft KV pool.
         if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
-            draft_kv_pool = draft_runner.token_to_kv_pool
-        else:
-            draft_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+
+        return (
+            self.draft_worker.model_runner.token_to_kv_pool,
+            self.draft_worker.model_config,
+        )
+
+    def _maybe_register_hicache_draft(self) -> None:
+        """
+        Register the draft model's KV pool with HiRadixCache.
+        """
+        if not self.enable_hierarchical_cache:
+            return
+        if not hasattr(self.tree_cache, "register_draft_kv_pool"):
+            return
+
+        draft_kv_pool, _ = self._resolve_draft_kv_pool()
+        if draft_kv_pool is None:
+            return
 
         self.tree_cache.register_draft_kv_pool(draft_kv_pool, self.server_args)
 
@@ -943,19 +947,7 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
-            draft_token_to_kv_pool = None
-        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-            else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
-            draft_token_to_kv_pool = draft_runner.token_to_kv_pool
-            model_config = draft_runner.model_config
-        else:
-            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-            draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
-            model_config = self.draft_worker.model_config
+        draft_token_to_kv_pool, model_config = self._resolve_draft_kv_pool()
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE

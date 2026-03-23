@@ -66,12 +66,10 @@ class HiCacheDraftMixin:
         draft_device_pool,
         server_args: "ServerArgs",
     ) -> None:
+        # TODO: may support SWA
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         pool = draft_device_pool
-        if isinstance(pool, SWAKVPool):
-            pool = pool.full_kv_pool
         if isinstance(pool, HybridLinearKVPool):
             pool = pool.full_kv_pool
 
