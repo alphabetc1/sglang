@@ -317,9 +317,31 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
+        self.target_layer_num = self.device_pool.layer_num
+        self.layer_num = self.target_layer_num
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+
+    def register_draft_pool(self, draft_pool) -> None:
+        """Expand host buffer to include draft layers (called before any data)."""
+        d = draft_pool.layer_num
+        if d == 0:
+            return
+        self.layer_num = self.target_layer_num + d
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.kv_buffer = self.init_kv_buffer()
+        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
 
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2

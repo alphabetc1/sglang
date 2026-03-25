@@ -813,45 +813,13 @@ class Scheduler(
         if draft_kv_pool is None:
             return
 
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-            NSATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
-            NSATokenToKVPoolHost,
-        )
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         pool = draft_kv_pool
         if isinstance(pool, HybridLinearKVPool):
             pool = pool.full_kv_pool
 
-        # Create host pool for draft with the same slot count as the target host pool,
-        # so that host indices stay 1-to-1 between target and draft KV caches.
-        primary = self.tree_cache.cache_controller.mem_pool_host
-        kw = dict(
-            host_to_device_ratio=primary.size / pool.size,
-            host_size=0,
-            page_size=self.page_size,
-            layout=self.server_args.hicache_mem_layout,
-        )
-        if isinstance(pool, MHATokenToKVPool):
-            draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, NSATokenToKVPool):
-            draft_host_pool = NSATokenToKVPoolHost(pool, **kw)
-        elif isinstance(pool, MLATokenToKVPool):
-            draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
-        else:
-            logger.warning(
-                "Draft pool type %s not supported for HiCache, skipping.",
-                type(pool).__name__,
-            )
-            return
-
-        self.tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+        self.tree_cache.cache_controller.register_draft_pool(pool)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
