@@ -598,11 +598,31 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            max_new_tokens = min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+            # Cap by total headroom, reserving one page (mirrors _update_prefill_budget)
+            _rem_tokens = min(
+                self.rem_chunk_tokens,
+                max(int(self.rem_total_tokens) - self.page_size, 0),
+            )
+            _rem_tokens = _rem_tokens // self.page_size * self.page_size
+            _rem_tokens = min(_rem_tokens, input_tokens)
+
+            # Tail fits in one chunk but total budget insufficient → force truncation
+            if _rem_tokens >= input_tokens and (
+                input_tokens + max_new_tokens >= self.rem_total_tokens
+            ):
+                _rem_tokens = max(_rem_tokens - self.page_size, 0)
+
+            # No total-token headroom — keep parked and retry next round
             if _rem_tokens <= 0:
-                _rem_tokens = self.rem_chunk_tokens
+                return req
+
+            _rem_tokens = min(req.extend_input_len, _rem_tokens)
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
@@ -747,27 +767,29 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
+        max_new_tokens = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        total_tokens = req.extend_input_len + max_new_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+        # For host_hit requests total_tokens is inaccurate before load_back;
+        # for chunk-capable requests, the chunked path can handle over-budget.
+        if req.host_hit_length == 0 and total_tokens >= self.rem_total_tokens:
+            if self.rem_chunk_tokens is None:
+                return AddReqResult.NO_TOKEN
+            if has_chunked_req:
+                return AddReqResult.OTHER
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
-
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -781,6 +803,15 @@ class PrefillAdder:
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            # Recompute after load_back may have changed extend_input_len
+            total_tokens = input_tokens + max_new_tokens
+
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
+                if self.rem_chunk_tokens is None:
+                    return AddReqResult.NO_TOKEN
+                if has_chunked_req:
+                    return AddReqResult.OTHER
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
@@ -795,8 +826,11 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+            elif self.rem_chunk_tokens is None or (
+                input_tokens <= self.rem_chunk_tokens
+                and total_tokens < self.rem_total_tokens
+            ):
+                # Non-chunked prefill — only when input fits chunk AND total budget
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -809,8 +843,17 @@ class PrefillAdder:
                     ),
                 )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                # Chunked prefill — cap by both chunk budget and total headroom
+                trunc_len = min(
+                    self.rem_chunk_tokens,
+                    max(int(self.rem_total_tokens) - self.page_size, 0),
+                )
+                trunc_len = trunc_len // self.page_size * self.page_size
+                trunc_len = min(trunc_len, input_tokens)
+
+                # Tail fits in one chunk but total budget insufficient → force truncation
+                if trunc_len >= input_tokens and total_tokens >= self.rem_total_tokens:
+                    trunc_len = max(trunc_len - self.page_size, 0)
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
