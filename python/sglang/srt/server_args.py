@@ -490,6 +490,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -4671,6 +4672,14 @@ class ServerArgs:
             default=ServerArgs.speculative_adaptive,
         )
         parser.add_argument(
+            "--speculative-adaptive-config",
+            type=str,
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs "
+            "(ema_alpha, update_interval, warmup_batches, down_hysteresis, up_hysteresis, candidate_steps). "
+            "Implies --speculative-adaptive.",
+            default=ServerArgs.speculative_adaptive_config,
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -5956,6 +5965,10 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        # speculative_adaptive_config implies speculative_adaptive
+        if self.speculative_adaptive_config is not None:
+            self.speculative_adaptive = True
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

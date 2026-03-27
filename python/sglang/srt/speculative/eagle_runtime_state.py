@@ -2,7 +2,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterator, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Iterator, Optional, Tuple
 
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -77,7 +77,9 @@ class AdaptiveRuntimeStateManager:
                 )
             )
 
-            backup_init_new_workspace = worker.target_worker.model_runner.init_new_workspace
+            backup_init_new_workspace = (
+                worker.target_worker.model_runner.init_new_workspace
+            )
             try:
                 target_attn_backend = (
                     worker.target_worker.model_runner._get_attention_backend(
@@ -152,8 +154,12 @@ class AdaptiveRuntimeStateManager:
             runtime_state.speculative_num_draft_tokens,
         )
         worker.draft_model_runner.draft_attn_backend = runtime_state.draft_attn_backend
-        worker.target_worker.model_runner.attn_backend = runtime_state.target_attn_backend
-        worker.target_worker.model_runner.graph_runner = runtime_state.target_graph_runner
+        worker.target_worker.model_runner.attn_backend = (
+            runtime_state.target_attn_backend
+        )
+        worker.target_worker.model_runner.graph_runner = (
+            runtime_state.target_graph_runner
+        )
 
     def _capture_draft_cuda_graphs_for_state(
         self,

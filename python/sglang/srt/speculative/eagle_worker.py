@@ -30,7 +30,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative.adaptive_spec_params import (
+    AdaptiveSpeculativeParams,
+    load_adaptive_config,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -110,8 +113,10 @@ class EAGLEWorker(TpModelWorker):
 
         # Adaptive speculative parameters (topk=1 only)
         if server_args.speculative_adaptive and self.topk == 1:
-            self.adaptive_params = AdaptiveSpeculativeParams.create_for_eagle_topk1(
+            adaptive_cfg = load_adaptive_config(server_args.speculative_adaptive_config)
+            self.adaptive_params = AdaptiveSpeculativeParams.create(
                 initial_steps=self.speculative_num_steps,
+                config_overrides=adaptive_cfg,
             )
         else:
             self.adaptive_params = None
@@ -224,7 +229,7 @@ class EAGLEWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
-            self._register_runtime_state(
+            self._get_runtime_state_manager().register(
                 EAGLERuntimeState(
                     speculative_num_steps=self.speculative_num_steps,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
@@ -306,9 +311,6 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def _register_runtime_state(self, state: EAGLERuntimeState):
-        self._get_runtime_state_manager().register(state)
-
     def _get_runtime_state_manager(self) -> AdaptiveRuntimeStateManager:
         manager = getattr(self, "runtime_state_manager", None)
         if manager is None:
@@ -362,7 +364,7 @@ class EAGLEWorker(TpModelWorker):
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
             )
-            self._register_runtime_state(runtime_state)
+            self._get_runtime_state_manager().register(runtime_state)
 
     def _activate_runtime_state(self, speculative_num_steps: int):
         self._get_runtime_state_manager().activate_runtime_state(speculative_num_steps)
@@ -418,10 +420,10 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            next_adaptive_steps = None
-            if self.adaptive_params is not None:
-                if self.adaptive_params.update(verify_output.accept_length_per_req_cpu):
-                    next_adaptive_steps = self.adaptive_params.current_steps
+            should_switch = (
+                self.adaptive_params is not None
+                and self.adaptive_params.update(verify_output.accept_length_per_req_cpu)
+            )
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -435,8 +437,8 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
-            if next_adaptive_steps is not None:
-                self._activate_runtime_state(next_adaptive_steps)
+            if should_switch:
+                self._activate_runtime_state(self.adaptive_params.current_steps)
 
             return GenerationBatchResult(
                 logits_output=logits_output,

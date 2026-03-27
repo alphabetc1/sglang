@@ -1,16 +1,33 @@
 """Adaptive speculative decoding parameters.
 
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
-Currently only supports topk=1 mode.
 """
 
+import json
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-ADAPTIVE_CANDIDATE_STEPS = [1, 3, 7]
-"""Fixed three-tier candidate steps for adaptive mode: conservative / moderate / aggressive."""
+
+def load_adaptive_config(path: Optional[str]) -> Dict[str, Any]:
+    """Load adaptive speculative config from a JSON file.
+
+    The file may contain any subset of the following keys:
+        ema_alpha, update_interval, warmup_batches,
+        down_hysteresis, up_hysteresis, candidate_steps
+
+    Returns an empty dict when *path* is ``None``.
+    """
+    if path is None:
+        return {}
+    with open(path) as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(
+            f"speculative_adaptive_config must be a JSON object, got {type(cfg).__name__}"
+        )
+    return cfg
 
 
 class AdaptiveSpeculativeParams:
@@ -26,20 +43,23 @@ class AdaptiveSpeculativeParams:
     """
 
     @classmethod
-    def create_for_eagle_topk1(
+    def create(
         cls,
         initial_steps: int,
+        config_overrides: Optional[Dict[str, Any]] = None,
     ) -> "AdaptiveSpeculativeParams":
-        candidate_steps = ADAPTIVE_CANDIDATE_STEPS
+        default_candidate_steps = [1, 3, 7]
+        cfg = config_overrides or {}
+        candidate_steps = cfg.get("candidate_steps", default_candidate_steps)
         return cls(
             initial_steps=initial_steps,
             max_steps=candidate_steps[-1],
             min_steps=candidate_steps[0],
-            ema_alpha=1.0,
-            update_interval=1,
-            warmup_batches=1,
-            down_hysteresis=0.0,
-            up_hysteresis=-0.25,
+            ema_alpha=cfg.get("ema_alpha", 0.2),
+            update_interval=cfg.get("update_interval", 5),
+            warmup_batches=cfg.get("warmup_batches", 10),
+            down_hysteresis=cfg.get("down_hysteresis", 0.0),
+            up_hysteresis=cfg.get("up_hysteresis", -0.25),
             candidate_steps=candidate_steps,
         )
 
@@ -48,12 +68,12 @@ class AdaptiveSpeculativeParams:
         initial_steps: int,
         max_steps: int,
         min_steps: int = 1,
-        ema_alpha: float = 0.1,
-        update_interval: int = 10,
+        ema_alpha: float = 0.2,
+        update_interval: int = 5,
         down_hysteresis: float = 0.0,
-        up_hysteresis: float = 0.0,
+        up_hysteresis: float = -0.25,
         candidate_steps: Optional[List[int]] = None,
-        warmup_batches: int = 0,
+        warmup_batches: int = 10,
     ):
         self.min_steps = min_steps
         self.max_steps = max_steps
@@ -78,7 +98,6 @@ class AdaptiveSpeculativeParams:
                 self.candidate_steps,
                 key=lambda step: (abs(step - self.current_steps), -step),
             )
-        self.current_draft_tokens = self.current_steps + 1  # topk=1 invariant
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
@@ -166,7 +185,6 @@ class AdaptiveSpeculativeParams:
 
         if target != old_steps:
             self.current_steps = target
-            self.current_draft_tokens = target + 1  # topk=1 invariant
             logger.info(
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
                 f"(ema_accept_len={self.ema_accept_len:.2f})"
