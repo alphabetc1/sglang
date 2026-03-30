@@ -32,10 +32,9 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
 )
-from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +214,18 @@ class MooncakeKVManager(CommonKVManager):
             self.start_decode_thread()
 
     def init_engine(self):
-        self.engine = get_mooncake_transfer_engine()
+        # Lazy-init is idempotent: returns existing instance if eager init
+        # already happened, otherwise creates one now (needed when eager
+        # init was skipped to avoid TE/MooncakeStore coexistence segfault).
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            init_mooncake_transfer_engine,
+        )
+
+        self.engine = init_mooncake_transfer_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers

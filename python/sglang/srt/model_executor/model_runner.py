@@ -882,7 +882,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         2) HiCache uses mooncake storage backend
         3) Encoder disaggregation uses mooncake
         """
-        use_mooncake_te = (
+        if self._should_defer_shared_mooncake_te_init():
+            return
+
+        use_mooncake_te = self._needs_shared_mooncake_te()
+
+        if use_mooncake_te:
+            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                init_mooncake_transfer_engine,
+            )
+
+            init_mooncake_transfer_engine(
+                hostname=get_local_ip_auto(),
+                gpu_id=self.gpu_id,
+                ib_device=(
+                    self.server_args.disaggregation_ib_device
+                    or self.server_args.mooncake_ib_device
+                ),
+            )
+
+    def _needs_shared_mooncake_te(self) -> bool:
+        return (
             (
                 self.server_args.disaggregation_mode != "null"
                 and self.server_args.disaggregation_transfer_backend == "mooncake"
@@ -906,19 +926,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         )
 
-        if use_mooncake_te:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-
-            init_mooncake_transfer_engine(
-                hostname=get_local_ip_auto(),
-                gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
-                ),
-            )
+    def _should_defer_shared_mooncake_te_init(self) -> bool:
+        """Defer eager TE init when prefill will also start a TCP MooncakeStore."""
+        return (
+            self.server_args.disaggregation_mode == "prefill"
+            and self.server_args.enable_hierarchical_cache
+            and self.server_args.hicache_storage_backend == "mooncake"
+            and envs.MOONCAKE_PROTOCOL.get() != "rdma"
+        )
 
     def load_model(self):
         tic_total = time.perf_counter()
