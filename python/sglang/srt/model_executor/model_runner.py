@@ -68,6 +68,9 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    init_mooncake_transfer_engine,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -888,10 +891,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         use_mooncake_te = self._needs_shared_mooncake_te()
 
         if use_mooncake_te:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-
             init_mooncake_transfer_engine(
                 hostname=get_local_ip_auto(),
                 gpu_id=self.gpu_id,

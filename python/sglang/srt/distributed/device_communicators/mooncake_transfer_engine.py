@@ -176,8 +176,6 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        metadata_server = envs.MOONCAKE_TE_META_DATA_SERVER.get()
-        protocol = envs.MOONCAKE_PROTOCOL.get()
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
@@ -186,15 +184,15 @@ class MooncakeTransferEngine:
                 hostname += f":{get_free_port()}:npu_{npu_phy_id}"
             ret_value = self.engine.initialize(
                 hostname,
-                metadata_server,
+                "P2PHANDSHAKE",
                 "ascend",
                 device_name if device_name is not None else "",
             )
         else:
             ret_value = self.engine.initialize(
                 hostname,
-                metadata_server,
-                protocol,
+                "P2PHANDSHAKE",
+                "rdma",
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
