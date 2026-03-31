@@ -928,7 +928,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _should_defer_shared_mooncake_te_init(self) -> bool:
         """Defer eager TE init when prefill will also start a TCP MooncakeStore."""
-        # FIXME: reuse TCP mooncake te
         return (
             self.server_args.disaggregation_mode == "prefill"
             and self.server_args.enable_hierarchical_cache
