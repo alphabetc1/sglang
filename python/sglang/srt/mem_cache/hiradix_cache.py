@@ -120,6 +120,7 @@ class HiRadixCache(RadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        self.storage_metrics_collector = None
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
             attach_hybrid_nsa_pool_to_hiradix_cache(
@@ -231,16 +232,17 @@ class HiRadixCache(RadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            existing_collector = getattr(self, "storage_metrics_collector", None)
-            if existing_collector is None:
+            if self.storage_metrics_collector is None:
                 self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
-            elif set(existing_collector.labels.keys()) == set(labels.keys()):
-                existing_collector.labels = labels
+            elif set(self.storage_metrics_collector.labels.keys()) == set(
+                labels.keys()
+            ):
+                self.storage_metrics_collector.labels = labels
             else:
                 logger.warning(
                     "Storage metrics labels changed (%s -> %s). Keep existing labels to "
                     "avoid duplicate metric registration.",
-                    sorted(existing_collector.labels.keys()),
+                    sorted(self.storage_metrics_collector.labels.keys()),
                     sorted(labels.keys()),
                 )
 
@@ -402,55 +404,31 @@ class HiRadixCache(RadixCache):
         """
         cc = self.cache_controller
 
-        # Force release leftover prefetch ops: free pre-allocated host pages and
-        # drop the host protection on the matched prefix node.
-        try:
-            for req_id, info in list(self.ongoing_prefetch.items()):
-                try:
-                    last_host_node, token_ids, host_indices, _operation = info
-                except Exception:
-                    # Unexpected shape; just drop it.
-                    self.ongoing_prefetch.pop(req_id, None)
-                    continue
+        # Release leftover prefetch ops: free host pages and drop host protection.
+        for req_id, info in list(self.ongoing_prefetch.items()):
+            last_host_node, token_ids, host_indices, _operation = info
+            if host_indices is not None:
+                cc.mem_pool_host.free(host_indices)
+            try:
+                last_host_node.release_host()
+            except Exception:
+                logger.exception(
+                    "Failed to release host protection for prefetch %s", req_id
+                )
+            cc.prefetch_tokens_occupied -= len(token_ids)
+            if cc.prefetch_tokens_occupied < 0:
+                cc.prefetch_tokens_occupied = 0
+            self.ongoing_prefetch.pop(req_id, None)
 
-                try:
-                    if host_indices is not None:
-                        cc.mem_pool_host.free(host_indices)
-                except Exception:
-                    logger.exception(
-                        "Failed to free host indices for prefetch %s", req_id
-                    )
-
-                try:
-                    last_host_node.release_host()
-                except Exception:
-                    logger.exception(
-                        "Failed to release host protection for prefetch %s", req_id
-                    )
-
-                try:
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
-                except Exception:
-                    pass
-
-                self.ongoing_prefetch.pop(req_id, None)
-        except Exception:
-            logger.exception("Force release pending prefetch ops failed.")
-
-        # Force release leftover backup ops: drop host protection on nodes.
-        try:
-            for ack_id, node in list(self.ongoing_backup.items()):
-                try:
-                    node.release_host()
-                except Exception:
-                    logger.exception(
-                        "Failed to release host protection for backup op %s", ack_id
-                    )
-                self.ongoing_backup.pop(ack_id, None)
-        except Exception:
-            logger.exception("Force release pending backup ops failed.")
+        # Release leftover backup ops: drop host protection on nodes.
+        for ack_id, node in list(self.ongoing_backup.items()):
+            try:
+                node.release_host()
+            except Exception:
+                logger.exception(
+                    "Failed to release host protection for backup op %s", ack_id
+                )
+            self.ongoing_backup.pop(ack_id, None)
 
     def _drain_storage_control_queues_local(self):
         """Drain storage control queues without TP synchronization.

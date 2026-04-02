@@ -1364,8 +1364,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
-        if hasattr(self, "storage_metrics_collector"):
-            self.storage_metrics_collector = None
+        self.storage_metrics_collector = None
         return True, "Detached HiCache storage backend successfully."
 
     def prefetch_abort(self, pool_transfers: Optional[list[PoolTransfer]]) -> None:
@@ -1379,54 +1378,34 @@ class HiMambaRadixCache(MambaRadixCache):
     def _force_release_pending_storage_ops(self):
         cc = self.cache_controller
 
-        try:
-            for req_id, info in list(self.ongoing_prefetch.items()):
-                try:
-                    last_host_node, token_ids, host_indices, _operation = info
-                except Exception:
-                    self.ongoing_prefetch.pop(req_id, None)
-                    continue
-                try:
-                    if host_indices is not None:
-                        cc.mem_pool_host.free(host_indices)
-                except Exception:
-                    logger.exception(
-                        "Failed to free host indices for prefetch %s", req_id
-                    )
-                try:
-                    self.prefetch_abort(getattr(_operation, "pool_transfers", None))
-                except Exception:
-                    logger.exception(
-                        "Failed to release mamba host indices for prefetch %s", req_id
-                    )
-                try:
-                    self._release_host_node(last_host_node)
-                except Exception:
-                    logger.exception(
-                        "Failed to release host protection for prefetch %s", req_id
-                    )
-                try:
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
-                except Exception:
-                    pass
-                self.ongoing_prefetch.pop(req_id, None)
-        except Exception:
-            logger.exception("Force release pending prefetch ops failed.")
+        # Release leftover prefetch ops: free host pages, mamba slots, and
+        # drop host protection.
+        for req_id, info in list(self.ongoing_prefetch.items()):
+            last_host_node, token_ids, host_indices, _operation = info
+            if host_indices is not None:
+                cc.mem_pool_host.free(host_indices)
+            self.prefetch_abort(_operation.pool_transfers)
+            try:
+                self._release_host_node(last_host_node)
+            except Exception:
+                logger.exception(
+                    "Failed to release host protection for prefetch %s", req_id
+                )
+            cc.prefetch_tokens_occupied -= len(token_ids)
+            if cc.prefetch_tokens_occupied < 0:
+                cc.prefetch_tokens_occupied = 0
+            self.ongoing_prefetch.pop(req_id, None)
 
-        try:
-            for ack_id, entry in list(self.ongoing_backup.items()):
-                try:
-                    node, mamba_host_protected = entry
-                    self._release_host_node(node, release_mamba=mamba_host_protected)
-                except Exception:
-                    logger.exception(
-                        "Failed to release host protection for backup op %s", ack_id
-                    )
-                self.ongoing_backup.pop(ack_id, None)
-        except Exception:
-            logger.exception("Force release pending backup ops failed.")
+        # Release leftover backup ops: drop host protection on nodes.
+        for ack_id, entry in list(self.ongoing_backup.items()):
+            try:
+                node, mamba_host_protected = entry
+                self._release_host_node(node, release_mamba=mamba_host_protected)
+            except Exception:
+                logger.exception(
+                    "Failed to release host protection for backup op %s", ack_id
+                )
+            self.ongoing_backup.pop(ack_id, None)
 
     def _drain_storage_control_queues_local(self):
         self._drain_storage_control_queues_impl(

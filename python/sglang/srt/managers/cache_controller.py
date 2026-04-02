@@ -167,21 +167,17 @@ class TransferBuffer:
         while not self.stop_event.is_set():
             try:
                 self.buffers.put(item, block=block, timeout=timeout)
-                break
+                return
             except Full:
                 if not block:
-                    break
+                    return
                 continue
-            except Exception as e:
-                logger.error(e)
 
     def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
         try:
             return self.buffers.get(block=block, timeout=timeout)
         except Empty:
             return None
-        except Exception as e:
-            logger.error(e)
 
     def clear(self):
         self.buffers.queue.clear()
@@ -296,6 +292,18 @@ class HiCacheController:
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
 
+        # Storage thread/queue attributes
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.prefetch_queue: Optional[Queue] = None
+        self.backup_queue: Optional[Queue] = None
+        self.prefetch_buffer: Optional[Queue] = None
+        self.prefetch_revoke_queue: Optional[Queue] = None
+        self.ack_backup_queue: Optional[Queue] = None
+        self.host_mem_release_queue: Optional[Queue] = None
+        self.prefetch_tp_group = None
+
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
@@ -366,46 +374,59 @@ class HiCacheController:
 
         Caller should ensure no in-flight requests.
         """
-        # Always request stop. This is safe even when storage is already disabled,
-        # and makes detach truly idempotent (previous partial detach may have left
-        # threads alive).
-        # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
-        # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
 
-        # Best-effort wakeups so threads exit promptly even if blocked on queues.
-        try:
-            if hasattr(self, "prefetch_queue"):
-                self.prefetch_queue.put_nowait(None)
-            if hasattr(self, "backup_queue"):
-                self.backup_queue.put_nowait(None)
-            if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
-        except Exception:
-            pass
+        # Wakeup threads that may be blocked on queue.get().
+        for q in (self.prefetch_queue, self.backup_queue, self.prefetch_buffer):
+            if q is not None:
+                q.put_nowait(None)
 
-        # Best-effort joins (threads are daemon, but join keeps state clean).
-        threads = []
-        if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
-        if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
-
+        # Join threads (daemon, but join keeps state clean).
+        threads = [
+            t
+            for t in (
+                self.prefetch_thread,
+                self.backup_thread,
+                self.prefetch_io_aux_thread,
+            )
+            if t is not None
+        ]
         for t in threads:
-            try:
-                t.join(timeout=10)
-            except Exception:
-                pass
+            t.join(timeout=10)
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [t for t in threads if t.is_alive()]
         if alive:
             logger.error(
                 "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                [t.name for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+    def _rollback_storage_state(self):
+        """Best-effort cleanup after a failed attach or partial init."""
+        try:
+            self._stop_storage_threads()
+        except Exception:
+            pass
+
+        if self.prefetch_tp_group is not None:
+            try:
+                torch.distributed.destroy_process_group(self.prefetch_tp_group)
+            except Exception:
+                pass
+            self.prefetch_tp_group = None
+
+        if self.storage_backend is not None and hasattr(self.storage_backend, "close"):
+            try:
+                self.storage_backend.close()
+            except Exception:
+                pass
+
+        self.storage_backend = None
+        self.storage_backend_type = None
+        self.enable_storage = False
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
 
     def attach_storage_backend(
         self,
@@ -424,15 +445,8 @@ class HiCacheController:
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
-        try:
-            self._stop_storage_threads()
-        except Exception as e:
-            raise RuntimeError(
-                "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
-            ) from e
+        self._stop_storage_threads()
 
-        # Rollback-safe init: if creation fails, keep controller state consistent
-        # for future attach attempts.
         self.storage_backend_type = storage_backend
         from sglang.srt.mem_cache.utils import get_hash_str
 
@@ -440,14 +454,11 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # for MLA models, only one rank needs to backup the KV cache
+        # For MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
+            self.storage_config.is_mla_model and self.storage_config.tp_rank != 0
         )
 
-        # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
@@ -455,76 +466,46 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.mem_pool_host
             )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+        except Exception:
+            self._rollback_storage_state()
+            raise
 
-            self.enable_storage = True
-            # todo: threshold policy for prefetching
-            self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
+        self.enable_storage = True
+        # todo: threshold policy for prefetching
+        self.prefetch_threshold = max(prefetch_threshold, self.page_size)
+        self.prefetch_capacity_limit = max(
+            0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
+        )
+        self.storage_batch_size = 128
+        self.prefetch_tokens_occupied = 0
+
+        # Create a new communication group for synchronizing storage operations
+        # across TP workers.
+        self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        if self.tp_world_size > 1:
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
             )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
-            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
-            self.prefetch_tokens_occupied = 0
 
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-            if self.tp_world_size > 1:
-                from sglang.srt.distributed.parallel_state import (
-                    create_custom_parallel_group,
-                )
+            group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
+            self.prefetch_tp_group = create_custom_parallel_group(
+                group_ranks=group_ranks, backend="gloo"
+            )
 
-                group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
-                self.prefetch_tp_group = create_custom_parallel_group(
-                    group_ranks=group_ranks, backend="gloo"
-                )
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+        if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl", "simm"]) or (
+            self.storage_backend_type == "dynamic"
+            and bool(self.storage_config.extra_config.get("interface_v1", 0))
+        ):
+            self.page_get_func = self._page_get_zero_copy
+            self.page_set_func = self._page_set_zero_copy
 
-            # Select the get and set functions
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
-
-            if (
-                self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
-            ) or (
-                self.storage_backend_type == "dynamic"
-                and bool(self.storage_config.extra_config.get("interface_v1", 0))
-            ):
-                self.page_get_func = self._page_get_zero_copy
-                self.page_set_func = self._page_set_zero_copy
-
-            # Ensure stop_event is clear before starting threads.
+        try:
             self.storage_stop_event.clear()
             self._start_storage_threads()
         except Exception:
-            # Best-effort cleanup for partial init.
-            try:
-                self._stop_storage_threads()
-            except Exception:
-                pass
-            try:
-                if hasattr(self, "prefetch_tp_group"):
-                    try:
-                        torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                    except Exception:
-                        pass
-                    self.prefetch_tp_group = None
-            except Exception:
-                pass
-            try:
-                if (
-                    hasattr(self, "storage_backend")
-                    and self.storage_backend is not None
-                ):
-                    if hasattr(self.storage_backend, "close"):
-                        self.storage_backend.close()
-            except Exception:
-                pass
-            self.storage_backend = None
-            self.storage_backend_type = None
-            self.enable_storage = False
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
+            self._rollback_storage_state()
             raise
 
     def detach_storage_backend(self):
@@ -533,51 +514,11 @@ class HiCacheController:
         Requirement: no in-flight requests. This will stop storage threads and release
         the backend instance (best-effort close).
         """
-        # Idempotent cleanup: even if `enable_storage` is already False,
-        # we may still have leftover resources (threads/backend/process group) from a
-        # previous partial detach. We attempt cleanup whenever possible.
-        try:
-            self._stop_storage_threads()
-        except Exception as e:
-            # Do not proceed tearing down backend/process group if threads are not
-            # fully stopped; otherwise still-alive threads may touch released state.
-            # Caller can retry detach.
-            logger.exception("Stop storage threads failed: %s", e)
-            # IMPORTANT: Do not silently succeed. Upper layers rely on exceptions here
-            # to avoid flipping `enable_storage` flags while threads are still alive.
-            raise RuntimeError("Stop storage threads failed; detach aborted.") from e
-
-        # Best-effort destroy process group created for storage ops.
-        try:
-            if (
-                hasattr(self, "prefetch_tp_group")
-                and self.prefetch_tp_group is not None
-            ):
-                try:
-                    torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                except Exception:
-                    pass
-                self.prefetch_tp_group = None
-        except Exception:
-            pass
-
-        # Best-effort close (some backends rely on GC/destructor).
-        try:
-            if (
-                hasattr(self, "storage_backend")
-                and self.storage_backend is not None
-                and hasattr(self.storage_backend, "close")
-            ):
-                self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
-
-        self.storage_backend = None
-        self.storage_backend_type = None
-        self.enable_storage = False
-        self.page_get_func = self._generic_page_get
-        self.page_set_func = self._generic_page_set
-        # Now it's safe to clear the stop event for future re-attach.
+        # If threads fail to stop, let the exception propagate – upper layers
+        # rely on this to avoid flipping enable_storage while threads are alive.
+        self._stop_storage_threads()
+        self._rollback_storage_state()
+        # Safe to clear stop event for future re-attach.
         self.storage_stop_event.clear()
 
     def _generate_storage_config(

@@ -3,7 +3,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 
@@ -101,13 +101,14 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    registered_pools: Dict[str, HostKVCache]
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
+        self.registered_pools = {}
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
-        if not hasattr(self, "registered_pools"):
-            self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
     def batch_exists_v2(
