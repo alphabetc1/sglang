@@ -42,6 +42,11 @@ class AdaptiveController:
     Works with any worker that implements ``AdaptiveSpecWorker`` protocol:
       - ``build_adaptive_runtime_state(steps, draft_tokens)`` → state object
       - ``apply_runtime_state(state)`` → apply it to the worker
+
+    The worker only needs to:
+      1. Call ``register()`` for the initial state, then ``init_states()``
+         once during startup.
+      2. Call ``on_verify_complete(accept_lengths)`` after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: Optional[str] = None):

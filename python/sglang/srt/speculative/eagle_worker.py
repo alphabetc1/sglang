@@ -270,10 +270,6 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
-        Device2DraftCudaGraphRunner = {
-            "npu": EAGLEDraftNpuGraphRunner,
-            "cuda": EAGLEDraftCudaGraphRunner,
-        }
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
@@ -281,9 +277,9 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner = _DEVICE_TO_DRAFT_RUNNER[self.target_worker.device](
+                self
+            )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
@@ -305,11 +301,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
     def apply_runtime_state(self, state: SpecRuntimeState):
-        """Apply a pre-built runtime state to this worker.
-
-        This is the single place that knows which worker fields correspond
-        to a SpecRuntimeState.  Called by AdaptiveController when switching.
-        """
+        """Apply a pre-built runtime state to this worker."""
         if self.speculative_num_steps == state.speculative_num_steps:
             return
 
