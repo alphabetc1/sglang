@@ -3,6 +3,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache, SessionSlot
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -17,6 +19,27 @@ class _FakeInnerCache:
 
     def reset(self):
         raise AssertionError("not used in this test")
+
+
+class _FakeAllocator:
+    def __init__(self):
+        self.freed = []
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
+
+
+class _FakeStreamingInnerCache(_FakeInnerCache):
+    def __init__(self, page_size: int = 4):
+        super().__init__(page_size=page_size)
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(32, dtype=torch.int32).reshape(2, 16),
+            free_slots=[],
+        )
+        self.token_to_kv_pool_allocator = _FakeAllocator()
+
+    def cache_finished_req(self, req, is_insert=True, **kwargs):
+        raise AssertionError("streaming requests should stay in SessionAwareCache")
 
 
 def _make_req(
@@ -41,6 +64,19 @@ def _make_req(
         mamba_last_track_seqlen=None,
         mamba_branching_seqlen=None,
     )
+
+
+def _make_streaming_req(
+    *, req_pool_idx: int, kv_committed_len: int, kv_allocated_len: int
+):
+    req = _make_req(
+        req_pool_idx=req_pool_idx,
+        kv_committed_len=kv_committed_len,
+        kv_allocated_len=kv_allocated_len,
+        cache_protected_len=4,
+    )
+    req.session = SimpleNamespace(session_id="session-1", streaming=True)
+    return req
 
 
 class TestSessionAwareCacheBusyAccounting(unittest.TestCase):
@@ -96,6 +132,41 @@ class TestSessionAwareCacheBusyAccounting(unittest.TestCase):
         self.assertFalse(slot.active)
         self.assertIsNone(req.req_pool_idx)
         self.assertEqual(self.cache.session_held_req_count(), 1)
+
+
+class TestSessionAwareCacheRetractCleanup(unittest.TestCase):
+    def test_retract_frees_page_aligned_overallocated_tokens_before_slot_takeover(self):
+        inner = _FakeStreamingInnerCache(page_size=4)
+        cache = SessionAwareCache(inner)
+        req = _make_streaming_req(
+            req_pool_idx=1,
+            kv_committed_len=5,
+            kv_allocated_len=9,
+        )
+
+        cache.cache_finished_req(req, is_insert=False)
+
+        self.assertEqual(
+            [buf.tolist() for buf in inner.token_to_kv_pool_allocator.freed],
+            [[24]],
+        )
+        self.assertEqual(req.kv_allocated_len, 5)
+        self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(cache.slots["session-1"].kv_allocated_len, 5)
+
+    def test_insert_path_keeps_overallocated_tokens_for_common_release_flow(self):
+        inner = _FakeStreamingInnerCache(page_size=4)
+        cache = SessionAwareCache(inner)
+        req = _make_streaming_req(
+            req_pool_idx=1,
+            kv_committed_len=5,
+            kv_allocated_len=9,
+        )
+
+        cache.cache_finished_req(req, is_insert=True)
+
+        self.assertEqual(inner.token_to_kv_pool_allocator.freed, [])
+        self.assertEqual(cache.slots["session-1"].kv_allocated_len, 9)
 
 
 if __name__ == "__main__":
