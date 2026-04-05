@@ -51,6 +51,9 @@ class SessionSlot:
     # SWA state
     swa_evicted_seqlen: int = 0
 
+    # True when KV has been lent to a running request (avoid double counting)
+    active: bool = False
+
     # Mamba states
     mamba_pool_idx: Any = None
     mamba_ping_pong_track_buffer: Any = None
@@ -83,6 +86,7 @@ class SessionSlot:
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        self.active = False
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -97,6 +101,8 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+
+        self.active = True
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by
@@ -269,10 +275,14 @@ class SessionAwareCache(BasePrefixCache):
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
     def session_held_tokens(self) -> int:
-        """Total KV tokens held by session slots, not tracked by the tree."""
+        """Total KV tokens held by session slots, not tracked by the tree.
+
+        Excludes active slots whose KV is currently lent to a running request
+        (those tokens are already counted by the batch uncached size).
+        """
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - slot.cache_protected_len
         return total
@@ -285,7 +295,7 @@ class SessionAwareCache(BasePrefixCache):
         """Total SWA tokens held by session slots, not tracked by the tree."""
         total = 0
         for slot in self.slots.values():
-            if slot.is_holding_kv:
+            if slot.is_holding_kv and not slot.active:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)
                 total += allocated - max(
                     slot.cache_protected_len, slot.swa_evicted_seqlen
@@ -294,7 +304,9 @@ class SessionAwareCache(BasePrefixCache):
 
     def session_held_req_count(self) -> int:
         """Number of req pool slots held by session slots."""
-        return sum(s.is_holding_kv for s in self.slots.values())
+        return sum(
+            s.is_holding_kv and not s.active for s in self.slots.values()
+        )
 
     # -- Pass-through methods --
 
