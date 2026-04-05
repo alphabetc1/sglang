@@ -1,4 +1,4 @@
-"""Unit tests for SessionAwareCache busy-memory accounting."""
+"""Unit tests for SessionAwareCache."""
 
 import unittest
 from types import SimpleNamespace
