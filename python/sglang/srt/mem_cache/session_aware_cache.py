@@ -206,6 +206,21 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        # On retract (is_insert=False), free over-allocated KV tokens before
+        # saving to the slot. release_kv_cache() returns early once we set
+        # req.req_pool_idx = None, so these tokens would otherwise leak.
+        if not is_insert and req.kv_committed_len < req.kv_allocated_len:
+            start = req.kv_committed_len
+            if self.page_size > 1:
+                start = ceil_align(start, self.page_size)
+            end = req.kv_allocated_len
+            if start < end:
+                indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, start:end
+                ]
+                self.token_to_kv_pool_allocator.free(indices)
+            req.kv_allocated_len = req.kv_committed_len
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
