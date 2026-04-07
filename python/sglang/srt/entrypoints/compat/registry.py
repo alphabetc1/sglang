@@ -6,13 +6,13 @@ from typing import Callable, Iterable, List, Mapping, Sequence
 
 from fastapi import APIRouter, Request
 
+from sglang.srt.entrypoints.compat.bailian_qwen3_rerank import (
+    BailianQwen3RerankAdapter,
+)
 from sglang.srt.entrypoints.compat.base import (
     CompatAdapter,
     CompatRouteSpec,
     CompatServiceRegistry,
-)
-from sglang.srt.entrypoints.compat.bailian_qwen3_rerank import (
-    BailianQwen3RerankAdapter,
 )
 
 _BUILTIN_COMPAT_ADAPTERS: dict[str, Callable[[], CompatAdapter]] = {

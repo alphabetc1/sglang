@@ -97,6 +97,9 @@ class BailianQwen3RerankAdapter(CompatAdapter):
         return [
             CompatRouteSpec(path="/reranks", methods=("POST",), include_in_schema=True),
             CompatRouteSpec(
+                path="/v1/reranks", methods=("POST",), include_in_schema=True
+            ),
+            CompatRouteSpec(
                 path="/compatible-api/v1/reranks",
                 methods=("POST",),
                 include_in_schema=False,

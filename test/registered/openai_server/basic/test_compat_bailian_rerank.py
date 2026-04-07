@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.entrypoints.compat.bailian_qwen3_rerank import (
+    BailianQwen3RerankAdapter,
     BailianQwenRerankRequest,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -10,6 +11,12 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestCompatBailianRerank(unittest.TestCase):
+    def test_routes_include_v1_reranks(self):
+        paths = {route.path for route in BailianQwen3RerankAdapter().route_specs()}
+        self.assertIn("/reranks", paths)
+        self.assertIn("/v1/reranks", paths)
+        self.assertIn("/compatible-api/v1/reranks", paths)
+
     def test_return_documents_defaults_to_true(self):
         request = BailianQwenRerankRequest(
             model="qwen3-rerank",
