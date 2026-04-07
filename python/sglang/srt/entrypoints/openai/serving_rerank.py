@@ -356,33 +356,12 @@ class OpenAIServingRerank(OpenAIServingBase):
         chat_template: str,
     ) -> Union[List[RerankResponse], ErrorResponse]:
         """Handle text-only decoder reranker request via score_prompts()."""
-        # Qwen3 reranker relies on decoder-only logprobs. If the server is launched
-        # with --is-embedding, model_config.is_generation is typically False and
-        # logprob scoring is not supported.
-        if not self.tokenizer_manager.model_config.is_generation:
-            return self.create_error_response(
-                "Detected Qwen3 reranker chat template, but the server is not in generation mode. "
-                "Please relaunch without --is-embedding for Qwen3-Reranker models."
-            )
-
         try:
-            prompts = [
-                _render_jinja_chat_template(
-                    chat_template,
-                    query=request.query,
-                    document=doc,
-                    instruct=getattr(request, "instruct", None),
-                )
-                for doc in request.documents
-            ]
-
-            result = await self.tokenizer_manager.score_prompts(
-                prompts,
-                label_token_ids=[self._yes_token_id, self._no_token_id],
-                apply_softmax=False,
-                request=raw_request,
+            scores, _prompt_tokens = await self._score_text_reranker_request(
+                request=request,
+                raw_request=raw_request,
+                chat_template=chat_template,
             )
-            scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:
@@ -391,6 +370,41 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         responses = self._build_rerank_response(scores, request)
         return responses
+
+    async def _score_text_reranker_request(
+        self,
+        *,
+        request: V1RerankReqInput,
+        raw_request: Request,
+        chat_template: str,
+    ) -> tuple[List[float], int]:
+        """Score a qwen3 text-only reranker request and return scores plus token usage."""
+        # Qwen3 reranker relies on decoder-only logprobs. If the server is launched
+        # with --is-embedding, model_config.is_generation is typically False and
+        # logprob scoring is not supported.
+        if not self.tokenizer_manager.model_config.is_generation:
+            raise ValueError(
+                "Detected Qwen3 reranker chat template, but the server is not in generation mode. "
+                "Please relaunch without --is-embedding for Qwen3-Reranker models."
+            )
+
+        prompts = [
+            _render_jinja_chat_template(
+                chat_template,
+                query=request.query,
+                document=doc,
+                instruct=getattr(request, "instruct", None),
+            )
+            for doc in request.documents
+        ]
+        result = await self.tokenizer_manager.score_prompts(
+            prompts,
+            label_token_ids=[self._yes_token_id, self._no_token_id],
+            apply_softmax=False,
+            request=raw_request,
+        )
+        scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
+        return scores, result.prompt_tokens
 
     async def _handle_vl_reranker_request(
         self,

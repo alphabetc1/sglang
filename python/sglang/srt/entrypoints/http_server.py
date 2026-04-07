@@ -66,6 +66,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+from sglang.srt.entrypoints.compat.base import CompatServiceRegistry
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -302,6 +303,9 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
+    fast_api_app.state.compat_service_registry = CompatServiceRegistry(
+        rerank=fast_api_app.state.openai_serving_rerank
+    )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
     )
@@ -384,8 +388,10 @@ app.add_middleware(
 )
 
 # Include routers
+from sglang.srt.entrypoints.compat.router import router as compat_router
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+app.include_router(compat_router)
 app.include_router(v1_loads_router)
 
 
