@@ -32,7 +32,7 @@ class BailianQwenRerankRequest(BaseModel):
     documents: List[str]
     top_n: Optional[int] = None
     instruct: Optional[str] = None
-    return_documents: bool = True
+    return_documents: bool = False
 
     @field_validator("top_n")
     @classmethod
@@ -68,18 +68,16 @@ class BailianRerankResult(BaseModel):
         return data
 
 
-class BailianRerankOutput(BaseModel):
-    results: List[BailianRerankResult]
-
-
 class BailianRerankUsage(BaseModel):
     total_tokens: int = Field(default=0)
 
 
 class BailianRerankResponse(BaseModel):
-    output: BailianRerankOutput
+    object: str = "list"
+    results: List[BailianRerankResult]
+    model: str
+    id: str
     usage: BailianRerankUsage
-    request_id: str
 
 
 class BailianErrorResponse(BaseModel):
@@ -212,22 +210,21 @@ class BailianQwen3RerankAdapter(CompatAdapter):
 
         rerank_results = rerank_service._build_rerank_response(scores, v1_request)
         response = BailianRerankResponse(
-            output=BailianRerankOutput(
-                results=[
-                    BailianRerankResult(
-                        index=result.index,
-                        relevance_score=result.score,
-                        document=(
-                            BailianRerankDocument(text=result.document)
-                            if result.document is not None
-                            else None
-                        ),
-                    )
-                    for result in rerank_results
-                ]
-            ),
+            results=[
+                BailianRerankResult(
+                    index=result.index,
+                    relevance_score=result.score,
+                    document=(
+                        BailianRerankDocument(text=result.document)
+                        if result.document is not None
+                        else None
+                    ),
+                )
+                for result in rerank_results
+            ],
+            model=request.model,
+            id=request_id,
             usage=BailianRerankUsage(total_tokens=prompt_tokens),
-            request_id=request_id,
         )
         return ORJSONResponse(content=response.model_dump())
 
