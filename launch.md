@@ -16,8 +16,20 @@ python -m sglang.launch_server \
   --host 127.0.0.1 \
   --port 38000 \
   --disable-cuda-graph \
-  --disable-piecewise-cuda-graph
+  --disable-piecewise-cuda-graph \
+  --mem-fraction-static 0.1
 ```
+
+## Benchmark
+python benchmark/rerank/bench_rerank_tpm.py \
+    --url http://127.0.0.1:38000 \
+    --model qwen3-rerank \
+    --api-style bailian \
+    --concurrency 32 \
+    --duration 60 \
+    --num-docs 10 \
+    --doc-tokens 200 \
+    --query-tokens 50
 
 ## Test Request
 
