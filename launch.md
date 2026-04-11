@@ -5,19 +5,19 @@
 The Bailian adapter is built in and loads by default.
 
 This command was validated locally with the model at
-`/models/Qwen/Qwen3-Reranker-0.6B`:
+`/models/Qwen/Qwen3-Reranker-8B`:
 
 ```bash
 PYTHONPATH=python:. \
 python -m sglang.launch_server \
-  --model-path /models/Qwen/Qwen3-Reranker-0.6B \
+  --model-path /models/Qwen/Qwen3-Reranker-8B \
   --served-model-name qwen3-rerank \
   --chat-template examples/chat_template/qwen3_reranker.jinja \
   --host 127.0.0.1 \
   --port 38000 \
   --disable-cuda-graph \
   --disable-piecewise-cuda-graph \
-  --mem-fraction-static 0.1
+  --mem-fraction-static 0.2
 ```
 
 ## Benchmark
