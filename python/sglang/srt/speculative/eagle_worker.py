@@ -476,11 +476,6 @@ class EAGLEWorker(TpModelWorker):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
 
-            if self.adaptive_controller is not None:
-                self.adaptive_controller.on_verify_complete(
-                    verify_output.accept_length_per_req_cpu
-                )
-
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,

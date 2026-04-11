@@ -8,6 +8,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+    maybe_init_adaptive_controller,
+    maybe_register_adaptive_state,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -155,6 +161,11 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.adaptive_controller: Optional[AdaptiveController] = (
+            maybe_init_adaptive_controller(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -174,6 +185,19 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             moe_dp_rank,
             nccl_port,
             target_worker,
+        )
+        maybe_register_adaptive_state(
+            self,
+            SpecRuntimeState(
+                speculative_num_steps=self.speculative_num_steps,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                draft_attn_backend=self.draft_worker.draft_attn_backend,
+                draft_extend_attn_backend=self.draft_worker.draft_extend_attn_backend,
+                cuda_graph_runner=self.draft_worker.cuda_graph_runner,
+                cuda_graph_runner_for_draft_extend=self.draft_worker.cuda_graph_runner_for_draft_extend,
+                target_attn_backend=self.target_worker.model_runner.attn_backend,
+                target_graph_runner=self.target_worker.model_runner.graph_runner,
+            ),
         )
 
         # Some dummy tensors

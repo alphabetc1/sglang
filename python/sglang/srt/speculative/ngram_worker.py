@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
@@ -11,6 +12,11 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    maybe_init_adaptive_controller,
+    maybe_register_adaptive_state,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -20,6 +26,39 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+
+
+@dataclass
+class NgramRuntimeState:
+    speculative_num_steps: int
+    speculative_num_draft_tokens: int
+    draft_tokens: torch.Tensor
+    retrieve_indexes: torch.Tensor
+    retrive_next_token: torch.Tensor
+    retrive_next_sibling: torch.Tensor
+    positions: torch.Tensor
+    tree_mask: torch.Tensor
+    draft_tokens_batch: List[torch.Tensor]
+    tree_mask_batch: List[torch.Tensor]
+    retrieve_indexes_batch: List[torch.Tensor]
+    retrive_next_token_batch: List[torch.Tensor]
+    retrive_next_sibling_batch: List[torch.Tensor]
+    positions_batch: List[torch.Tensor]
+    ngram_cache: NgramCache
+
+
+def _default_ngram_candidate_steps(
+    server_args: ServerArgs, current_draft_token_num: int
+) -> List[int]:
+    min_tokens = max(1, server_args.speculative_ngram_min_match_window_size)
+    max_tokens = max(
+        current_draft_token_num, server_args.speculative_ngram_max_match_window_size
+    )
+    mid_tokens = max(min_tokens, (min_tokens + max_tokens) // 2)
+    candidate_steps = sorted({min_tokens, mid_tokens, max_tokens})
+    if len(candidate_steps) == 1:
+        candidate_steps.append(candidate_steps[0] + 1)
+    return candidate_steps
 
 
 class NGRAMWorker:
@@ -35,10 +74,12 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
+        self.speculative_num_steps = server_args.speculative_num_steps
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.branch_length: int = server_args.speculative_ngram_branch_length
         self.max_match_window_size: int = (
@@ -47,21 +88,147 @@ class NGRAMWorker:
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-
-        self._init_preallocated_tensors()
-
-        self.ngram_cache = NgramCache(
-            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
-            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
-            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
-            capacity=server_args.speculative_ngram_capacity,
-            branch_length=server_args.speculative_ngram_branch_length,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+        self.adaptive_initial_value = self.draft_token_num
+        self.adaptive_candidate_steps = _default_ngram_candidate_steps(
+            server_args, self.draft_token_num
+        )
+        self.adaptive_controller: Optional[AdaptiveController] = (
+            maybe_init_adaptive_controller(
+                self, config_path=server_args.speculative_adaptive_config
+            )
         )
 
+        initial_state = self.build_adaptive_runtime_state(
+            speculative_num_steps=self.speculative_num_steps,
+            speculative_num_draft_tokens=self.draft_token_num,
+        )
+        self._apply_runtime_state(initial_state)
+        maybe_register_adaptive_state(self, initial_state)
+
     def clear_cache_pool(self):
-        self.ngram_cache.reset()
+        if self.adaptive_controller is None:
+            self.ngram_cache.reset()
+            return
+
+        for state in self.adaptive_controller.states.values():
+            state.ngram_cache.reset()
+
+    def get_adaptive_runtime_params(
+        self, speculative_num_draft_tokens: int
+    ) -> tuple[int, int]:
+        return self.speculative_num_steps, speculative_num_draft_tokens
+
+    def _make_ngram_cache(self, draft_token_num: int) -> NgramCache:
+        return NgramCache(
+            min_match_window_size=self.server_args.speculative_ngram_min_match_window_size,
+            max_match_window_size=self.server_args.speculative_ngram_max_match_window_size,
+            min_bfs_breadth=self.server_args.speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=self.server_args.speculative_ngram_max_bfs_breadth,
+            capacity=self.server_args.speculative_ngram_capacity,
+            branch_length=self.server_args.speculative_ngram_branch_length,
+            draft_token_num=draft_token_num,
+        )
+
+    def _build_preallocated_tensors(self, draft_token_num: int) -> NgramRuntimeState:
+        max_total_drafts = self.max_batch_size * draft_token_num
+        max_total_mask_size = self.max_batch_size * draft_token_num * draft_token_num
+
+        draft_tokens = torch.empty(
+            (max_total_drafts,), dtype=torch.int64, device=self.device
+        )
+        retrieve_indexes = torch.empty(
+            (self.max_batch_size, draft_token_num),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        retrive_next_token = torch.empty(
+            (self.max_batch_size, draft_token_num),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        retrive_next_sibling = torch.empty(
+            (self.max_batch_size, draft_token_num),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        positions = torch.empty(
+            (max_total_drafts,), dtype=torch.int64, device=self.device
+        )
+        tree_mask = torch.empty(
+            (max_total_mask_size,), dtype=torch.bool, device=self.device
+        )
+
+        draft_tokens_batch = []
+        tree_mask_batch = []
+        retrieve_indexes_batch = []
+        retrive_next_token_batch = []
+        retrive_next_sibling_batch = []
+        positions_batch = []
+
+        for bs in range(0, self.max_batch_size + 1):
+            retrieve_indexes_batch.append(retrieve_indexes[:bs, :])
+            retrive_next_token_batch.append(retrive_next_token[:bs, :])
+            retrive_next_sibling_batch.append(retrive_next_sibling[:bs, :])
+            positions_batch.append(positions[: bs * draft_token_num])
+            draft_tokens_batch.append(draft_tokens[: bs * draft_token_num])
+            tree_mask_batch.append(
+                tree_mask[: bs * draft_token_num * draft_token_num]
+            )
+
+        return NgramRuntimeState(
+            speculative_num_steps=self.speculative_num_steps,
+            speculative_num_draft_tokens=draft_token_num,
+            draft_tokens=draft_tokens,
+            retrieve_indexes=retrieve_indexes,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            positions=positions,
+            tree_mask=tree_mask,
+            draft_tokens_batch=draft_tokens_batch,
+            tree_mask_batch=tree_mask_batch,
+            retrieve_indexes_batch=retrieve_indexes_batch,
+            retrive_next_token_batch=retrive_next_token_batch,
+            retrive_next_sibling_batch=retrive_next_sibling_batch,
+            positions_batch=positions_batch,
+            ngram_cache=self._make_ngram_cache(draft_token_num),
+        )
+
+    def _apply_runtime_state(self, state: NgramRuntimeState) -> None:
+        self.draft_token_num = state.speculative_num_draft_tokens
+        self.draft_tokens = state.draft_tokens
+        self.retrieve_indexes = state.retrieve_indexes
+        self.retrive_next_token = state.retrive_next_token
+        self.retrive_next_sibling = state.retrive_next_sibling
+        self.positions = state.positions
+        self.tree_mask = state.tree_mask
+        self.draft_tokens_batch = state.draft_tokens_batch
+        self.tree_mask_batch = state.tree_mask_batch
+        self.retrieve_indexes_batch = state.retrieve_indexes_batch
+        self.retrive_next_token_batch = state.retrive_next_token_batch
+        self.retrive_next_sibling_batch = state.retrive_next_sibling_batch
+        self.positions_batch = state.positions_batch
+        self.ngram_cache = state.ngram_cache
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    def apply_runtime_state(self, state: NgramRuntimeState) -> None:
+        if self.draft_token_num == state.speculative_num_draft_tokens:
+            return
+
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"draft_tokens {self.draft_token_num} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+        self._apply_runtime_state(state)
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+    ) -> NgramRuntimeState:
+        return self._build_preallocated_tensors(speculative_num_draft_tokens)
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
@@ -70,56 +237,6 @@ class NGRAMWorker:
 
         need_from_seq1 = n - seq2_len
         return seq1[-need_from_seq1:] + seq2
-
-    def _init_preallocated_tensors(self):
-        max_total_drafts = self.max_batch_size * self.draft_token_num
-        max_total_mask_size = (
-            self.max_batch_size * self.draft_token_num * self.draft_token_num
-        )
-
-        self.draft_tokens = torch.empty(
-            (max_total_drafts,), dtype=torch.int64, device=self.device
-        )
-        self.retrieve_indexes = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.retrive_next_token = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.retrive_next_sibling = torch.empty(
-            (self.max_batch_size, self.draft_token_num),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self.positions = torch.empty(
-            (max_total_drafts,), dtype=torch.int64, device=self.device
-        )
-        self.tree_mask = torch.empty(
-            (max_total_mask_size,), dtype=torch.bool, device=self.device
-        )
-
-        self.draft_tokens_batch = []
-        self.tree_mask_batch = []
-        self.retrieve_indexes_batch = []
-        self.retrive_next_token_batch = []
-        self.retrive_next_sibling_batch = []
-        self.positions_batch = []
-
-        for bs in range(0, self.max_batch_size + 1):
-            self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrive_next_token_batch.append(self.retrive_next_token[:bs, :])
-            self.retrive_next_sibling_batch.append(self.retrive_next_sibling[:bs, :])
-            self.positions_batch.append(self.positions[: bs * self.draft_token_num])
-            self.draft_tokens_batch.append(
-                self.draft_tokens[: bs * self.draft_token_num]
-            )
-            self.tree_mask_batch.append(
-                self.tree_mask[: bs * self.draft_token_num * self.draft_token_num]
-            )
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
@@ -211,7 +328,17 @@ class NGRAMWorker:
                 req.origin_input_ids, req.output_ids, self.branch_length
             )
             batch_tokens.append(put_ids)
-        self.ngram_cache.batch_put(batch_tokens)
+        if self.adaptive_controller is None:
+            self.ngram_cache.batch_put(batch_tokens)
+            return
+
+        seen_cache_ids = set()
+        for state in self.adaptive_controller.states.values():
+            cache_id = id(state.ngram_cache)
+            if cache_id in seen_cache_ids:
+                continue
+            seen_cache_ids.add(cache_id)
+            state.ngram_cache.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
@@ -260,8 +387,8 @@ class NGRAMWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size, vocab_mask
             )
-            # Store accept_lens for per-request metrics
-            accept_lens = verify_input.accept_length
+            # Scheduler output processing expects spec-v1 accept lengths on CPU.
+            accept_lens = verify_input.accept_length.cpu()
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)

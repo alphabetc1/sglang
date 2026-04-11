@@ -27,9 +27,16 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+    maybe_init_adaptive_controller,
+    maybe_register_adaptive_state,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -647,6 +654,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.adaptive_controller: Optional[AdaptiveController] = (
+            maybe_init_adaptive_controller(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -665,6 +677,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             moe_dp_rank,
             nccl_port,
             target_worker,
+        )
+        maybe_register_adaptive_state(
+            self,
+            SpecRuntimeState(
+                speculative_num_steps=self.speculative_num_steps,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                draft_attn_backend=self.draft_worker.draft_attn_backend,
+                draft_extend_attn_backend=self.draft_worker.draft_extend_attn_backend,
+                cuda_graph_runner=self.draft_worker.cuda_graph_runner,
+                cuda_graph_runner_for_draft_extend=self.draft_worker.cuda_graph_runner_for_draft_extend,
+                target_attn_backend=self.target_worker.model_runner.attn_backend,
+                target_graph_runner=self.target_worker.model_runner.graph_runner,
+            ),
         )
 
         # Some dummy tensors
@@ -686,6 +711,138 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
+
+    def apply_runtime_state(self, state: SpecRuntimeState):
+        if (
+            self.speculative_num_steps == state.speculative_num_steps
+            and self.speculative_num_draft_tokens
+            == state.speculative_num_draft_tokens
+        ):
+            return
+
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        self.draft_worker.speculative_num_steps = state.speculative_num_steps
+        self.draft_worker.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+        self.draft_worker.cuda_graph_runner = state.cuda_graph_runner
+        self.draft_worker.cuda_graph_runner_for_draft_extend = (
+            state.cuda_graph_runner_for_draft_extend
+        )
+        self.draft_worker.draft_attn_backend = state.draft_attn_backend
+        self.draft_worker.draft_extend_attn_backend = state.draft_extend_attn_backend
+        self.draft_worker.draft_runner.draft_attn_backend = state.draft_attn_backend
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    @contextlib.contextmanager
+    def _override_worker_state(
+        self,
+        speculative_num_steps: Optional[int],
+        speculative_num_draft_tokens: int,
+    ):
+        sa = self.server_args
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.draft_worker.speculative_num_steps,
+            self.draft_worker.speculative_num_draft_tokens,
+            self.draft_worker.draft_attn_backend,
+            self.draft_worker.draft_extend_attn_backend,
+            getattr(self.draft_worker.draft_runner, "draft_attn_backend", None),
+            getattr(self.draft_worker, "cuda_graph_runner", None),
+            getattr(self.draft_worker, "cuda_graph_runner_for_draft_extend", None),
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+        )
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.draft_worker.speculative_num_steps = speculative_num_steps
+        self.draft_worker.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.draft_worker.speculative_num_steps,
+                self.draft_worker.speculative_num_draft_tokens,
+                self.draft_worker.draft_attn_backend,
+                self.draft_worker.draft_extend_attn_backend,
+                self.draft_worker.draft_runner.draft_attn_backend,
+                self.draft_worker.cuda_graph_runner,
+                self.draft_worker.cuda_graph_runner_for_draft_extend,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: Optional[int],
+        speculative_num_draft_tokens: int,
+    ) -> SpecRuntimeState:
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        with self._override_worker_state(
+            speculative_num_steps, speculative_num_draft_tokens
+        ):
+            with self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.draft_worker.init_attention_backend()
+                self.draft_worker.init_cuda_graphs()
+
+            target_model_runner = self.target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not self.server_args.disable_cuda_graph:
+                target_graph_runner = CudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+
+            state = SpecRuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                draft_attn_backend=self.draft_worker.draft_attn_backend,
+                draft_extend_attn_backend=self.draft_worker.draft_extend_attn_backend,
+                cuda_graph_runner=self.draft_worker.cuda_graph_runner,
+                cuda_graph_runner_for_draft_extend=self.draft_worker.cuda_graph_runner_for_draft_extend,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Built adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB"
+        )
+        return state
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (

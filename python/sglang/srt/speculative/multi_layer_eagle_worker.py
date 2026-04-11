@@ -14,6 +14,8 @@
 
 import logging
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -26,12 +28,18 @@ from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    maybe_init_adaptive_controller,
+    maybe_register_adaptive_state,
+)
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -67,6 +75,18 @@ if is_cuda():
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class MultiLayerSpecRuntimeState:
+    """Runtime state for EAGLE3 (multi-layer) workers."""
+
+    speculative_num_steps: int
+    speculative_num_draft_tokens: int
+    draft_extend_attn_backend_list: List[object] = field(default_factory=list)
+    cuda_graph_runner_for_draft_extend_list: List[object] = field(default_factory=list)
+    target_attn_backend: Optional[object] = None
+    target_graph_runner: Optional[object] = None
+
+
 class MultiLayerEagleWorker(TpModelWorker):
 
     def __init__(
@@ -94,6 +114,16 @@ class MultiLayerEagleWorker(TpModelWorker):
             server_args.speculative_algorithm
         )
         self.draft_extend_attn_backend_list = []
+        self.adaptive_candidate_steps = [
+            step for step in (1, 3, 7) if step <= self.speculative_num_steps
+        ]
+
+        # Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = (
+            maybe_init_adaptive_controller(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+        )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -188,6 +218,21 @@ class MultiLayerEagleWorker(TpModelWorker):
         ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
+            maybe_register_adaptive_state(
+                self,
+                MultiLayerSpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_extend_attn_backend_list=list(
+                        self.draft_extend_attn_backend_list
+                    ),
+                    cuda_graph_runner_for_draft_extend_list=list(
+                        self.cuda_graph_runner_for_draft_extend_list
+                    ),
+                    target_attn_backend=self.target_worker.model_runner.attn_backend,
+                    target_graph_runner=self.target_worker.model_runner.graph_runner,
+                )
+            )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -233,7 +278,130 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
 
-    def mtp_model_runner(self, layer_id: int) -> ModelRunner:
+    def apply_runtime_state(self, state: MultiLayerSpecRuntimeState):
+        """Apply a pre-built runtime state to this worker."""
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        logger.info(
+            "Switch adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        self.draft_extend_attn_backend_list = state.draft_extend_attn_backend_list
+        self.cuda_graph_runner_for_draft_extend_list = (
+            state.cuda_graph_runner_for_draft_extend_list
+        )
+        self.target_worker.model_runner.attn_backend = state.target_attn_backend
+        self.target_worker.model_runner.graph_runner = state.target_graph_runner
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> MultiLayerSpecRuntimeState:
+        """Build a MultiLayerSpecRuntimeState for the given step configuration."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        with self._override_worker_state(
+            speculative_num_steps, speculative_num_draft_tokens
+        ):
+            # Build per-layer draft extend backends
+            draft_extend_attn_backend_list = []
+            for step in range(speculative_num_steps):
+                draft_backend_factory = DraftBackendFactory(
+                    self.server_args,
+                    self.mtp_model_runner(step),
+                    self.topk,
+                    speculative_num_steps,
+                )
+                draft_extend_attn_backend_list.append(
+                    draft_backend_factory.create_draft_extend_backend()
+                )
+
+            # Temporarily apply so CUDA graph capture sees correct backends
+            self.draft_extend_attn_backend_list = draft_extend_attn_backend_list
+
+            # Capture per-layer draft extend CUDA graphs
+            cuda_graph_runner_for_draft_extend_list = []
+            if not self.server_args.disable_cuda_graph:
+                for step in range(speculative_num_steps):
+                    if draft_extend_attn_backend_list[step] and not _is_npu:
+                        cuda_graph_runner_for_draft_extend_list.append(
+                            MultiLayerEagleDraftExtendCudaGraphRunner(self, step)
+                        )
+
+            # Capture target CUDA graph
+            target_model_runner = self.target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not self.server_args.disable_cuda_graph:
+                target_graph_runner = CudaGraphRunner(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Built adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB"
+        )
+
+        return MultiLayerSpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            draft_extend_attn_backend_list=draft_extend_attn_backend_list,
+            cuda_graph_runner_for_draft_extend_list=cuda_graph_runner_for_draft_extend_list,
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+        )
+
+    @contextmanager
+    def _override_worker_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ):
+        """Temporarily override server_args and worker attributes for graph capture."""
+        sa = self.server_args
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.draft_extend_attn_backend_list,
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+        )
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.draft_extend_attn_backend_list,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup
+
+    def mtp_model_runner(self, layer_id: int) -> "ModelRunner":
         return self.model_runner_list[layer_id]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:

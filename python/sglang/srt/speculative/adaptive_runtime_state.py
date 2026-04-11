@@ -50,8 +50,12 @@ class AdaptiveController:
     def __init__(self, worker: AdaptiveSpecWorker, config_path: Optional[str] = None):
         self.worker = worker
         cfg = load_adaptive_config(config_path)
+        default_candidate_steps = getattr(worker, "adaptive_candidate_steps", None)
+        if default_candidate_steps is not None and "candidate_steps" not in cfg:
+            cfg = {**cfg, "candidate_steps": default_candidate_steps}
+        initial_value = getattr(worker, "adaptive_initial_value", worker.speculative_num_steps)
         self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
+            initial_steps=initial_value,
             config=cfg,
         )
         self._states: Dict[int, Any] = {}
@@ -59,6 +63,10 @@ class AdaptiveController:
     @property
     def candidate_steps(self):
         return self.params.candidate_steps
+
+    @property
+    def states(self) -> Dict[int, Any]:
+        return self._states
 
     def register(self, state: Any, steps: Optional[int] = None):
         """Register a pre-built runtime state.
@@ -68,16 +76,25 @@ class AdaptiveController:
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
 
+    def _get_runtime_params(self, key: int) -> tuple[int, int]:
+        resolver = getattr(self.worker, "get_adaptive_runtime_params", None)
+        if resolver is not None:
+            return resolver(key)
+        return key, key + 1
+
     def init_states(self):
         """Build and register runtime states for all candidate steps."""
-        for steps in self.params.candidate_steps:
-            if steps in self._states:
+        for key in self.params.candidate_steps:
+            if key in self._states:
                 continue
-            state = self.worker.build_adaptive_runtime_state(
-                speculative_num_steps=steps,
-                speculative_num_draft_tokens=steps + 1,
+            speculative_num_steps, speculative_num_draft_tokens = (
+                self._get_runtime_params(key)
             )
-            self._states[steps] = state
+            state = self.worker.build_adaptive_runtime_state(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+            self._states[key] = state
         self._activate(self.params.current_steps)
 
     def on_verify_complete(self, accept_lengths: List[int]) -> None:
@@ -92,3 +109,32 @@ class AdaptiveController:
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
         self.worker.apply_runtime_state(state)
+
+
+def maybe_init_adaptive_controller(
+    worker: AdaptiveSpecWorker, config_path: Optional[str] = None
+) -> Optional[AdaptiveController]:
+    if not getattr(worker.server_args, "speculative_adaptive", False):
+        worker.adaptive_controller = None
+        return None
+
+    candidate_steps = getattr(worker, "adaptive_candidate_steps", None)
+    if candidate_steps is not None and len(set(candidate_steps)) < 2:
+        logger.warning(
+            "Disabling speculative_adaptive because fewer than 2 adaptive "
+            f"candidates are available: {candidate_steps}"
+        )
+        worker.adaptive_controller = None
+        return None
+
+    worker.adaptive_controller = AdaptiveController(worker, config_path=config_path)
+    return worker.adaptive_controller
+
+
+def maybe_register_adaptive_state(worker: AdaptiveSpecWorker, state: Any) -> None:
+    controller = getattr(worker, "adaptive_controller", None)
+    if controller is None:
+        return
+
+    controller.register(state, steps=getattr(worker, "adaptive_initial_value", None))
+    controller.init_states()

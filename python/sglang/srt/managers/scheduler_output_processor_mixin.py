@@ -391,6 +391,19 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
+            if batch.is_spec_v2:
+                assert result.accept_lens is not None and result.accept_lens.is_cpu
+                result.accept_length_per_req_cpu = [x - 1 for x in result.accept_lens.tolist()]
+                result.num_accepted_tokens = sum(result.accept_length_per_req_cpu)
+            elif result.accept_length_per_req_cpu is None and result.accept_lens is not None:
+                assert result.accept_lens.is_cpu
+                result.accept_length_per_req_cpu = result.accept_lens.tolist()
+
+            if result.accept_length_per_req_cpu:
+                draft_worker = getattr(self, "draft_worker", None)
+                controller = getattr(draft_worker, "adaptive_controller", None)
+                if controller is not None:
+                    controller.on_verify_complete(result.accept_length_per_req_cpu)
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -544,7 +557,10 @@ class SchedulerOutputProcessorMixin:
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                    != (
+                        actual_seq_len
+                        - result.accept_length_per_req_cpu[i]
+                    )
                     // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (
