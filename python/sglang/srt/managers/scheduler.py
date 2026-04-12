@@ -1,3 +1,1002 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""A scheduler that manages a tensor parallel GPU worker."""
+
+import faulthandler
+import logging
+import os
+import signal
+import sys
+import time
+from collections import deque
+from contextlib import nullcontext
+from dataclasses import dataclass
+from http import HTTPStatus
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
+
+import psutil
+import setproctitle
+import torch
+import torch.distributed
+import zmq
+from torch.cuda import Stream as CudaStream
+from torch.distributed import barrier
+
+from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    DecodeTransferQueue,
+    SchedulerDisaggregationDecodeMixin,
+)
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
+from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.prefill import (
+    PrefillBootstrapQueue,
+    SchedulerDisaggregationPrefillMixin,
+    release_req_to_metadata_buffer,
+)
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    MetadataBuffers,
+    ReqToMetadataIdxAllocator,
+    TransferBackend,
+    prepare_abort,
+)
+from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.attention.mamba.ops import (
+    initialize_mamba_selective_state_update_backend,
+)
+from sglang.srt.layers.dp_attention import (
+    compute_dp_attention_world_info,
+    get_attention_cp_group,
+    get_attention_tp_group,
+)
+from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    ActiveRanksOutput,
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
+    BaseBatchReq,
+    BaseReq,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    CheckWeightsReqInput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
+    CloseSessionReqInput,
+    ContinueGenerationReqInput,
+    DestroyWeightsUpdateGroupReqInput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
+    FreezeGCReq,
+    GetInternalStateReq,
+    GetInternalStateReqOutput,
+    GetLoadReqInput,
+    GetLoadsReqInput,
+    GetWeightsByNameReqInput,
+    HealthCheckOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
+    OpenSessionReqInput,
+    PauseGenerationReqInput,
+    ProfileReq,
+    ReleaseMemoryOccupationReqInput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
+    ResumeMemoryOccupationReqInput,
+    RpcReqInput,
+    RpcReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
+    SlowDownReqInput,
+    SlowDownReqOutput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
+from sglang.srt.managers.mm_utils import (
+    has_shm_features,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.prefill_delayer import (
+    PrefillDelayer,
+    PrefillDelayerSinglePassExecutor,
+)
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ModelWorkerBatch,
+    MultimodalInputs,
+    Req,
+    ScheduleBatch,
+)
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
+from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
+from sglang.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
+from sglang.srt.managers.scheduler_runtime_checker_mixin import (
+    SchedulerRuntimeCheckerMixin,
+    create_scheduler_watchdog,
+)
+from sglang.srt.managers.scheduler_update_weights_mixin import (
+    SchedulerUpdateWeightsMixin,
+)
+from sglang.srt.managers.session_controller import SessionController
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability.req_time_stats import (
+    real_time,
+    set_schedule_time_batch,
+    set_time_batch,
+)
+from sglang.srt.observability.scheduler_metrics_mixin import (
+    RECORD_STEP_TIME,
+    PrefillStats,
+    SchedulerMetricsMixin,
+)
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import (
+    DynamicGradMode,
+    broadcast_pyobj,
+    configure_gc_logger,
+    configure_logger,
+    freeze_gc,
+    get_available_gpu_memory,
+    get_bool_env_var,
+    get_int_env_var,
+    is_mps,
+    kill_itself_when_parent_died,
+    point_to_point_pyobj,
+    require_mlp_sync,
+    set_gpu_proc_affinity,
+    set_random_seed,
+    suppress_other_loggers,
+)
+from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.tensor_bridge import use_mlx
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
+if is_mps():
+    CudaStreamContext = nullcontext
+else:
+    from torch.cuda import StreamContext as CudaStreamContext
+
+logger = logging.getLogger(__name__)
+
+# Test retract decode for debugging purposes
+TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
+TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
+TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
+
+_is_npu = is_npu()
+
+
+@dataclass
+class EmbeddingBatchResult:
+    embeddings: torch.Tensor
+    copy_done: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self):
+        """Copy embeddings tensor to CPU in overlap scheduling."""
+
+        if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [
+                emb.to("cpu", non_blocking=True) for emb in self.embeddings
+            ]
+
+        self.copy_done.record()
+
+
+class Scheduler(
+    SchedulerOutputProcessorMixin,
+    SchedulerUpdateWeightsMixin,
+    SchedulerProfilerMixin,
+    SchedulerMetricsMixin,
+    SchedulerDisaggregationDecodeMixin,
+    SchedulerDisaggregationPrefillMixin,
+    SchedulerMultiplexMixin,
+    SchedulerRuntimeCheckerMixin,
+    SchedulerPPMixin,
+    SchedulerDPAttnMixin,
+    SchedulerDllmMixin,
+):
+    """A scheduler that manages a tensor parallel GPU worker."""
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        moe_ep_rank: int,
+        pp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
+        dp_rank: Optional[int],
+    ):
+        self.is_initializing = True
+        self.init_soft_watchdog(server_args)
+
+        # Parse args
+        self.server_args = server_args
+        self.tp_rank = tp_rank
+        self.moe_ep_rank = moe_ep_rank
+        self.pp_rank = pp_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dp_rank = moe_dp_rank
+        self.moe_dp_size = server_args.moe_dp_size
+        self.dp_rank = dp_rank
+        self.tp_size = server_args.tp_size
+        self.moe_ep_size = server_args.ep_size
+        self.pp_size = server_args.pp_size
+        self.dp_size = server_args.dp_size
+        self.nccl_port = port_args.nccl_port
+        self.schedule_policy = server_args.schedule_policy
+        self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.abort_on_priority_when_disabled = (
+            server_args.abort_on_priority_when_disabled
+        )
+        self.schedule_low_priority_values_first = (
+            server_args.schedule_low_priority_values_first
+        )
+        self.priority_scheduling_preemption_threshold = (
+            server_args.priority_scheduling_preemption_threshold
+        )
+        self.enable_lora = server_args.enable_lora
+        self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
+        self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_pdmux = server_args.enable_pdmux
+        self.skip_tokenizer_init = server_args.skip_tokenizer_init
+        self.stream_interval = server_args.stream_interval
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
+        self.gpu_id = gpu_id
+        self.page_size = server_args.page_size
+        self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.enable_hisparse = server_args.enable_hisparse
+        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+        # Distributed rank info
+        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+            compute_dp_attention_world_info(
+                server_args.enable_dp_attention,
+                self.tp_rank,
+                self.tp_size,
+                self.dp_size,
+                self.attn_cp_size,
+            )
+        )
+
+        self.enable_kv_cache_events = bool(
+            server_args.kv_events_config and self.attn_tp_rank == 0
+        )
+
+        # Init model configs
+        self.init_model_config()
+
+        # Init metrics stats
+        self.init_metrics(tp_rank, pp_rank, dp_rank)
+
+        # Init inter-process communication
+        self.init_ipc_channels(port_args)
+
+        # Init PD-multiplexing context
+        if self.enable_pdmux:
+            self.init_pdmux()
+
+        # Init tokenizer
+        self.init_tokenizer()
+
+        # Init moe config and GEMM config (FP8 GEMM, etc.)
+        self.init_moe_gemm_config()
+
+        # Init mamba backend
+        self.init_mamba_backend()
+
+        # Launch a model worker and draft model worker if using speculative decoding
+        self.init_model_worker()
+
+        if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
+            time.sleep(t)
+
+        # Init cache and memory pool
+        self.init_cache_with_memory_pool()
+
+        # Init running status
+        self.init_running_status()
+
+        # Init chunked prefill
+        self.init_chunked_prefill()
+
+        # Init diffusion LLM
+        self.init_diffusion_llm()
+
+        # Init schedule policy and new token estimation
+        self.init_schedule_policy()
+
+        # Init watchdog, memory saver, input blocker and recv skipper
+        self.init_watch_dog_memory_saver_input_blocker()
+
+        # Init profiler
+        self.init_profiler()
+
+        # Init prefill-decodedisaggregation
+        self.init_disaggregation()
+
+        # Init overlap schedule
+        self.init_overlap()
+
+        # Init Ngram Embedding
+        self.maybe_init_ngram_embedding()
+
+        # Init prefill kv split size when deterministic inference is enabled with various attention backends
+        self.init_deterministic_inference_config()
+
+        # Init request dispatcher
+        self.init_request_dispatcher()
+
+        # Init LoRA overlap loader
+        if self.enable_lora_overlap_loading:
+            self.lora_overlap_loader = LoRAOverlapLoader(
+                self.tp_worker.model_runner.lora_manager
+            )
+
+        # Init the grammar backend for constrained generation
+        self.grammar_manager = GrammarManager(self)
+
+        self.is_initializing = False
+
+    def init_model_config(self):
+        self.model_config = ModelConfig.from_server_args(self.server_args)
+        if _is_npu:
+            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
+            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
+            from sglang.srt.dllm.config import DllmConfig
+
+            self.dllm_config = (  # For diffusion LLM
+                DllmConfig.from_server_args(self.server_args)
+                if self.server_args.dllm_algorithm is not None
+                else None
+            )
+            if self.dllm_config:
+                if self.dllm_config.block_size < self.page_size:
+                    logger.warning(
+                        "WARNING: "
+                        f"The page size {self.page_size} should not be larger than dllm block size {self.dllm_config.block_size}."
+                        f"Page size now falls back to {self.dllm_config.block_size}"
+                    )
+                    self.page_size = self.dllm_config.block_size
+
+    def init_ipc_channels(self, port_args: PortArgs):
+        context = zmq.Context(2)
+        self.idle_sleeper = None
+
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.recv_from_rpc = get_zmq_socket(
+                context, zmq.DEALER, port_args.rpc_ipc_name, False
+            )
+
+            send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+            if self.server_args.skip_tokenizer_init:
+                # Directly send to the TokenizerManager
+                send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                )
+            else:
+                # Send to the DetokenizerManager
+                send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
+                )
+
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
+        else:
+            self.recv_from_tokenizer = None
+            self.recv_from_rpc = None
+            self.send_to_tokenizer = SenderWrapper(None)
+            self.send_to_detokenizer = SenderWrapper(None)
+
+        if self.current_scheduler_metrics_enabled:
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
+
+    def init_tokenizer(self):
+        server_args = self.server_args
+        self.is_generation = self.model_config.is_generation
+
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = self.processor = None
+        else:
+            if self.model_config.is_multimodal:
+                self.processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
+                )
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+
+        # Load multimodal processor for M-RoPE fallback computation.
+        self._mm_processor = None
+        if self.model_config.is_multimodal and self.processor is not None:
+            try:
+                import_processors("sglang.srt.multimodal.processors")
+                self._mm_processor = get_mm_processor(
+                    self.model_config.hf_config,
+                    server_args,
+                    self.processor,
+                    "default",
+                    skip_mm_pool=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load multimodal processor in scheduler; "
+                    "M-RoPE fallback will not be available."
+                )
+
+        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        if self.server_args.reasoning_parser and self.tokenizer:
+            reasoning_parser = ReasoningParser(
+                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+            )
+            self.model_config.think_end_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            )[0]
+
+    def init_mamba_backend(self) -> None:
+        initialize_mamba_selective_state_update_backend(self.server_args)
+
+    def init_moe_gemm_config(self):
+        # For the MM models, check the text_config for MoE settings
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+
+        if hasattr(config_to_check, "num_experts_per_tok"):
+            initialize_moe_config(self.server_args)
+
+        # Initialize GEMM-related configuration for FP8 and FP4 backends.
+        initialize_fp8_gemm_config(self.server_args)
+        initialize_fp4_gemm_config(self.server_args)
+
+        # This must be called after initialize_moe_config
+        self.require_mlp_sync = require_mlp_sync(self.server_args)
+
+    def init_tp_model_worker(self):
+
+        worker_kwargs = dict(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            pp_rank=self.pp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+            dp_rank=self.dp_rank,
+            nccl_port=self.nccl_port,
+        )
+
+        # FIXME: move tp worker's init logic outside of the scheduler.
+        if use_mlx():
+            from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+            self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        else:
+            from sglang.srt.managers.tp_worker import TpModelWorker
+
+            self.tp_worker = TpModelWorker(**worker_kwargs)
+
+    def maybe_init_draft_worker(self):
+        if self.spec_algorithm.is_none():
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
+        # Launch a draft worker for speculative decoding
+        draft_worker_kwargs = dict(
+            server_args=self.server_args,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            nccl_port=self.nccl_port,
+            target_worker=self.tp_worker,
+            dp_rank=self.dp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_dp_rank=self.moe_dp_rank,
+        )
+
+        if self.server_args.speculative_draft_load_format is not None:
+            self.server_args.load_format = (
+                self.server_args.speculative_draft_load_format
+            )
+            logger.info(
+                f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
+            )
+
+        DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+        self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.external_corpus_manager import (
+                ExternalCorpusManager,
+            )
+
+            self.external_corpus_manager = ExternalCorpusManager(
+                self.draft_worker,
+                self.send_to_tokenizer.send_output,
+            )
+        else:
+            self.external_corpus_manager = None
+
+    def init_model_worker(self):
+        self.init_tp_model_worker()
+        self.maybe_init_draft_worker()
+
+        # Dispatch the model worker
+        if self.spec_algorithm.is_none():
+            self.model_worker = self.tp_worker
+        else:
+            self.model_worker = self.draft_worker
+
+        # Get token and memory info from the model worker
+        (
+            self.max_total_num_tokens,
+            self.max_prefill_tokens,
+            self.max_running_requests,
+            self.max_queued_requests,
+            self.max_req_len,
+            self.max_req_input_len,
+            self.random_seed,
+            self.device,
+            self.forward_stream,
+            _,
+            _,
+            _,
+        ) = self.tp_worker.get_worker_info()
+        if get_global_server_args().pp_max_micro_batch_size is None:
+            get_global_server_args().pp_max_micro_batch_size = max(
+                self.max_running_requests // self.pp_size, 1
+            )
+
+        self.tp_group = get_tp_group()
+        self.tp_cpu_group = self.tp_group.cpu_group
+        self.attn_tp_group = get_attention_tp_group()
+        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
+        self.pp_group = get_pp_group()
+        self.world_group = get_world_group()
+
+        # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
+        # When DP attention is enabled, scope to the attention-TP group; otherwise use
+        # the base TP group. Entry rank is the local rank 0 in that group.
+        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
+        # stream/device coupling (#11910).
+        self.dp_tp_group = (
+            self.attn_tp_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group
+        )
+        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
+
+        self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
+        set_random_seed(self.random_seed)
+
+        # Print debug info
+        if self.tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.gpu_id, empty_cache=False
+            )
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}, "
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+            )
+
+        if self.enable_metrics and hasattr(self, "metrics_collector"):
+            self.metrics_collector.emit_cache_config_info(
+                self.page_size, self.max_total_num_tokens // self.page_size
+            )
+
+    def init_cache_with_memory_pool(self):
+        server_args = self.server_args
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
+
+        # Hybrid memory pool
+        self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
+        self.is_hybrid_ssm = (
+            self.tp_worker.model_runner.hybrid_gdn_config is not None
+            or self.tp_worker.model_runner.mamba2_config is not None
+        )
+
+        self.sliding_window_size = None
+        if self.is_hybrid_swa:
+            self.sliding_window_size = self.tp_worker.sliding_window_size
+            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
+                self.tp_worker.get_tokens_per_layer_info()
+            )
+
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self.tp_worker.get_memory_pool()
+        )
+
+        self.disable_radix_cache = server_args.disable_radix_cache or (
+            self.model_config.is_multimodal and uses_transformers_backend
+        )
+        if self.disable_radix_cache and not server_args.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled for multimodal models with the "
+                "Transformers backend to avoid multimodal prefix-cache mismatches."
+            )
+
+        effective_chunked_prefill_size = server_args.chunked_prefill_size
+        if self.model_config.is_multimodal and uses_transformers_backend:
+            effective_chunked_prefill_size = None
+
+        params = CacheInitParams(
+            disable=self.disable_radix_cache,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=self.page_size,
+            is_eagle=self.spec_algorithm.is_eagle(),
+            tp_cache_group=(
+                self.attn_tp_cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_cpu_group
+            ),
+            eviction_policy=server_args.radix_eviction_policy,
+            enable_metrics=self.enable_metrics,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+            enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            chunked_prefill_size=effective_chunked_prefill_size,
+            sliding_window_size=self.sliding_window_size,
+        )
+
+        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
+            if not self.is_hybrid_swa:
+                from sglang.srt.mem_cache.chunk_cache import ChunkCache
+
+                self.tree_cache = ChunkCache(params)
+            else:
+                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
+                self.tree_cache = SWAChunkCache(params)
+        else:
+
+            if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+                # lazy import to avoid JIT overhead
+                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+
+                logger.info("Using experimental C++ radix tree implementation.")
+                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
+            elif self.enable_hierarchical_cache:
+                if self.is_hybrid_ssm:
+                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
+                        HiMambaRadixCache,
+                    )
+
+                    self.tree_cache = HiMambaRadixCache(
+                        params=params, server_args=server_args
+                    )
+                else:
+                    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                    self.tree_cache = HiRadixCache(
+                        params=params, server_args=server_args
+                    )
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
+            elif self.is_hybrid_swa:
+                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+
+                self.tree_cache = SWARadixCache(params=params)
+            elif self.is_hybrid_ssm:
+                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+                self.tree_cache = MambaRadixCache(params)
+            elif server_args.enable_lmcache:
+                from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
+                    LMCRadixCache,
+                )
+
+                self.tree_cache = LMCRadixCache(
+                    params=params,
+                    model_config=self.model_config,
+                    tp_size=self.tp_size,
+                    rank=self.tp_rank,
+                    tp_group=self.tp_group,
+                )
+            else:
+                self.tree_cache = RadixCache(params)
+
+        if server_args.enable_streaming_session:
+            self.tree_cache = SessionAwareCache(self.tree_cache)
+
+        if self.enable_hisparse:
+            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if (
+            server_args.disaggregation_mode == "decode"
+            and server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=params.tp_cache_group,
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
+
+        embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def init_running_status(self):
+        self.waiting_queue: List[Req] = []
+        # The running decoding batch for continuous batching
+        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # The current forward batch
+        self.cur_batch: Optional[ScheduleBatch] = None
+        # The last forward batch
+        self.last_batch: Optional[ScheduleBatch] = None
+        self.forward_ct = 0
+        self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
+        self.num_retracted_reqs: int = 0
+        self.num_paused_reqs: int = 0
+        self.session_controller = SessionController(self.tree_cache)
+        self.forward_sleep_time = None
+        self._engine_paused = False
+
+    def init_chunked_prefill(self):
+        self.chunked_prefill_size = self.server_args.chunked_prefill_size
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
+        if (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+            and self.model_config.is_multimodal
+            and uses_transformers_backend
+        ):
+            logger.warning(
+                "Chunked prefill is disabled for multimodal models with the "
+                "Transformers backend to avoid partial multimodal chunk mismatches."
+            )
+            self.chunked_prefill_size = None
+        elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
+            self.chunked_prefill_size = None
+        self.chunked_req = None
+        self.is_mixed_chunk = (
+            self.chunked_prefill_size is not None
+            and self.server_args.enable_mixed_chunk
+        )
+
+        # Init the dynamic chunking predictor for PP
+        self.enable_dynamic_chunking = (
+            self.server_args.enable_dynamic_chunking and self.pp_size > 1
+        )
+        if self.enable_dynamic_chunking:
+            try:
+                self.profile_and_init_predictor()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
+
+    def init_schedule_policy(self):
+        # Init schedule policy and new token estimation
+        self.policy = SchedulePolicy(
+            self.schedule_policy,
+            self.tree_cache,
+            self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
+        )
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+        self.max_prefill_bs: int = 0
+        if self.server_args.enable_prefill_delayer:
+            self.prefill_delayer = PrefillDelayer(
+                dp_size=self.dp_size,
+                attn_tp_size=self.attn_tp_size,
+                cpu_group=self.tp_cpu_group,
+                server_args=self.server_args,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
+                max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
+                token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
+                device=(
+                    self.tp_group.device
+                    if self.server_args.disable_overlap_schedule
+                    else "cpu"
+                ),
+            )
+
+        # NOTE: preemption is enabled by default for priority scheduling.
+        self.enable_priority_preemption = (
+            self.enable_priority_scheduling
+            and not self.server_args.disable_priority_preemption
+        )
+
+        self.init_new_token_ratio = min(
+            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
+            * self.server_args.schedule_conservativeness,
+            1.0,
+        )
+        self.min_new_token_ratio = min(
+            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
+            1.0,
+        )
+        self.new_token_ratio_decay = (
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
+        self.new_token_ratio = self.init_new_token_ratio
+
+    def init_soft_watchdog(self, server_args: ServerArgs):
+        if (x := server_args.soft_watchdog_timeout) is not None:
+            self.soft_watchdog = create_scheduler_watchdog(
+                self, watchdog_timeout=x, soft=True
+            )
+
+    def init_watch_dog_memory_saver_input_blocker(self):
+        # Start watchdog thread
+        self.watchdog = create_scheduler_watchdog(
+            self, watchdog_timeout=self.server_args.watchdog_timeout
+        )
+
+        # Init memory saver, profiler and metric stats
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
+        )
+        self.offload_tags = set()
+
+        # Init recv skipper and input blocker
+        self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
+        self.input_blocker = (
+            SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
+            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            else None
+        )
+
+        # Configure GC logger
+        if envs.SGLANG_LOG_GC.get():
+            configure_gc_logger()
+
+    def init_disaggregation(self):
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
 
@@ -2627,26 +3626,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    # Patch FlashInfer's check_cuda_arch to support sm_120 (desktop Blackwell, e.g. RTX 5090).
-    # FlashInfer 0.6.x JIT does not recognize sm_120 and raises RuntimeError.
-    try:
-        import flashinfer.jit.core as _flashinfer_jit_core
-
-        _orig_check = _flashinfer_jit_core.check_cuda_arch
-
-        def _patched_check_cuda_arch():
-            import torch
-
-            if torch.cuda.is_available():
-                major, _ = torch.cuda.get_device_capability()
-                if major >= 12:
-                    return
-            _orig_check()
-
-        _flashinfer_jit_core.check_cuda_arch = _patched_check_cuda_arch
-    except (ImportError, AttributeError):
-        pass
-
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
