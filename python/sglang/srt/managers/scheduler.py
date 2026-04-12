@@ -3626,6 +3626,26 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Patch FlashInfer check_cuda_arch for sm_120 (desktop Blackwell, e.g. RTX 5090).
+    # FlashInfer 0.6.x JIT does not recognize sm_120 and raises RuntimeError.
+    try:
+        import flashinfer.jit.core as _fi_jit
+
+        _orig_check = _fi_jit.check_cuda_arch
+
+        def _patched_check():
+            import torch
+
+            if torch.cuda.is_available():
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 12:
+                    return
+            _orig_check()
+
+        _fi_jit.check_cuda_arch = _patched_check
+    except (ImportError, AttributeError):
+        pass
+
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
