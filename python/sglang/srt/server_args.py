@@ -514,6 +514,9 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_draft_model_explicit_unquant: bool = dataclasses.field(
+        default=False, init=False
+    )
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -1036,9 +1039,12 @@ class ServerArgs:
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
-        if self.speculative_draft_model_quantization is None:
+        if self.speculative_draft_model_explicit_unquant:
+            self.speculative_draft_model_quantization = None
+        elif self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
         elif self.speculative_draft_model_quantization == "unquant":
+            self.speculative_draft_model_explicit_unquant = True
             self.speculative_draft_model_quantization = None
 
     def _handle_modelscope_paths(self):
@@ -6353,7 +6359,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self, port: Optional[int] = None):

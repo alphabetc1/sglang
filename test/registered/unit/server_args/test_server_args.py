@@ -48,6 +48,28 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestSpeculativeDraftQuantization(unittest.TestCase):
+    def test_explicit_unquant_sets_internal_flag(self):
+        with patch.object(ServerArgs, "_handle_modelscope_paths", autospec=True):
+            server_args = ServerArgs(
+                model_path="dummy", speculative_draft_model_quantization="unquant"
+            )
+            server_args._handle_missing_default_values()
+            self.assertIsNone(server_args.speculative_draft_model_quantization)
+            self.assertTrue(server_args.speculative_draft_model_explicit_unquant)
+
+    def test_explicit_unquant_survives_repeated_default_handling(self):
+        with patch.object(ServerArgs, "_handle_modelscope_paths", autospec=True):
+            server_args = ServerArgs(
+                model_path="dummy",
+                quantization="compressed-tensors",
+                speculative_draft_model_quantization="unquant",
+            )
+            server_args._handle_missing_default_values()
+            self.assertIsNone(server_args.speculative_draft_model_quantization)
+            self.assertTrue(server_args.speculative_draft_model_explicit_unquant)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

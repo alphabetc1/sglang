@@ -41,6 +41,17 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
+def resolve_glm4_nextn_draft_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Keep auto-detected quantization unless the user explicitly forces unquant."""
+
+    server_args = get_global_server_args()
+    if getattr(server_args, "speculative_draft_model_explicit_unquant", False):
+        return None
+    return quant_config
+
+
 class Glm4MoeModelNextN(nn.Module):
     def __init__(
         self,
@@ -128,10 +139,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.needs_quant_draft = (
-            get_global_server_args().speculative_draft_model_quantization
-        )
-        quant_config = quant_config if self.needs_quant_draft else None
+        quant_config = resolve_glm4_nextn_draft_quant_config(quant_config)
+        self.needs_quant_draft = quant_config is not None
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
