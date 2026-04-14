@@ -1,4 +1,4 @@
-name: Nightly Perf Regression (GB200)
+name: Nightly Test (GB200 72GPU)
 
 # NOTE: This workflow is intentionally cron-only.
 # It must NOT be triggered manually (no workflow_dispatch) to prevent
@@ -6,6 +6,7 @@ name: Nightly Perf Regression (GB200)
 on:
   schedule:
     - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
+  workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
 
 concurrency:
   group: nightly-test-gb200
@@ -47,7 +48,8 @@ jobs:
   prepare-image:
     needs: setup
     if: github.repository == 'sgl-project/sglang'
-    runs-on: gb200
+    environment: gb200-ci
+    runs-on: 72-gpu-gb200
     outputs:
       squash_file: ${{ steps.import.outputs.squash_file }}
       nginx_squash_file: ${{ steps.import.outputs.nginx_squash_file }}
@@ -79,7 +81,7 @@ jobs:
   nightly-gb200-benchmark:
     needs: [setup, prepare-image]
     if: github.repository == 'sgl-project/sglang'
-    runs-on: gb200
+    runs-on: 72-gpu-gb200
     strategy:
       fail-fast: false
       matrix:
