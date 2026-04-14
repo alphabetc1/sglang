@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    build_nsa_hybrid_stack,
+    build_hiradix_hybrid_stack,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -96,6 +96,8 @@ class HiRadixCache(RadixCache):
                 "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
             )
 
+        self.draft_kv_pool_host = None
+
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
@@ -120,8 +122,10 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            build_nsa_hybrid_stack(
+        if isinstance(self.kv_cache, NSATokenToKVPool) or (
+            params.draft_token_to_kv_pool is not None
+        ):
+            build_hiradix_hybrid_stack(
                 self,
                 params,
                 server_args,
@@ -612,14 +616,22 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
+        pools = []
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pool = PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
             )
-            return {"extra_pools": [pool]}
-        else:
-            return {}
+        if self.draft_kv_pool_host is not None:
+            pools.append(
+                PoolTransfer(
+                    name=PoolName.DRAFT,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                )
+            )
+        return {"extra_pools": pools} if pools else {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
         """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""

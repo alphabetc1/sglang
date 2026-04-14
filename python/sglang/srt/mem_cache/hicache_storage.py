@@ -42,6 +42,7 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     INDEXER = "indexer"
+    DRAFT = "draft"
 
 
 class PoolHitPolicy(str, Enum):

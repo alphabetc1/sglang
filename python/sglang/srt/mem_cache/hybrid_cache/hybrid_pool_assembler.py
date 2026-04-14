@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_nsa_hybrid_stack(
+def build_hiradix_hybrid_stack(
     radix_cache: "HiRadixCache",
     params: "CacheInitParams",
     server_args: "ServerArgs",
@@ -35,49 +35,106 @@ def build_nsa_hybrid_stack(
     enable_storage_metrics: bool,
     load_cache_event,
 ) -> None:
-    """HostPoolGroup (KV + indexer) + HybridCacheController for NSA (DSA)."""
+    """HostPoolGroup + HybridCacheController for NSA and/or speculative draft."""
     try:
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+            NSATokenToKVPool,
+        )
+
         kv = radix_cache.kv_cache
-        mla_host = MLATokenToKVPoolHost(
-            kv,
-            server_args.hicache_ratio,
-            server_args.hicache_size,
-            radix_cache.page_size,
-            server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-            override_kv_cache_dim=kv.kv_cache_dim,
-        )
-        indexer_host = NSAIndexerPoolHost(
-            kv,
-            mla_host,
-            server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-        )
         layer_num = kv.layer_num
+
+        # --- KV anchor host pool ---
+        if isinstance(kv, NSATokenToKVPool):
+            kv_host = MLATokenToKVPoolHost(
+                kv,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                radix_cache.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+                override_kv_cache_dim=kv.kv_cache_dim,
+            )
+        else:
+            # MHA / MLA: already created by HiRadixCache.__init__
+            kv_host = radix_cache.token_to_kv_pool_host
 
         def layer_mapper(layer_id: int):
             if 0 <= layer_id < layer_num:
                 return layer_id
             return None
 
-        host_pool_group = HostPoolGroup(
-            [
-                PoolEntry(
-                    name=PoolName.KV,
-                    host_pool=mla_host,
-                    device_pool=kv,
-                    layer_mapper=layer_mapper,
-                    is_primary_index_anchor=True,
-                ),
+        entries = [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=kv_host,
+                device_pool=kv,
+                layer_mapper=layer_mapper,
+                is_primary_index_anchor=True,
+            ),
+        ]
+
+        # --- NSA/DSA indexer sidecar ---
+        if isinstance(kv, NSATokenToKVPool):
+            indexer_host = NSAIndexerPoolHost(
+                kv,
+                kv_host,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+            entries.append(
                 PoolEntry(
                     name=PoolName.INDEXER,
                     host_pool=indexer_host,
                     device_pool=kv,
                     layer_mapper=layer_mapper,
                     share_indices_with_anchor=True,
-                ),
-            ]
-        )
+                )
+            )
+
+        # --- Speculative draft KV sidecar ---
+        transfer_layer_num = layer_num
+        draft_pool = params.draft_token_to_kv_pool
+        if draft_pool is not None:
+            if isinstance(draft_pool, HybridLinearKVPool):
+                draft_pool = draft_pool.full_kv_pool
+            draft_kw = dict(
+                host_to_device_ratio=kv_host.size / draft_pool.size,
+                host_size=0,
+                page_size=radix_cache.page_size,
+                layout=server_args.hicache_mem_layout,
+            )
+            if isinstance(draft_pool, MLATokenToKVPool):
+                draft_host = MLATokenToKVPoolHost(draft_pool, **draft_kw)
+            elif isinstance(draft_pool, MHATokenToKVPool):
+                draft_host = MHATokenToKVPoolHost(draft_pool, **draft_kw)
+            else:
+                raise ValueError(
+                    f"Draft pool type {type(draft_pool).__name__} not supported"
+                )
+            draft_layer_num = draft_pool.layer_num
+            transfer_layer_num = max(layer_num, draft_layer_num)
+
+            def draft_layer_mapper(layer_id: int):
+                if 0 <= layer_id < draft_layer_num:
+                    return layer_id
+                return None
+
+            entries.append(
+                PoolEntry(
+                    name=PoolName.DRAFT,
+                    host_pool=draft_host,
+                    device_pool=draft_pool,
+                    layer_mapper=draft_layer_mapper,
+                    share_indices_with_anchor=True,
+                )
+            )
+            radix_cache.draft_kv_pool_host = draft_host
+
+        host_pool_group = HostPoolGroup(entries)
         cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
             host_pool_group,
@@ -92,19 +149,25 @@ def build_nsa_hybrid_stack(
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
-            transfer_layer_num=layer_num,
+            transfer_layer_num=transfer_layer_num,
             enable_storage_metrics=enable_storage_metrics,
         )
-        radix_cache.full_kv_pool_host = mla_host
+        radix_cache.full_kv_pool_host = kv_host
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
+        if draft_pool is not None:
+            draft_pool.register_layer_transfer_counter(
+                cache_controller.layer_done_counter
+            )
+        pool_names = [e.name.value.upper() for e in entries]
         logger.info(
-            "Hybrid hierarchical cache: HostPoolGroup(KV + INDEXER), HybridCacheController, "
+            "Hybrid hierarchical cache: HostPoolGroup(%s), HybridCacheController, "
             "transfer_layer_num=%s",
-            layer_num,
+            " + ".join(pool_names),
+            transfer_layer_num,
         )
     except Exception:
-        logger.exception("build_nsa_hybrid_stack failed")
+        logger.exception("build_hiradix_hybrid_stack failed")
         raise
 
 
