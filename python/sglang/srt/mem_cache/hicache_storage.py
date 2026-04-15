@@ -301,10 +301,17 @@ class HiCacheFile(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
-    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+    def _get_component_key(
+        self, key: str, component_name: Optional[str | PoolName] = None
+    ) -> str:
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+        component_suffix = (
+            component_name.value
+            if isinstance(component_name, PoolName)
+            else component_name
+        )
+        return self._get_suffixed_key(f"{key}.{component_suffix}")
 
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
@@ -449,8 +456,8 @@ class HiCacheFile(HiCacheStorage):
 
         return PoolTransferResult(final_pages, hit_count)
 
-    def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+    def _log_key(self, pool_name: PoolName, key: str) -> str:
+        return key if pool_name == PoolName.KV else f"{key}.{pool_name.value}"
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
