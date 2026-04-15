@@ -7,6 +7,12 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     MambaPoolHost,
@@ -25,7 +31,65 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_hiradix_hybrid_stack(
+def _build_attention_host_pool(
+    pool,
+    *,
+    host_to_device_ratio: float,
+    host_size: int,
+    page_size: int,
+    layout: str,
+    allocator_type: Optional[str],
+):
+    common_kw = dict(
+        host_to_device_ratio=host_to_device_ratio,
+        host_size=host_size,
+        page_size=page_size,
+        layout=layout,
+    )
+    if isinstance(pool, NSATokenToKVPool):
+        return MLATokenToKVPoolHost(
+            pool,
+            **common_kw,
+            allocator_type=allocator_type,
+            override_kv_cache_dim=pool.kv_cache_dim,
+        )
+    if isinstance(pool, MLATokenToKVPool):
+        return MLATokenToKVPoolHost(pool, **common_kw, allocator_type=allocator_type)
+    if isinstance(pool, MHATokenToKVPool):
+        return MHATokenToKVPoolHost(pool, **common_kw, allocator_type=allocator_type)
+    raise ValueError(f"Attention pool type {type(pool).__name__} not supported")
+
+
+def _append_nsa_indexer_entry(
+    entries: list[PoolEntry],
+    *,
+    name: PoolName,
+    pool: NSATokenToKVPool,
+    anchor_host,
+    layout: str,
+    allocator_type: Optional[str],
+    layer_mapper,
+) -> NSAIndexerPoolHost:
+    indexer_host = NSAIndexerPoolHost(
+        pool,
+        anchor_host,
+        layout,
+        allocator_type=allocator_type,
+    )
+
+    entries.append(
+        PoolEntry(
+            name=name,
+            host_pool=indexer_host,
+            device_pool=pool,
+            layer_mapper=layer_mapper,
+            share_indices_with_anchor=True,
+        )
+    )
+    return indexer_host
+
+
+def build_radix_hybrid_stack(
     radix_cache: "HiRadixCache",
     params: "CacheInitParams",
     server_args: "ServerArgs",
@@ -37,26 +101,18 @@ def build_hiradix_hybrid_stack(
 ) -> None:
     """HostPoolGroup + HybridCacheController for NSA and/or speculative draft."""
     try:
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-            NSATokenToKVPool,
-        )
-
         kv = radix_cache.kv_cache
         layer_num = kv.layer_num
 
         # --- KV anchor host pool ---
         if isinstance(kv, NSATokenToKVPool):
-            kv_host = MLATokenToKVPoolHost(
+            kv_host = _build_attention_host_pool(
                 kv,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                radix_cache.page_size,
-                server_args.hicache_mem_layout,
+                host_to_device_ratio=server_args.hicache_ratio,
+                host_size=server_args.hicache_size,
+                page_size=radix_cache.page_size,
+                layout=server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
-                override_kv_cache_dim=kv.kv_cache_dim,
             )
         else:
             # MHA / MLA: already created by HiRadixCache.__init__
@@ -79,20 +135,14 @@ def build_hiradix_hybrid_stack(
 
         # --- NSA/DSA indexer sidecar ---
         if isinstance(kv, NSATokenToKVPool):
-            indexer_host = NSAIndexerPoolHost(
-                kv,
-                kv_host,
-                server_args.hicache_mem_layout,
+            _append_nsa_indexer_entry(
+                entries,
+                name=PoolName.INDEXER,
+                pool=kv,
+                anchor_host=kv_host,
+                layout=server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
-            )
-            entries.append(
-                PoolEntry(
-                    name=PoolName.INDEXER,
-                    host_pool=indexer_host,
-                    device_pool=kv,
-                    layer_mapper=layer_mapper,
-                    share_indices_with_anchor=True,
-                )
+                layer_mapper=layer_mapper,
             )
 
         # --- Speculative draft KV sidecar ---
@@ -101,20 +151,16 @@ def build_hiradix_hybrid_stack(
         if draft_pool is not None:
             if isinstance(draft_pool, HybridLinearKVPool):
                 draft_pool = draft_pool.full_kv_pool
-            draft_kw = dict(
+
+            draft_host = _build_attention_host_pool(
+                draft_pool,
                 host_to_device_ratio=kv_host.size / draft_pool.size,
                 host_size=0,
                 page_size=radix_cache.page_size,
                 layout=server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
             )
-            if isinstance(draft_pool, MLATokenToKVPool):
-                draft_host = MLATokenToKVPoolHost(draft_pool, **draft_kw)
-            elif isinstance(draft_pool, MHATokenToKVPool):
-                draft_host = MHATokenToKVPoolHost(draft_pool, **draft_kw)
-            else:
-                raise ValueError(
-                    f"Draft pool type {type(draft_pool).__name__} not supported"
-                )
+
             draft_layer_num = draft_pool.layer_num
             transfer_layer_num = max(layer_num, draft_layer_num)
 
@@ -132,7 +178,19 @@ def build_hiradix_hybrid_stack(
                     share_indices_with_anchor=True,
                 )
             )
+
             radix_cache.draft_kv_pool_host = draft_host
+            if isinstance(draft_pool, NSATokenToKVPool):
+                draft_indexer_host = _append_nsa_indexer_entry(
+                    entries,
+                    name=PoolName.DRAFT_INDEXER,
+                    pool=draft_pool,
+                    anchor_host=draft_host,
+                    layout=server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                    layer_mapper=draft_layer_mapper,
+                )
+                radix_cache.draft_indexer_pool_host = draft_indexer_host
 
         host_pool_group = HostPoolGroup(entries)
         cache_controller = HybridCacheController(
@@ -155,10 +213,12 @@ def build_hiradix_hybrid_stack(
         radix_cache.full_kv_pool_host = kv_host
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
+
         if draft_pool is not None:
             draft_pool.register_layer_transfer_counter(
                 cache_controller.layer_done_counter
             )
+
         pool_names = [e.name.value.upper() for e in entries]
         logger.info(
             "Hybrid hierarchical cache: HostPoolGroup(%s), HybridCacheController, "
@@ -167,7 +227,7 @@ def build_hiradix_hybrid_stack(
             transfer_layer_num,
         )
     except Exception:
-        logger.exception("build_hiradix_hybrid_stack failed")
+        logger.exception("build_radix_hybrid_stack failed")
         raise
 
 
@@ -185,15 +245,12 @@ def build_mamba_hybrid_stack(
     try:
         hybrid_kv = mamba_cache.hybrid_kv_cache
         kvcache = mamba_cache.kvcache
-        kv_host_pool_cls = (
-            MLATokenToKVPoolHost if hybrid_kv.use_mla else MHATokenToKVPoolHost
-        )
-        full_kv_pool_host = kv_host_pool_cls(
+        full_kv_pool_host = _build_attention_host_pool(
             kvcache,
-            server_args.hicache_ratio,
-            server_args.hicache_size,
-            params.page_size,
-            server_args.hicache_mem_layout,
+            host_to_device_ratio=server_args.hicache_ratio,
+            host_size=server_args.hicache_size,
+            page_size=params.page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         mamba_pool_host = MambaPoolHost(
