@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import temp_set_env
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -127,6 +127,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.pp_group = get_pp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.needs_quant_draft = (
             get_global_server_args().speculative_draft_model_quantization is not None
