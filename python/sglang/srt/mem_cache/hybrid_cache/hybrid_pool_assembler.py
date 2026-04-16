@@ -207,6 +207,8 @@ def build_radix_hybrid_stack(
             storage_backend_extra_config=extra_config,
             pp_rank=radix_cache.pp_rank,
             pp_size=radix_cache.pp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
             transfer_layer_num=transfer_layer_num,
             enable_storage_metrics=enable_storage_metrics,
         )
@@ -310,6 +312,8 @@ def build_mamba_hybrid_stack(
             storage_backend_extra_config=extra_config,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
             transfer_layer_num=transfer_layer_num,
             enable_storage_metrics=enable_storage_metrics,
         )
