@@ -219,6 +219,59 @@ class HybridCacheController(BaseHiCacheController):
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
+    def move_indices(self, op: CacheOperation):
+        host_indices, device_indices = super().move_indices(op)
+
+        for transfer in op.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is None:
+                continue
+
+            if entry.share_indices_with_anchor:
+                transfer.host_indices = host_indices
+                transfer.device_indices = device_indices
+                continue
+
+            host_pool = entry.host_pool
+            transfer_host_indices = transfer.host_indices
+            transfer_device_indices = transfer.device_indices
+
+            if self.io_backend == "kernel":
+                if (
+                    transfer_host_indices is not None
+                    and not transfer_host_indices.is_cuda
+                ):
+                    transfer.host_indices = transfer_host_indices.to(
+                        self.device, non_blocking=True
+                    )
+            elif self.io_backend == "direct":
+                if host_pool.layout == "layer_first":
+                    if transfer_device_indices is not None:
+                        transfer_device_indices = transfer_device_indices.cpu()
+                    if transfer_host_indices is not None:
+                        transfer_host_indices, idx = transfer_host_indices.sort()
+                        transfer.host_indices = transfer_host_indices
+                        if transfer_device_indices is not None:
+                            transfer.device_indices = (
+                                transfer_device_indices.index_select(0, idx)
+                            )
+                    elif transfer_device_indices is not None:
+                        transfer.device_indices = transfer_device_indices
+                elif host_pool.layout == "page_first_direct":
+                    if transfer_device_indices is not None:
+                        transfer.device_indices = transfer_device_indices.cpu()
+                else:
+                    raise ValueError(
+                        f"Unsupported layout {host_pool.layout!r} for io backend 'direct'"
+                    )
+            elif self.io_backend == "kernel_ascend":
+                if transfer_device_indices is not None:
+                    transfer.device_indices = transfer_device_indices.cpu()
+            else:
+                raise ValueError(f"Unsupported io backend")
+
+        return host_indices, device_indices
+
     def reset(self):
         super().reset()
         if self.enable_storage:
@@ -289,9 +342,12 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        primary_device_allocator = self._resolve_primary_device_allocator_for_load(
+            extra_pools
+        )
         need_load_kv = host_indices.numel() > 0
         if need_load_kv:
-            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+            device_indices = primary_device_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
         else:
@@ -305,7 +361,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
-                self.mem_pool_device_allocator.free(device_indices)
+                primary_device_allocator.free(device_indices)
             return None
 
         self.load_queue.append(
@@ -318,6 +374,39 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return device_indices
+
+    def _resolve_primary_device_allocator_for_load(
+        self, extra_pools: Optional[list[PoolTransfer]]
+    ):
+        """Choose the anchor allocator for host→device restore.
+
+        Composite allocators such as SWATokenToKVPoolAllocator allocate sidecar
+        device slots together with the anchor KV slots. When hybrid HiCache also
+        restores those sidecar pools explicitly through `extra_pools`, using the
+        composite allocator here would double-allocate the sidecar device pages
+        and later orphan the implicit allocation when the explicit mapping is
+        committed. In that case, restore only the full-KV anchor indices here.
+        """
+        if not extra_pools:
+            return self.mem_pool_device_allocator
+
+        has_sidecar_device_allocator = False
+        for transfer in extra_pools:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if (
+                entry is not None
+                and not entry.share_indices_with_anchor
+                and entry.device_allocator is not None
+            ):
+                has_sidecar_device_allocator = True
+                break
+
+        if has_sidecar_device_allocator and hasattr(
+            self.mem_pool_device_allocator, "full_attn_allocator"
+        ):
+            return self.mem_pool_device_allocator.full_attn_allocator
+
+        return self.mem_pool_device_allocator
 
     def start_loading(self) -> int:
         if not self.load_queue:
@@ -502,7 +591,7 @@ class HybridCacheController(BaseHiCacheController):
                 if pool.device_indices is not None or pool.host_indices is None:
                     continue
                 entry_pool, evict_fn, size = (
-                    entry.device_pool,
+                    entry.device_allocator or entry.device_pool,
                     entry.device_evict_fn,
                     len(pool.host_indices),
                 )

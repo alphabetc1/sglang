@@ -1665,6 +1665,10 @@ class PoolEntry:
     # When True, host_pool uses the same logical slot indices as the anchor pool
     # (e.g. DSA indexer); HostPoolGroup.free mirrors frees to this pool.
     share_indices_with_anchor: bool = False
+    # Optional device-side allocator when the transfer target itself does not
+    # implement alloc/free (for example SWA uses a raw KV pool plus a separate
+    # allocator object).
+    device_allocator: Optional[Any] = None
     # Optional eviction callbacks for auto-alloc in HybridCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
     # device_evict_fn(n): evict n slots from the device pool (used by load()).

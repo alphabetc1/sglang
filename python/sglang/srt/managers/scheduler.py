@@ -841,6 +841,14 @@ class Scheduler(
                     self.tree_cache = HiMambaRadixCache(
                         params=params, server_args=server_args
                     )
+                elif self.is_hybrid_swa:
+                    from sglang.srt.mem_cache.hi_swa_radix_cache import (
+                        HiSWARadixCache,
+                    )
+
+                    self.tree_cache = HiSWARadixCache(
+                        params=params, server_args=server_args
+                    )
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -1481,6 +1489,17 @@ class Scheduler(
             and last_batch_is_extend
         )
 
+        # HiSWA mutates tree and host/device residency metadata while processing
+        # prefill results. Letting the next prefill schedule against that state
+        # before the previous extend batch is fully processed can desynchronize
+        # TP ranks and strand the next request in waiting_queue.
+        hicache_hiswa_needs_sync = (
+            self.enable_hierarchical_cache
+            and self.is_hybrid_swa
+            and batch_is_extend
+            and last_batch_is_extend
+        )
+
         # We do not support overlap + spec + grammar yet,
         # so we need to turn off overlap for this batch.
         # TODO(lsyin): support overlap + spec + grammar
@@ -1492,7 +1511,9 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        return (
+            disable_overlap_for_batch or hicache_hiswa_needs_sync or need_grammar_sync
+        )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -2437,6 +2458,18 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
+            # HiSWA in write-through mode can race with the next prefill request:
+            # a freshly produced prefix may still be waiting on host backup ACKs,
+            # and if we stage another request that triggers eviction first, those
+            # nodes can be treated as non-backed-up and get dropped instead of
+            # demoted to host. Flush write-through ACKs before admitting the next
+            # prefill so host recall remains intact.
+            if (
+                self.is_hybrid_swa
+                and self.server_args.hicache_write_policy == "write_through"
+                and len(self.waiting_queue) > 0
+            ):
+                self.tree_cache.flush_write_through_acks()
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:

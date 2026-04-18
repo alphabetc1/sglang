@@ -2528,21 +2528,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every eviction_interval tokens to reduce the overhead.
                     if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                elif self.forward_mode.is_extend() and req.is_chunked > 0:
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        # In chunked prefill, the second scheduled extend can still
+                        # overlap with the previous chunk's forward. Delay SWA eviction
+                        # until at least the third extend batch so the prior chunk is
+                        # no longer using those request-local slots.
                         if req.extend_batch_idx < 2:
                             continue
-                        else:
-                            pre_len = (
-                                pre_len - server_args.chunked_prefill_size
-                                if server_args.chunked_prefill_size > 0
-                                else pre_len
-                            )
-                            self._evict_swa(req, pre_len)
-                    else:
-                        self._evict_swa(req, pre_len)
+                        pre_len = (
+                            pre_len - server_args.chunked_prefill_size
+                            if server_args.chunked_prefill_size > 0
+                            else pre_len
+                        )
+                    self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

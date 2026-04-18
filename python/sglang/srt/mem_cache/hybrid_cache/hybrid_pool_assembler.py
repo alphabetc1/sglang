@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+    from sglang.srt.mem_cache.hi_swa_radix_cache import HiSWARadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -213,4 +214,113 @@ def build_mamba_hybrid_stack(
         )
     except Exception:
         logger.exception("build_mamba_hybrid_stack failed")
+        raise
+
+
+def build_swa_hybrid_stack(
+    swa_cache: "HiSWARadixCache",
+    params: "CacheInitParams",
+    server_args: "ServerArgs",
+    *,
+    extra_config: dict,
+    prefetch_threshold: int,
+    load_cache_event,
+    enable_storage_metrics: bool = False,
+) -> None:
+    """HostPoolGroup (full KV + SWA KV) + HybridCacheController for hybrid SWA models."""
+    try:
+        swa_kv_cache = swa_cache.swa_kv_cache
+        full_kv_pool = swa_kv_cache.full_kv_pool
+        swa_kv_pool = swa_kv_cache.swa_kv_pool
+
+        full_kv_pool_host = MHATokenToKVPoolHost(
+            full_kv_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            params.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        swa_kv_pool_host = MHATokenToKVPoolHost(
+            swa_kv_pool,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            params.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+
+        # Build layer mappings: global_layer_id → pool-local index
+        full_layer_mapping = {}
+        swa_layer_mapping = {}
+        for global_id, (pool_id, is_swa) in swa_kv_cache.layers_mapping.items():
+            if is_swa:
+                swa_layer_mapping[global_id] = pool_id
+            else:
+                full_layer_mapping[global_id] = pool_id
+
+        all_layer_ids = sorted(
+            set(full_layer_mapping.keys()) | set(swa_layer_mapping.keys())
+        )
+        transfer_layer_num = len(all_layer_ids)
+
+        def full_layer_mapper(layer_id: int) -> Optional[int]:
+            if not 0 <= layer_id < transfer_layer_num:
+                return None
+            return full_layer_mapping.get(layer_id)
+
+        def swa_layer_mapper(layer_id: int) -> Optional[int]:
+            if not 0 <= layer_id < transfer_layer_num:
+                return None
+            return swa_layer_mapping.get(layer_id)
+
+        host_pool_group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=full_kv_pool_host,
+                    device_pool=full_kv_pool,
+                    layer_mapper=full_layer_mapper,
+                    is_primary_index_anchor=True,
+                ),
+                PoolEntry(
+                    name=PoolName.SWA,
+                    host_pool=swa_kv_pool_host,
+                    device_pool=swa_kv_pool,
+                    layer_mapper=swa_layer_mapper,
+                    device_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
+                ),
+            ]
+        )
+        cache_controller = HybridCacheController(
+            params.token_to_kv_pool_allocator,
+            host_pool_group,
+            params.page_size,
+            params.tp_cache_group,
+            load_cache_event=load_cache_event,
+            write_policy=server_args.hicache_write_policy,
+            io_backend=server_args.hicache_io_backend,
+            storage_backend=server_args.hicache_storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=server_args.served_model_name,
+            storage_backend_extra_config=extra_config,
+            pp_rank=params.pp_rank,
+            pp_size=params.pp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
+            transfer_layer_num=transfer_layer_num,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        swa_cache.full_kv_pool_host = full_kv_pool_host
+        swa_cache.swa_kv_pool_host = swa_kv_pool_host
+        swa_cache.transfer_layer_num = transfer_layer_num
+        swa_cache.host_pool_group = host_pool_group
+        swa_cache.cache_controller = cache_controller
+        logger.info(
+            "Hybrid hierarchical cache: HostPoolGroup(KV + SWA), HybridCacheController, "
+            "transfer_layer_num=%s",
+            transfer_layer_num,
+        )
+    except Exception:
+        logger.exception("build_swa_hybrid_stack failed")
         raise

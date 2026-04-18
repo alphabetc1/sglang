@@ -22,7 +22,7 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -84,6 +84,13 @@ class TreeNode:
         self.hit_count = 0
         # store the host indices of KV cache
         self.host_value = None
+        # store the host indices of SWA KV cache
+        self.swa_host_value = None
+        # reference counters for protecting host data during async I/O
+        self.host_ref_counter = 0
+        self.host_swa_ref_counter = 0
+        # page hashes for L3 storage backend
+        self.hash_value = []
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -92,6 +99,9 @@ class TreeNode:
         self.next = None
         self.swa_prev = None
         self.swa_next = None
+        # host SWA LRU list pointers
+        self.host_swa_prev = None
+        self.host_swa_next = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -104,6 +114,35 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    @property
+    def swa_backuped(self):
+        return self.swa_host_value is not None
+
+    def protect_host(self):
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        self.host_ref_counter -= 1
+        assert self.host_ref_counter >= 0
+
+    def protect_host_swa(self):
+        self.host_swa_ref_counter += 1
+
+    def release_host_swa(self):
+        self.host_swa_ref_counter -= 1
+        assert self.host_swa_ref_counter >= 0
+
+    def get_last_hash_value(self) -> Optional[str]:
+        if len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+        if node is None or len(node.hash_value) == 0:
+            return []
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
@@ -521,6 +560,7 @@ class SWARadixCache(BasePrefixCache):
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len

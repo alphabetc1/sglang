@@ -804,7 +804,7 @@ class PrefillAdder:
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(req.extend_input_len)
-            if swa_needed >= self.rem_swa_tokens:
+            if swa_needed > self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -817,7 +817,7 @@ class PrefillAdder:
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(req.extend_input_len)
-                if swa_needed >= self.rem_swa_tokens:
+                if swa_needed > self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:

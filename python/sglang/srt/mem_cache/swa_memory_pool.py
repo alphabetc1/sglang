@@ -51,9 +51,13 @@ class SWAKVPool(KVCache):
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        # Hybrid HiCache transfers are orchestrated in global layer-id order.
+        self.layer_num = self.swa_layer_nums + self.full_layer_nums
         self.start_layer = 0
+        self.end_layer = self.layer_num - 1
         self.page_size = page_size
         self.swa_loc = None
+        self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
         kwargs["enable_memory_saver"] = False
@@ -100,6 +104,16 @@ class SWAKVPool(KVCache):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
+        # The global wait is handled at the SWAKVPool level.
+        self.full_kv_pool.register_layer_transfer_counter(None)
+        self.swa_kv_pool.register_layer_transfer_counter(None)
+
+    def _wait_for_layer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_kv_size_bytes(self):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
@@ -123,6 +137,7 @@ class SWAKVPool(KVCache):
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_key_buffer(layer_id_pool)
@@ -130,6 +145,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_key_buffer(layer_id_pool)
 
     def get_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_value_buffer(layer_id_pool)
@@ -137,6 +153,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
     def get_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
@@ -348,7 +365,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
+        if self.page_size > 1:
+            assert (
+                need_size % self.page_size == 0
+            ), "The allocation size should be page-aligned"
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
