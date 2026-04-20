@@ -45,6 +45,9 @@ class PoolName(str, Enum):
     DRAFT = "draft"
     DRAFT_INDEXER = "draft_indexer"
 
+    def __str__(self) -> str:
+        return self.value
+
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
