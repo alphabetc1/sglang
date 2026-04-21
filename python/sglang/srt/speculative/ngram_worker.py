@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from typing import List, Optional
 
 import numpy as np
@@ -13,6 +14,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+    build_target_runtime,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -37,11 +43,18 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
+        self.gpu_id = gpu_id
         self.page_size = server_args.page_size
+        self.speculative_num_steps = server_args.speculative_num_steps or server_args.speculative_num_draft_tokens
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
+        # For adaptive: the corpus always generates at the max draft token count;
+        # self._corpus_draft_token_num tracks the corpus's fixed capacity.
+        self._corpus_draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
@@ -79,6 +92,37 @@ class NGRAMWorker:
                 corpus_path,
                 loaded,
             )
+
+        # Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+            # Reinit corpus at max candidate draft tokens so we can
+            # truncate when the active setting is smaller.
+            max_draft = max(s + 1 for s in self.adaptive_controller.candidate_steps)
+            if max_draft > self._corpus_draft_token_num:
+                self._corpus_draft_token_num = max_draft
+                self.ngram_corpus = NgramCorpus(
+                    min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
+                    max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+                    match_type=server_args.speculative_ngram_match_type,
+                    capacity=server_args.speculative_ngram_capacity,
+                    max_trie_depth=server_args.speculative_ngram_max_trie_depth,
+                    draft_token_num=max_draft,
+                    external_sam_budget=server_args.speculative_ngram_external_sam_budget,
+                    external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+                )
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    target_attn_backend=self.model_runner.attn_backend,
+                    target_graph_runner=self.model_runner.graph_runner,
+                )
+            )
+            self.adaptive_controller.init_states()
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -172,12 +216,22 @@ class NGRAMWorker:
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
-        total_draft_token_num = len(req_drafts)
 
-        # Check if speculative decoding is needed; here we always enforce it
+        # Adaptive: corpus may produce more tokens than current draft_token_num.
+        # Truncate to the active draft_token_num per request.
+        cn = self._corpus_draft_token_num
+        dn = self.draft_token_num
+        if cn > dn:
+            # req_drafts: flat [bs * cn], mask: flat [bs * cn * cn]
+            drafts_2d = req_drafts.reshape(bs, cn)[:, :dn]
+            req_drafts = drafts_2d.reshape(-1).copy()
+            mask_3d = mask.reshape(bs, cn, cn)[:, :dn, :dn]
+            mask = mask_3d.reshape(-1).copy()
+
+        total_draft_token_num = len(req_drafts)
         assert (
-            total_draft_token_num == bs * self.draft_token_num
-        ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
+            total_draft_token_num == bs * dn
+        ), f"{total_draft_token_num=}, {bs=}, {dn=}"
         return req_drafts, mask
 
     def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
@@ -344,6 +398,9 @@ class NGRAMWorker:
                 batch_result.can_run_cuda_graph,
             )
 
+        if accept_length_per_req_cpu and self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(accept_length_per_req_cpu)
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
@@ -352,3 +409,80 @@ class NGRAMWorker:
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )
+
+    # -- Adaptive speculative decoding protocol --
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> SpecRuntimeState:
+        """Build a SpecRuntimeState for the given step configuration."""
+        with self._override_worker_state(
+            speculative_num_steps, speculative_num_draft_tokens
+        ):
+            target_attn_backend, target_graph_runner = build_target_runtime(
+                self.model_runner,
+                self.server_args,
+                speculative_num_steps,
+                speculative_num_draft_tokens,
+            )
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            target_attn_backend=target_attn_backend,
+            target_graph_runner=target_graph_runner,
+        )
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Apply a pre-built runtime state to this worker."""
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        logger.info(
+            "NGRAMWorker switch adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        self.draft_token_num = state.speculative_num_draft_tokens
+        # Target side
+        self.model_runner.attn_backend = state.target_attn_backend
+        self.model_runner.graph_runner = state.target_graph_runner
+        # Sync server_args
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+        # Rebuild pre-allocated tensors (cheap — small GPU allocations)
+        self._init_preallocated_tensors()
+
+    @contextmanager
+    def _override_worker_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ):
+        """Temporarily override server_args for target graph capture."""
+        sa = self.server_args
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            self.draft_token_num,
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+        )
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        self.draft_token_num = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.draft_token_num,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup

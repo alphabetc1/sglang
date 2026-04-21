@@ -14,6 +14,8 @@
 
 import contextlib
 import logging
+import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -30,6 +32,11 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    MultiLayerEagleV2RuntimeState,
+    build_target_runtime,
+)
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -49,6 +56,7 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
     select_top_k_tokens,
 )
+from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
@@ -628,6 +636,29 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
+        # Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+            with self._draft_worker.draft_tp_context(
+                self._draft_worker.draft_runner_list[0].tp_group
+            ), speculative_moe_backend_context():
+                self.adaptive_controller.register(
+                    MultiLayerEagleV2RuntimeState(
+                        speculative_num_steps=self.speculative_num_steps,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        target_attn_backend=self._target_worker.model_runner.attn_backend,
+                        target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        draft_extend_attn_backend_list=list(
+                            self._draft_worker.draft_extend_attn_backend_list
+                        ),
+                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                    )
+                )
+                self.adaptive_controller.init_states()
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -687,6 +718,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(
+                    batch_output.accept_lens.tolist()
+                )
+
             return batch_output
 
     def verify(
@@ -805,3 +842,112 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."
+
+    # -- Adaptive speculative decoding protocol --
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ) -> MultiLayerEagleV2RuntimeState:
+        """Build a MultiLayerEagleV2RuntimeState for the given step configuration."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        with self._override_worker_state(
+            speculative_num_steps, speculative_num_draft_tokens
+        ):
+            self._draft_worker.init_attention_backend()
+            self._draft_worker.init_cuda_graphs()
+
+            target_attn_backend, target_graph_runner = build_target_runtime(
+                self._target_worker.model_runner,
+                self.server_args,
+                speculative_num_steps,
+                speculative_num_draft_tokens,
+            )
+
+            state = MultiLayerEagleV2RuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+                draft_extend_attn_backend_list=list(
+                    self._draft_worker.draft_extend_attn_backend_list
+                ),
+                cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Built adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB"
+        )
+
+        return state
+
+    def apply_runtime_state(self, state: MultiLayerEagleV2RuntimeState) -> None:
+        """Apply a pre-built runtime state to this worker."""
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        logger.info(
+            "MultiLayerEagleWorkerV2 switch adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}"
+        )
+
+        # Top-level
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        # Draft side
+        dw = self._draft_worker
+        dw.speculative_num_steps = state.speculative_num_steps
+        dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.draft_extend_attn_backend_list = state.draft_extend_attn_backend_list
+        dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
+        # Target side
+        self._target_worker.model_runner.attn_backend = state.target_attn_backend
+        self._target_worker.model_runner.graph_runner = state.target_graph_runner
+        # Sync server_args
+        self.server_args.speculative_num_steps = state.speculative_num_steps
+        self.server_args.speculative_num_draft_tokens = (
+            state.speculative_num_draft_tokens
+        )
+
+    @contextmanager
+    def _override_worker_state(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ):
+        """Temporarily override server_args and worker attributes for graph capture."""
+        sa = self.server_args
+        dw = self._draft_worker
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            dw.speculative_num_steps,
+            dw.speculative_num_draft_tokens,
+            dw.draft_extend_attn_backend_list,
+            dw.cuda_graph_runner_for_draft_extend,
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+        )
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        dw.speculative_num_steps = speculative_num_steps
+        dw.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.speculative_num_steps = speculative_num_steps
+        sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                dw.speculative_num_steps,
+                dw.speculative_num_draft_tokens,
+                dw.draft_extend_attn_backend_list,
+                dw.cuda_graph_runner_for_draft_extend,
+                sa.speculative_num_steps,
+                sa.speculative_num_draft_tokens,
+            ) = backup

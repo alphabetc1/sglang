@@ -17,36 +17,110 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
         EAGLEDraftExtendCudaGraphRunner,
     )
+    from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+        MultiLayerEagleDraftExtendCudaGraphRunner,
+        MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
+    )
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Runtime state hierarchy
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class SpecRuntimeState:
-    """A complete set of runtime resources bound to a specific speculative
-    decoding configuration.
+    """Base runtime state for adaptive speculative decoding.
 
-    Each decode round runs three stages — draft, verify, extend — and every
-    stage has shape-dependent resources (attention backends and CUDA graphs)
-    that must match the current configuration.  Switching adaptive steps
-    means swapping the entire state atomically.
+    Every worker needs at minimum the configuration (num_steps, draft_tokens)
+    and target-side resources (attention backend + CUDA graph runner) that depend
+    on those values.
     """
 
-    # -- Configuration (determines shapes for all stages) --
+    # -- Configuration --
     speculative_num_steps: int
     speculative_num_draft_tokens: int
 
-    # -- Draft stage: draft model multi-step autoregressive generation --
-    draft_attn_backend: "AttentionBackend | None"
-    cuda_graph_runner: "EAGLEDraftCudaGraphRunner | None"
+    # -- Verify stage: target model one-pass verification --
+    target_attn_backend: "AttentionBackend | None" = None
+    target_graph_runner: "CudaGraphRunner | CPUGraphRunner | None" = None
 
-    # -- Verify stage: target model one-pass tree verification --
-    target_attn_backend: "AttentionBackend"
-    target_graph_runner: "CudaGraphRunner | CPUGraphRunner | None"
+
+@dataclass
+class EagleRuntimeState(SpecRuntimeState):
+    """Runtime state for single-layer EAGLE (v1/v2) and Standalone workers."""
+
+    # -- Draft stage: draft model multi-step autoregressive generation --
+    draft_attn_backend: "AttentionBackend | None" = None
+    cuda_graph_runner: "EAGLEDraftCudaGraphRunner | None" = None
 
     # -- Extend stage: draft model KV cache catch-up after verify --
-    draft_extend_attn_backend: "AttentionBackend | None"
-    cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
+    draft_extend_attn_backend: "AttentionBackend | None" = None
+    cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None" = None
+
+
+@dataclass
+class MultiLayerEagleRuntimeState(SpecRuntimeState):
+    """Runtime state for MultiLayerEagleWorker (v1) — per-step backend/graph lists."""
+
+    draft_extend_attn_backend_list: "list[AttentionBackend | None] | None" = None
+    cuda_graph_runner_for_draft_extend_list: (
+        "list[MultiLayerEagleDraftExtendCudaGraphRunner] | None"
+    ) = None
+
+
+@dataclass
+class MultiLayerEagleV2RuntimeState(SpecRuntimeState):
+    """Runtime state for MultiLayerEagleWorkerV2 — per-step backends + single multi-step graph."""
+
+    draft_extend_attn_backend_list: "list[AttentionBackend | None] | None" = None
+    cuda_graph_runner_for_draft_extend: (
+        "MultiLayerEagleMultiStepDraftExtendCudaGraphRunner | None"
+    ) = None
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: build target-side resources
+# ---------------------------------------------------------------------------
+
+
+def build_target_runtime(
+    target_model_runner,
+    server_args,
+    speculative_num_steps: int,
+    speculative_num_draft_tokens: int,
+) -> tuple:
+    """Build target attention backend + CUDA graph runner for a given step config.
+
+    Returns:
+        (target_attn_backend, target_graph_runner)
+    """
+    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+    backup_init = target_model_runner.init_new_workspace
+    try:
+        target_attn_backend = target_model_runner._get_attention_backend(
+            init_new_workspace=True
+        )
+    finally:
+        target_model_runner.init_new_workspace = backup_init
+
+    target_graph_runner = None
+    if not server_args.disable_cuda_graph:
+        target_graph_runner = CudaGraphRunner(
+            target_model_runner,
+            attn_backend=target_attn_backend,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+    return target_attn_backend, target_graph_runner
+
+
+# ---------------------------------------------------------------------------
+# Adaptive protocol + controller
+# ---------------------------------------------------------------------------
 
 
 class AdaptiveSpecWorker(Protocol):

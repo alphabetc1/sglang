@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -36,7 +35,8 @@ from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
-    SpecRuntimeState,
+    EagleRuntimeState,
+    build_target_runtime,
 )
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -221,13 +221,13 @@ class EAGLEWorker(TpModelWorker):
             self.init_cuda_graphs()
             if self.adaptive_controller is not None:
                 self.adaptive_controller.register(
-                    SpecRuntimeState(
+                    EagleRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self.draft_attn_backend,
-                        cuda_graph_runner=self.cuda_graph_runner,
                         target_attn_backend=self.target_worker.model_runner.attn_backend,
                         target_graph_runner=self.target_worker.model_runner.graph_runner,
+                        draft_attn_backend=self.draft_attn_backend,
+                        cuda_graph_runner=self.cuda_graph_runner,
                         draft_extend_attn_backend=self.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
@@ -301,7 +301,7 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def apply_runtime_state(self, state: SpecRuntimeState):
+    def apply_runtime_state(self, state: EagleRuntimeState):
         """Apply a pre-built runtime state to this worker."""
         if self.speculative_num_steps == state.speculative_num_steps:
             return
@@ -335,8 +335,8 @@ class EAGLEWorker(TpModelWorker):
 
     def build_adaptive_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
-    ) -> SpecRuntimeState:
-        """Build a SpecRuntimeState for the given step configuration."""
+    ) -> EagleRuntimeState:
+        """Build an EagleRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
@@ -348,34 +348,20 @@ class EAGLEWorker(TpModelWorker):
             self.init_cuda_graphs()
 
             # Capture target attention backend and CUDA graph
-            target_model_runner = self.target_worker.model_runner
-            backup_init = target_model_runner.init_new_workspace
-            try:
-                target_attn_backend = target_model_runner._get_attention_backend(
-                    init_new_workspace=True
-                )
-            finally:
-                target_model_runner.init_new_workspace = backup_init
+            target_attn_backend, target_graph_runner = build_target_runtime(
+                self.target_worker.model_runner,
+                self.server_args,
+                speculative_num_steps,
+                speculative_num_draft_tokens,
+            )
 
-            target_graph_runner = None
-            if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
-                    target_model_runner,
-                    attn_backend=target_attn_backend,
-                    speculative_num_steps=speculative_num_steps,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
-                )
-
-            state = SpecRuntimeState(
+            state = EagleRuntimeState(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
-                # Draft stage
-                draft_attn_backend=self.draft_attn_backend,
-                cuda_graph_runner=self.cuda_graph_runner,
-                # Verify stage
                 target_attn_backend=target_attn_backend,
                 target_graph_runner=target_graph_runner,
-                # Extend stage
+                draft_attn_backend=self.draft_attn_backend,
+                cuda_graph_runner=self.cuda_graph_runner,
                 draft_extend_attn_backend=self.draft_extend_attn_backend,
                 cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
             )

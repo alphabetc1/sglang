@@ -30,12 +30,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
-    SpecRuntimeState,
+    EagleRuntimeState,
+    build_target_runtime,
 )
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -697,13 +697,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self._draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.adaptive_controller.register(
-                    SpecRuntimeState(
+                    EagleRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         target_attn_backend=self._target_worker.model_runner.attn_backend,
                         target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        draft_attn_backend=self._draft_worker.draft_attn_backend,
+                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                         draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                         cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                     )
@@ -782,8 +782,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def build_adaptive_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
-    ) -> SpecRuntimeState:
-        """Build a SpecRuntimeState for the given step configuration."""
+    ) -> EagleRuntimeState:
+        """Build an EagleRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
@@ -793,32 +793,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
 
-            # Build target attention backend and CUDA graph runner
-            target_model_runner = self._target_worker.model_runner
-            backup_init = target_model_runner.init_new_workspace
-            try:
-                target_attn_backend = target_model_runner._get_attention_backend(
-                    init_new_workspace=True
-                )
-            finally:
-                target_model_runner.init_new_workspace = backup_init
+            # Capture target attention backend and CUDA graph
+            target_attn_backend, target_graph_runner = build_target_runtime(
+                self._target_worker.model_runner,
+                self.server_args,
+                speculative_num_steps,
+                speculative_num_draft_tokens,
+            )
 
-            target_graph_runner = None
-            if not self.server_args.disable_cuda_graph:
-                target_graph_runner = CudaGraphRunner(
-                    target_model_runner,
-                    attn_backend=target_attn_backend,
-                    speculative_num_steps=speculative_num_steps,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
-                )
-
-            state = SpecRuntimeState(
+            state = EagleRuntimeState(
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
-                draft_attn_backend=self._draft_worker.draft_attn_backend,
-                cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                 target_attn_backend=target_attn_backend,
                 target_graph_runner=target_graph_runner,
+                draft_attn_backend=self._draft_worker.draft_attn_backend,
+                cuda_graph_runner=self._draft_worker.cuda_graph_runner,
                 draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
                 cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
             )
@@ -832,7 +821,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         return state
 
-    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+    def apply_runtime_state(self, state: EagleRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""
         if self.speculative_num_steps == state.speculative_num_steps:
             return

@@ -3468,16 +3468,25 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            supported_algorithms = (
+                "EAGLE",
+                "EAGLE3",
+                "NGRAM",
+                "STANDALONE",
+            )
+            if self.speculative_algorithm not in supported_algorithms:
                 logger.warning(
-                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
+                    f"speculative_adaptive is only supported with {supported_algorithms}. "
                     f"Current algorithm={self.speculative_algorithm}. "
                     "Falling back to static params."
                 )
                 self.speculative_adaptive = False
-            elif self.speculative_eagle_topk != 1:
+            elif (
+                self.speculative_algorithm in ("EAGLE", "EAGLE3")
+                and self.speculative_eagle_topk != 1
+            ):
                 logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
+                    "speculative_adaptive with EAGLE requires topk=1. "
                     f"Current topk={self.speculative_eagle_topk}. "
                     "Falling back to static params."
                 )
