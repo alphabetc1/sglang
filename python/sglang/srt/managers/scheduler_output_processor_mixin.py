@@ -356,7 +356,10 @@ class SchedulerOutputProcessorMixin:
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
+        stride = (
+            result.speculative_num_draft_tokens
+            or self.draft_worker.speculative_num_draft_tokens
+        )
 
         for i, req in enumerate(batch.reqs):
             # -1 because prepare_for_decode pre-claimed the bonus slot.
