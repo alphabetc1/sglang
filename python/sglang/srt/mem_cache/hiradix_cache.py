@@ -31,12 +31,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_nsa_pool_to_hiradix_cache,
-)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -45,6 +39,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.multi_pool_cache import (
+    MultiPoolCacheController,
+    attach_multi_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -81,7 +79,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+            # Filled by attach_pools() after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -120,9 +118,14 @@ class HiRadixCache(RadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        self.draft_token_to_kv_pool = params.draft_token_to_kv_pool
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            attach_hybrid_nsa_pool_to_hiradix_cache(
+        # TODO: unify to always use MultiPoolCacheController (even for plain KV
+        # with entries=[KV]).  This would eliminate the dual-path branching and
+        # the isinstance guards in _get_extra_pools / _get_hybrid_storage_attach_kwargs,
+        # making future pool-type additions (SWA, etc.) a one-line append.
+        if isinstance(self.kv_cache, NSATokenToKVPool) or self.draft_token_to_kv_pool is not None:
+            attach_multi_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -130,6 +133,7 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
+                draft_pool=self.draft_token_to_kv_pool,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -611,20 +615,20 @@ class HiRadixCache(RadixCache):
         return height
 
     def _get_extra_pools(self) -> dict:
-        if not isinstance(self.cache_controller, HybridCacheController):
+        if not isinstance(self.cache_controller, MultiPoolCacheController):
             return {}
+        pools = []
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            pool = PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
-            )
-            return {"extra_pools": [pool]}
-        else:
-            return {}
+            pools.append(PoolTransfer(name=PoolName.INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES))
+        if self.draft_token_to_kv_pool is not None:
+            pools.append(PoolTransfer(name=PoolName.DRAFT, hit_policy=PoolHitPolicy.ALL_PAGES))
+            if isinstance(self.draft_token_to_kv_pool, NSATokenToKVPool):
+                pools.append(PoolTransfer(name=PoolName.DRAFT_INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES))
+        return {"extra_pools": pools} if pools else {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
-        """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
-        if isinstance(self.cache_controller, HybridCacheController):
+        """Extra kwargs for attach_storage_backend when controller is MultiPoolCacheController."""
+        if isinstance(self.cache_controller, MultiPoolCacheController):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}
 

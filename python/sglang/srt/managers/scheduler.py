@@ -793,6 +793,11 @@ class Scheduler(
         if self.model_config.is_multimodal and uses_transformers_backend:
             effective_chunked_prefill_size = None
 
+        # Get draft KV pool for HiCache multi-pool stack (spec + hicache).
+        draft_kv_pool = None
+        if self.enable_hierarchical_cache:
+            draft_kv_pool, _ = self._get_draft_kv_pool()
+
         params = CacheInitParams(
             disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
@@ -814,6 +819,7 @@ class Scheduler(
             attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
+            draft_token_to_kv_pool=draft_kv_pool,
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
@@ -916,6 +922,24 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _get_draft_kv_pool(self):
+        """Return (draft_token_to_kv_pool, draft_model_config) for the current
+        draft worker, or (None, None) when no draft KV pool is available."""
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            return None, None
+
+        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+
+        return (
+            self.draft_worker.model_runner.token_to_kv_pool,
+            self.draft_worker.model_config,
+        )
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []

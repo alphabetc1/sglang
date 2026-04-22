@@ -23,11 +23,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from sglang.srt.mem_cache.multi_pool_cache import (
     PrefetchOperation,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_pool_to_mamba_cache,
+    attach_multi_pool_to_mamba_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import (
     LRUList,
@@ -134,14 +132,17 @@ class HiMambaRadixCache(MambaRadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        self.draft_token_to_kv_pool = params.draft_token_to_kv_pool
         self.load_cache_event = threading.Event()
-        attach_hybrid_pool_to_mamba_cache(
+        attach_multi_pool_to_mamba_cache(
             self,
             params,
             server_args,
             extra_config=extra_config,
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
+            enable_storage_metrics=self.enable_storage_metrics,
+            draft_pool=self.draft_token_to_kv_pool,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -211,7 +212,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.mamba_host_lru_list.in_list(node):
                 self.mamba_host_lru_list.reset_node_mru(node)
 
-        extra_pools = self.mamba_backup_transfers(node)
+        extra_pools = self._extend_with_draft(self.mamba_backup_transfers(node))
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -283,8 +284,8 @@ class HiMambaRadixCache(MambaRadixCache):
         logger.debug(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
-        mamba_pools = self.mamba_restore_transfers(
-            last_hit_node, mamba_restore_nodes, req
+        mamba_pools = self._extend_with_draft(
+            self.mamba_restore_transfers(last_hit_node, mamba_restore_nodes, req)
         )
         full_device_indices = self.cache_controller.load(
             host_indices=full_host_indices,
@@ -295,8 +296,8 @@ class HiMambaRadixCache(MambaRadixCache):
             if len(full_host_indices) > 0:
                 self.evict(EvictParams(num_tokens=len(full_host_indices)))
 
-            mamba_pools = self.mamba_restore_transfers(
-                last_hit_node, mamba_restore_nodes, req
+            mamba_pools = self._extend_with_draft(
+                self.mamba_restore_transfers(last_hit_node, mamba_restore_nodes, req)
             )
             full_device_indices = self.cache_controller.load(
                 host_indices=full_host_indices,
@@ -1664,7 +1665,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
-        extra_pools = self.mamba_archive_transfers(node)
+        extra_pools = self._extend_with_draft(self.mamba_archive_transfers(node))
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
@@ -1708,8 +1709,8 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         # Allocate host mamba slot
-        extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
-        if extra_pools is None:
+        mamba_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
+        if mamba_pools is None:
             self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node, release_mamba=False)
             return
@@ -1719,6 +1720,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if self.mamba_host_lru_list.in_list(last_host_node):
             self.mamba_host_lru_list.remove_node(last_host_node)
 
+        extra_pools = self._extend_with_draft(mamba_pools)
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
@@ -1947,6 +1949,32 @@ class HiMambaRadixCache(MambaRadixCache):
         if indices is None and error_message is not None:
             raise RuntimeError(error_message)
         return indices
+
+    # -- draft PoolTransfer helpers ---------------------------------------------
+
+    def _draft_pool_transfers(self) -> list[PoolTransfer]:
+        """Return DRAFT (+ optional DRAFT_INDEXER) PoolTransfers if draft is present."""
+        if self.draft_token_to_kv_pool is None:
+            return []
+        from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+
+        transfers = [PoolTransfer(name=PoolName.DRAFT, hit_policy=PoolHitPolicy.ALL_PAGES)]
+        if isinstance(self.draft_token_to_kv_pool, NSATokenToKVPool):
+            transfers.append(
+                PoolTransfer(name=PoolName.DRAFT_INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES)
+            )
+        return transfers
+
+    def _extend_with_draft(
+        self, transfers: Optional[list[PoolTransfer]]
+    ) -> Optional[list[PoolTransfer]]:
+        """Append DRAFT PoolTransfers to an existing list (or create one)."""
+        draft = self._draft_pool_transfers()
+        if not draft:
+            return transfers
+        if transfers is None:
+            return draft
+        return transfers + draft
 
     # -- mamba PoolTransfer builders (D↔H↔S) ----------------------------------
 

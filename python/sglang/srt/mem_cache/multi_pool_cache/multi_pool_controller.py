@@ -23,10 +23,14 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostPoolGroup,
+    PoolEntry,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -146,7 +150,7 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-class HybridCacheController(BaseHiCacheController):
+class MultiPoolCacheController(BaseHiCacheController):
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -200,6 +204,51 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+
+    @classmethod
+    def from_entries(
+        cls,
+        entries: list[PoolEntry],
+        *,
+        token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator",
+        page_size: int,
+        transfer_layer_num: int,
+        tp_group: torch.distributed.ProcessGroup,
+        load_cache_event: threading.Event,
+        write_policy: str = "write_through_selective",
+        io_backend: str = "",
+        storage_backend: Optional[str] = None,
+        prefetch_threshold: int = 256,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        attn_cp_rank: int = 0,
+        attn_cp_size: int = 1,
+        enable_storage_metrics: bool = False,
+    ) -> tuple["HostPoolGroup", "MultiPoolCacheController"]:
+        """Generic factory: entries list -> (HostPoolGroup, controller)."""
+        host_pool_group = HostPoolGroup(entries)
+        controller = cls(
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            mem_pool_host=host_pool_group,
+            page_size=page_size,
+            tp_group=tp_group,
+            load_cache_event=load_cache_event,
+            write_policy=write_policy,
+            io_backend=io_backend,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+            transfer_layer_num=transfer_layer_num,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return host_pool_group, controller
 
     def attach_storage_backend(
         self,
@@ -261,7 +310,7 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_hybrid_indices(op)
+        host_indices, device_indices = self.move_pool_indices(op)
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -326,7 +375,7 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_hybrid_indices(op)
+        host_indices, device_indices = self.move_pool_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -445,7 +494,7 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
-    def move_hybrid_indices(self, operation):
+    def move_pool_indices(self, operation):
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
         )
