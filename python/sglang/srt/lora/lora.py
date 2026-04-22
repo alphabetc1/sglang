@@ -46,7 +46,6 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-
     def __init__(
         self,
         uid: str,
@@ -74,49 +73,74 @@ class LoRAAdapter(nn.Module):
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
-    # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules for filtering
+        for name, loaded_weight in loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                model_path, revision=revision, fall_back_to_pt=True
+            )
+        ):
+            self._process_weight(name, loaded_weight)
+
+        self._normalize_weights()
+
+    def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        for name, tensor in tensors.items():
+            self._process_weight(name, tensor)
+
+        self._normalize_weights()
+
+    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules
         )
 
-        for name, loaded_weight in loader._get_weights_iterator(
-            DefaultModelLoader.Source(
-                model_path, revision=revision, fall_back_to_pt=True
-            )
-        ):
-            layer_id = get_layer_id(name)
-            if layer_id is not None:
-                self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            elif "embed_tokens" in name or "lm_head" in name:
-                # Check if this module is declared in target_modules before loading
-                module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
-                if module_name in normalized_target_modules:
-                    self.embedding_layers[name] = loaded_weight.cpu()
-                else:
-                    logger.debug(
-                        f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
-                    )
-            elif "input_embeddings" in name or "output_embeddings" in name:
-                # added/extra token emb
-                self.added_tokens_embeddings[name] = loaded_weight.cpu()
-                assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
-                )
+        # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
+        # recognized and loaded into the correct buffer.
+        if "unembed_tokens" in name:
+            name = name.replace("unembed_tokens", "lm_head")
 
-        # normalize kv_proj and gate_up_proj
+        layer_id = get_layer_id(name)
+        if layer_id is not None:
+            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+        elif "embed_tokens" in name or "lm_head" in name:
+            # Check if this module is declared in target_modules before loading.
+            # When normalized_target_modules is {"all"} (e.g. target_modules was
+            # "all-linear"), we allow loading since the server-level
+            # --lora-target-modules will govern which modules are active.
+            module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
+            if (
+                "all" in normalized_target_modules
+                or module_name in normalized_target_modules
+            ):
+                self.embedding_layers[name] = loaded_weight.cpu()
+            else:
+                logger.debug(
+                    f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
+                )
+        elif "input_embeddings" in name or "output_embeddings" in name:
+            # added/extra token emb
+            self.added_tokens_embeddings[name] = loaded_weight.cpu()
+            assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
+                f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
+                f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
+            )
+
+    def _normalize_weights(self):
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
+            self._rename_expert_w_to_proj(layer.weights)
+            weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
+            weight_names = list(layer.weights.keys())
+            self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -171,6 +195,23 @@ class LoRAAdapter(nn.Module):
                     weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
 
+    def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
+        """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
+        normalize_gate_up_proj can stack them into gate_up_proj."""
+        renames = {}
+        for name in list(weights.keys()):
+            new_name = name
+            if ".w1." in name:
+                new_name = name.replace(".w1.", ".gate_proj.")
+            elif ".w3." in name:
+                new_name = name.replace(".w3.", ".up_proj.")
+            elif ".w2." in name:
+                new_name = name.replace(".w2.", ".down_proj.")
+            if new_name != name:
+                renames[name] = new_name
+        for old_name, new_name in renames.items():
+            weights[new_name] = weights.pop(old_name)
+
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
@@ -185,8 +226,9 @@ class LoRAAdapter(nn.Module):
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )
+                cat_dim = weights[weight_name].dim() - 2
                 weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), 0
+                    (weights[weight_name], weights[up_name]), cat_dim
                 )
                 weights.pop(weight_name)
                 if up_name in weights:
@@ -195,5 +237,46 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    ndim = weights[gate_up_name].dim()
+                    repeat_dims = [1] * ndim
+                    repeat_dims[ndim - 2] = 2
+                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def normalize_fused_qkv_a_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        """Fuse separate q_a_proj and kv_a_proj_with_mqa LoRA weights into
+        a single fused_qkv_a_proj_with_mqa entry (concat along dim 0 for
+        both A and B), matching the DeepSeek MLA fused projection layout."""
+        for weight_name in weight_names:
+            if "q_a_proj" not in weight_name:
+                continue
+            if "fused_qkv_a_proj_with_mqa" in weight_name:
+                continue
+
+            q_a_name = weight_name
+            kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+
+            kv_a_weight = (
+                weights[kv_a_name]
+                if kv_a_name in weights
+                else torch.zeros_like(weights[q_a_name])
+            )
+
+            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
+            weights.pop(q_a_name)
+            if kv_a_name in weights:
+                weights.pop(kv_a_name)
+
+    def pin_weights_in_cpu(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()

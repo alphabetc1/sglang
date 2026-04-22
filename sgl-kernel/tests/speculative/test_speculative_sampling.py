@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -967,4 +969,4 @@ def test_tree_speculative_sampling_target_only_rejmask_reject_masks_token_in_fin
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

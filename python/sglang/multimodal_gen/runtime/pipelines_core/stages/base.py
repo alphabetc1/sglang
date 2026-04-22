@@ -13,6 +13,7 @@ from enum import Enum, auto
 
 import torch
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -54,6 +55,8 @@ class PipelineStage(ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
+        if self.server_args.comfyui_mode:
+            return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
     def log_warning(self, msg, *args):
@@ -82,13 +85,6 @@ class PipelineStage(ABC):
                 result.add_check("image_latent", batch.image_latent, V.is_tensor)
                 return result
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            A VerificationResult containing the verification status.
-
         """
         # Default implementation - no verification
         return VerificationResult()
@@ -108,6 +104,11 @@ class PipelineStage(ABC):
         """
         pass
 
+    # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.ENCODER
+
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -119,9 +120,7 @@ class PipelineStage(ABC):
         """
         Verify the output for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             A VerificationResult containing the verification status.
@@ -182,9 +181,7 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.
@@ -204,7 +201,9 @@ class PipelineStage(ABC):
         with StageProfiler(
             stage_name,
             logger=logger,
-            timings=batch.timings,
+            metrics=batch.metrics,
+            log_stage_start_end=not batch.is_warmup
+            and not (self.server_args and self.server_args.comfyui_mode),
             perf_dump_path_provided=batch.perf_dump_path is not None,
         ):
             result = self.forward(batch, server_args)
@@ -231,9 +230,7 @@ class PipelineStage(ABC):
         This method should be implemented by subclasses to provide the forward
         processing logic for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.
