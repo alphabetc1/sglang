@@ -356,7 +356,10 @@ class SchedulerOutputProcessorMixin:
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
+        # In adaptive spec-v2, the worker state may already have switched when this
+        # delayed result is processed. Use the draft token count recorded on result.
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
             # -1 because prepare_for_decode pre-claimed the bonus slot.
