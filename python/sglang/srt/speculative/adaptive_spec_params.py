@@ -32,11 +32,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
-    if not server_args.disable_overlap_schedule:
-        return (
-            "the overlap scheduler (spec v2) is enabled "
-            "(adaptive is only implemented for EAGLEWorker v1)"
-        )
     if server_args.enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
