@@ -1,5 +1,6 @@
 # Test and Continuous Integration (CI) System in SGLang
 
+test
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
 - **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
