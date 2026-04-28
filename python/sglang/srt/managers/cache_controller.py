@@ -905,6 +905,13 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Best-effort draft L3 read before publishing target completion.
+            # Otherwise wait_complete can race and load back target KV before
+            # draft KV reaches host memory.
+            if self.has_draft:
+                self._draft_page_get(batch_hashes, batch_host_indices)
+
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -916,10 +923,6 @@ class HiCacheController:
             ):
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
-
-            # Best-effort draft L3 read alongside target.
-            if self.has_draft:
-                self._draft_page_get(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
