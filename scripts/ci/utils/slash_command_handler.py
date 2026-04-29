@@ -523,6 +523,47 @@ MULTIMODAL_PATH_TO_RUNNER = {
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
 
+def _known_test_groups():
+    groups = []
+    for group_dir in glob.glob("test/registered/*"):
+        if os.path.isdir(group_dir):
+            groups.append(group_dir[len("test/registered/") :])
+    return sorted(groups)
+
+
+def resolve_test_group_specs(group_name):
+    """
+    Resolve a test group name into /rerun-test specs.
+
+    A group maps to a directory under test/registered/. For example,
+    "hicache" maps to all test_*.py files under test/registered/hicache/.
+
+    Returns (test_specs, error_message). On success error_message is None.
+    """
+    group_name = group_name.strip().strip("/")
+    if (
+        not group_name
+        or group_name.startswith(".")
+        or "/." in group_name
+        or ".." in group_name.split("/")
+    ):
+        return [], f"Invalid test group `{group_name}`."
+
+    group_dir = f"test/registered/{group_name}"
+    if not os.path.isdir(group_dir):
+        known = ", ".join(f"`{g}`" for g in _known_test_groups())
+        return (
+            [],
+            f"Unknown test group `{group_name}`.\n\nKnown groups: {known}",
+        )
+
+    test_files = sorted(glob.glob(f"{group_dir}/test_*.py"))
+    if not test_files:
+        return [], f"No registered test files found in `{group_dir}`."
+
+    return [path[len("test/") :] for path in test_files], None
+
+
 def resolve_test_file(file_part):
     """
     Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
@@ -959,6 +1000,43 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
     return len(successes) > 0
 
 
+def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+    """
+    Handles the /rerun-group command. Expands one or more registered test
+    groups into test file specs, then reuses /rerun-test dispatch behavior.
+    """
+    if not group_names:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "Example:\n"
+            "- `/rerun-group hicache`"
+        )
+        return False
+
+    test_specs = []
+    failures = []
+    seen = set()
+    for group_name in group_names:
+        specs, err = resolve_test_group_specs(group_name)
+        if err:
+            failures.append((group_name, err))
+            continue
+
+        for spec in specs:
+            if spec not in seen:
+                test_specs.append(spec)
+                seen.add(spec)
+
+    if failures:
+        comment.create_reaction("confused")
+        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        pr.create_issue_comment("\n\n".join(lines))
+        return False
+
+    return handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token)
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -1039,6 +1117,10 @@ def main():
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+
+    elif first_line.startswith("/rerun-group"):
+        group_names = first_line.split()[1:]
+        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]
