@@ -53,12 +53,8 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-<<<<<<< fix/hicache-storage-v2-guard
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.mem_cache.storage.backend_factory import StorageCapability
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
-=======
->>>>>>> main
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
