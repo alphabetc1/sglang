@@ -402,6 +402,148 @@ def build_shared_anchor_stack(
     return host_pool_group, cache_controller
 
 
+def build_dsv4_compressed_stack(
+    *,
+    params: "CacheInitParams",
+    server_args: "ServerArgs",
+    c4_pool: Any,
+    c4_indexer_pool: Any,
+    c128_pool: Any,
+    swa_pool: Any,
+    swa_layer_mapping: dict,
+    swa_attn_allocator: Any,
+    page_size: int,
+    tp_group,
+    load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    storage_backend: Optional[str],
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    pp_rank: int = 0,
+    pp_size: int = 1,
+    attn_cp_rank: int = 0,
+    attn_cp_size: int = 1,
+    enable_storage_metrics: bool = False,
+) -> "tuple[HostPoolGroup, HybridCacheController]":
+    """Build host pool group + controller for DSV4 (c4 anchor, c4_indexer
+    + c128 share-indices side pools, SWA independent side pool).
+    """
+    from sglang.srt.mem_cache.dsv4_host_pool import (
+        C4HostPool,
+        C4IndexerHostPool,
+        C128HostPool,
+        SWAHostPool,
+    )
+
+    # c4 anchor.
+    c4_host = C4HostPool(
+        c4_pool,
+        server_args.hicache_ratio,
+        server_args.hicache_size,
+        page_size,
+        server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+
+    # c128 sized to anchor for share-indices. Wasteful (128:1 slot redundancy)
+    # but small in absolute terms (only 2 c128 layers in DSV4-Flash) and avoids
+    # any index-translation extension to the share-indices controller path.
+    c128_host = C128HostPool(
+        c128_pool,
+        anchor_size=c4_host.size,
+        page_size=page_size,
+        layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+
+    # c4_indexer reuses c4's slot layout (NSAIndexerPoolHost-style).
+    c4_indexer_host = C4IndexerHostPool(
+        c4_indexer_pool,
+        anchor_host=c4_host,
+        layout=server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+
+    # SWA host pool — independent indices, sized via swa_attn_allocator's pool.
+    swa_host = SWAHostPool(
+        swa_pool,
+        server_args.hicache_ratio,
+        server_args.hicache_size,
+        page_size,
+        server_args.hicache_mem_layout,
+        allocator_type=server_args.hicache_storage_backend,
+    )
+
+    c4_layer_mapping = {i: i for i in range(c4_pool.layer_num)}
+    c128_layer_mapping = {i: i for i in range(c128_pool.layer_num)}
+    transfer_layer_num = max(
+        len(c4_layer_mapping),
+        len(c128_layer_mapping),
+        len(swa_layer_mapping),
+    )
+
+    entries = [
+        build_pool_entry(
+            name=PoolName.C4,
+            host_pool=c4_host,
+            device_pool=c4_pool,
+            layer_mapping=c4_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.C4_INDEXER,
+            host_pool=c4_indexer_host,
+            device_pool=c4_indexer_pool,
+            layer_mapping=c4_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            share_indices_with_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.C128,
+            host_pool=c128_host,
+            device_pool=c128_pool,
+            layer_mapping=c128_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            share_indices_with_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=swa_host,
+            device_pool=swa_pool,
+            layer_mapping=swa_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            device_alloc_fn=swa_attn_allocator.alloc,
+            device_free_fn=swa_attn_allocator.free,
+        ),
+    ]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        page_size,
+        tp_group,
+        load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
 def attach_hybrid_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
@@ -413,6 +555,7 @@ def attach_hybrid_pool_to_unified_cache(
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MLATokenToKVPool,
@@ -426,6 +569,7 @@ def attach_hybrid_pool_to_unified_cache(
         swa_stack = isinstance(kvcache, SWAKVPool)
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
         nsa_stack = isinstance(kvcache, NSATokenToKVPool)
+        dsv4_stack = isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
         if mamba_stack:
             full_kv_pool = kvcache.full_kv_pool
@@ -441,6 +585,10 @@ def attach_hybrid_pool_to_unified_cache(
                 ComponentType.FULL,
                 ComponentType.SWA,
             }, "SWAKVPool currently only supports FULL + SWA in UnifiedRadixCache."
+        elif dsv4_stack:
+            # DSV4 has no single full_kv_pool; use c4_kv_pool as the anchor.
+            full_kv_pool = kvcache.c4_kv_pool
+            use_mla = False
         else:
             full_kv_pool = kvcache
             use_mla = isinstance(kvcache, MLATokenToKVPool)
@@ -564,6 +712,91 @@ def attach_hybrid_pool_to_unified_cache(
                 cache.full_kv_pool_host
             )
             transfer_layer_num = len(full_layer_mapping)
+        elif dsv4_stack:
+            assert set(cache.components.keys()) >= {
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.DSV4_COMPRESSED,
+            }, "DSV4 stack requires (FULL, SWA, DSV4_COMPRESSED) tree components"
+
+            # All-layers iteration; c4/c128 only fire on their respective layers
+            # via the per-pool layer mapper.
+            full_layer_mapping = {
+                global_id: item.compress_layer_id
+                for global_id, item in enumerate(kvcache.layer_mapping)
+                if item.compress_ratio == 4
+            }
+            swa_layer_mapping = {i: i for i in range(kvcache.swa_kv_pool.layer_num)}
+            allocator = params.token_to_kv_pool_allocator
+
+            host_pool_group, cache_controller = build_dsv4_compressed_stack(
+                params=params,
+                server_args=server_args,
+                c4_pool=kvcache.c4_kv_pool,
+                c4_indexer_pool=kvcache.c4_indexer_kv_pool,
+                c128_pool=kvcache.c128_kv_pool,
+                swa_pool=kvcache.swa_kv_pool,
+                swa_layer_mapping=swa_layer_mapping,
+                swa_attn_allocator=allocator.swa_attn_allocator,
+                page_size=cache.page_size,
+                tp_group=params.tp_cache_group,
+                load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
+                storage_backend=None,
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+                attn_cp_rank=params.attn_cp_rank,
+                attn_cp_size=params.attn_cp_size,
+            )
+
+            # Standard cache wiring.
+            cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.C4)
+            cache.host_pool_group = host_pool_group
+            cache.cache_controller = cache_controller
+
+            # FULL component owns the host_value lifecycle on the c4 anchor.
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
+            # SWAComponent owns SWA host backup (independent slot space).
+            cache.components[ComponentType.SWA]._swa_kv_pool_host = (
+                host_pool_group.get_pool(PoolName.SWA)
+            )
+
+            # Register c4_indexer + c128 as anchor-shared so write_backup
+            # includes their PoolTransfers in extra_pools; the controller fills
+            # in their host/device indices from the anchor via
+            # share_indices_with_anchor. c128 is sized to the anchor in v2 to
+            # eliminate the v1 correctness gap (c128 layers operating on
+            # uninitialized memory after host hit).
+            cache.register_hicache_anchor_kv_shared_indices_pool(
+                PoolName.C4_INDEXER,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+            cache.register_hicache_anchor_kv_shared_indices_pool(
+                PoolName.C128,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+
+            # Bind c4/c4_indexer/c128 host pool refs (used by DSV4_COMPRESSED's
+            # bookkeeping; the actual transfers go through the controller +
+            # share-indices flow above, not the component's hicache hooks).
+            comp = cache.components[ComponentType.DSV4_COMPRESSED]
+            comp._c4_pool_host = host_pool_group.get_pool(PoolName.C4)
+            comp._c4_indexer_pool_host = host_pool_group.get_pool(PoolName.C4_INDEXER)
+            comp._c128_pool_host = host_pool_group.get_pool(PoolName.C128)
+
+            # Wire alloc/free callbacks on DeepSeekV4TokenToKVPool: c4 / c4_indexer
+            # / c128 page-ids share the SWATokenToKVPoolAllocator.full_attn_allocator
+            # namespace (DSV4 has SWA, so the token pool allocator wraps full_attn
+            # + swa sub-allocators).
+            kvcache.register_compressed_free_alloc(
+                allocator.full_attn_allocator.free,
+                allocator.full_attn_allocator.alloc,
+            )
+
+            transfer_layer_num = max(len(full_layer_mapping), len(swa_layer_mapping))
         else:
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
@@ -601,6 +834,8 @@ def attach_hybrid_pool_to_unified_cache(
             pools_desc = "KV + SWA"
         elif nsa_stack:
             pools_desc = "KV + INDEXER"
+        elif dsv4_stack:
+            pools_desc = "C4 + C4_INDEXER + C128 + SWA"
         else:
             pools_desc = "KV"
         logger.info(

@@ -38,7 +38,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_deepseek_v4
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -318,6 +318,40 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# DSV4 HiCache v1 startup limits
+# ---------------------------------------------------------------------------
+
+
+def _assert_dsv4_hicache_v1_supported(server_args, model_config) -> None:
+    """Block unsupported DSV4-hicache combinations at startup.
+
+    v1 supports TP single-node + EAGLE/NextN. The combinations below are
+    explicitly out of scope and asserted out so users get a clear error
+    instead of silent fall-through.
+    """
+    if not is_deepseek_v4(model_config.hf_config):
+        return
+    if not getattr(server_args, "enable_hierarchical_cache", False):
+        return
+    if getattr(server_args, "enable_hisparse", False):
+        raise ValueError(
+            "DSV4 hicache v1 does not support --enable-hisparse. "
+            "Disable HiSparse or hicache. (Tracking: future PR)"
+        )
+    if getattr(server_args, "enable_dp_attention", False):
+        raise ValueError("DSV4 hicache v1 does not support --enable-dp-attention.")
+    if getattr(server_args, "pp_size", 1) > 1:
+        raise ValueError(
+            "DSV4 hicache v1 does not support pipeline parallelism (pp_size > 1)."
+        )
+    if getattr(server_args, "hicache_storage_backend", None) not in (None, "none"):
+        raise ValueError(
+            "DSV4 hicache v1 does not support --hicache-storage-backend; "
+            "L3 storage is deferred."
+        )
 
 
 class Scheduler(
@@ -865,6 +899,9 @@ class Scheduler(
             sliding_window_size=self.sliding_window_size,
         )
 
+        # DSV4 hicache v1 limits — fail fast on unsupported combos.
+        _assert_dsv4_hicache_v1_supported(server_args, self.model_config)
+
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -881,7 +918,10 @@ class Scheduler(
 
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
-            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or (
+                is_deepseek_v4(self.model_config.hf_config)
+                and self.enable_hierarchical_cache
+            ):
                 from sglang.srt.mem_cache.unified_cache_components import (
                     ComponentType,
                 )
@@ -894,6 +934,13 @@ class Scheduler(
                     tree_components.append(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
+                is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
+                if is_dsv4:
+                    # DSV4 always has SWA + new compressed component. SWA may already
+                    # be in the list above (when is_hybrid_swa is True); guard against dup.
+                    if ComponentType.SWA not in tree_components:
+                        tree_components.append(ComponentType.SWA)
+                    tree_components.append(ComponentType.DSV4_COMPRESSED)
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)
                 if self.enable_hierarchical_cache:

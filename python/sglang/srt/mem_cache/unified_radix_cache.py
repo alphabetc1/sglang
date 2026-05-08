@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
+    DSV4CompressedComponent,
     EvictLayer,
     FullComponent,
     MambaComponent,
@@ -190,6 +191,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
     ComponentType.SWA: SWAComponent,
+    ComponentType.DSV4_COMPRESSED: DSV4CompressedComponent,
 }
 
 logger = logging.getLogger(__name__)
@@ -339,6 +341,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if not self.disable:
+            key = key.page_aligned(self.page_size)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
@@ -349,7 +353,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
             )
-        key = key.page_aligned(self.page_size)
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
         return self._match_post_processor(params, value, last_node, best_value_len)

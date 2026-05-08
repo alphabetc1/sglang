@@ -471,6 +471,54 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    # ---- HiCache compressed-page helpers ----
+
+    def register_compressed_free_alloc(self, free_fn, alloc_fn) -> None:
+        """Wire the allocator's free/alloc callbacks for compressed pages.
+
+        Called by HybridPoolAssembler (T7) after the SWATokenToKVPoolAllocator
+        is fully constructed.  Both callables operate on page-id tensors that
+        are valid across c4 / c4_indexer / c128 (they share the same page-index
+        space as full attention).
+
+        Args:
+            free_fn:  callable(page_ids: torch.Tensor) -> None
+            alloc_fn: callable(num_pages: int) -> Optional[torch.Tensor]
+        """
+        self._compressed_free_fn = free_fn
+        self._compressed_alloc_fn = alloc_fn
+
+    def free_compressed_pages(self, page_ids: torch.Tensor) -> None:
+        """Free a set of page-ids across c4 / c4_indexer / c128 in lockstep.
+
+        Delegates to the allocator's full_attn_allocator.free, which was
+        injected via register_compressed_free_alloc during pool assembly.
+        All three compressed pools (c4, c4_indexer, c128) share the same
+        page-index space, so a single free call suffices.
+        """
+        free_fn = getattr(self, "_compressed_free_fn", None)
+        if free_fn is None:
+            raise RuntimeError(
+                "free_compressed_pages: allocator not yet registered — "
+                "call register_compressed_free_alloc first"
+            )
+        free_fn(page_ids)
+
+    def alloc_compressed_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        """Allocate page-ids valid across c4 / c4_indexer / c128.
+
+        Delegates to the allocator's full_attn_allocator.alloc, which was
+        injected via register_compressed_free_alloc during pool assembly.
+        Returns None if the pool is exhausted.
+        """
+        alloc_fn = getattr(self, "_compressed_alloc_fn", None)
+        if alloc_fn is None:
+            raise RuntimeError(
+                "alloc_compressed_pages: allocator not yet registered — "
+                "call register_compressed_free_alloc first"
+            )
+        return alloc_fn(num_pages)
+
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
         is_speculative = server_args.speculative_algorithm is not None
