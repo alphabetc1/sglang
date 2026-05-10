@@ -510,6 +510,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # Skip buffer registration when the anchor host pool is logical
+        # (no physical KV buffer — e.g. a placeholder pool used purely for
+        # slot bookkeeping in sidecar-only topologies). Sidecar pools that
+        # hold the real data still register themselves via
+        # ``register_mem_host_pool_v2``.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            self.gb_per_page = 0.0
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",

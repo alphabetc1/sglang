@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey, split_node_hash_value
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -88,6 +88,34 @@ class UnifiedTreeNode:
 
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
+
+    # ---- HiCache storage helpers (parity with TreeNode in radix_cache.py) ----
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Return the hash of the last page in this node, or ``None``."""
+        if not self.hash_value:
+            return None
+        return self.hash_value[-1]
+
+    def get_prefix_hash_values(self, node: Optional["UnifiedTreeNode"]) -> list[str]:
+        """Walk root→``node`` and concatenate per-page hashes."""
+        if node is None or node.hash_value is None:
+            return []
+        return node.get_prefix_hash_values(node.parent) + list(node.hash_value)
+
+    def protect_host(self) -> None:
+        """Increment the FULL component's host lock so this node's host_value
+        cannot be evicted while a storage op references it."""
+        self.component_data[ComponentType.FULL].host_lock_ref += 1
+
+    def release_host(self) -> None:
+        """Counterpart to ``protect_host``; raises if the lock was already
+        zero (mirrors TreeNode.release_host)."""
+        cd = self.component_data[ComponentType.FULL]
+        if cd.host_lock_ref > 0:
+            cd.host_lock_ref -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
 
 
 class UnifiedLRUList:
@@ -279,7 +307,12 @@ class UnifiedRadixCache(BasePrefixCache):
             int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
         ] = {}
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
-        self.enable_storage = False
+        # ``enable_storage`` reflects whether a storage backend is currently
+        # attached on the controller; it is owned by the storage attach/detach
+        # lifecycle, not by ``flush_cache`` (which only clears L1+L2 state).
+        # Initialize once on first construction; preserve it across resets.
+        if not hasattr(self, "enable_storage"):
+            self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
 
@@ -736,6 +769,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
         child.parent = new_node
         child.key = child.key[split_len:]
+
+        # Split per-page hash_value if it has been computed (consumers like
+        # HiCache storage and KV-cache events need correct prefix hashes on
+        # both sides of the split). Mirrors RadixCache._split_node.
+        if child.hash_value is not None:
+            new_hash, child_hash = split_node_hash_value(
+                child.hash_value, split_len, self.page_size
+            )
+            new_node.hash_value = new_hash
+            child.hash_value = child_hash
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
