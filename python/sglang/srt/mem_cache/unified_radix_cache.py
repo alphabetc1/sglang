@@ -37,7 +37,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.mem_cache.utils import convert_to_bigram_key, split_node_hash_value
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
@@ -736,6 +736,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         child.parent = new_node
         child.key = child.key[split_len:]
+
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
