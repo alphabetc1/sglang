@@ -53,17 +53,23 @@ class FullComponent(TreeComponent):
         params: MatchPrefixParams,
         value_chunks: list[torch.Tensor],
         best_value_len: int,
+        last_matched_leaf: UnifiedTreeNode,
     ) -> MatchResult:
-        # Compute Full KV host hit length: walk from last_host_node up to
-        # last_device_node, summing host_value lengths of evicted nodes.
+        # Walk from the matched leaf up through the FULL-evicted segment,
+        # accumulating host_value. Anchoring on result.last_host_node
+        # would be unsafe — that field is shaped by FULL.backuped walk-up
+        # for the prefetch-from-storage consumer and may sit above
+        # last_device_node.
         ct = self.component_type
         kv_host_hit = 0
-        node = result.last_host_node
+        node = last_matched_leaf
         root_node = self.cache.root_node
-        while node is not result.last_device_node and node is not root_node:
-            full_host = node.component_data[ct].host_value
-            if full_host is not None:
-                kv_host_hit += len(full_host)
+        while node is not root_node:
+            cd = node.component_data[ct]
+            if cd.value is not None:
+                break
+            if cd.host_value is not None:
+                kv_host_hit += len(cd.host_value)
             node = node.parent
         if kv_host_hit > 0:
             return result._replace(

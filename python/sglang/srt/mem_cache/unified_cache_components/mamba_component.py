@@ -64,6 +64,7 @@ class MambaComponent(TreeComponent):
         params: MatchPrefixParams,
         value_chunks: list[torch.Tensor],
         best_value_len: int,
+        last_matched_leaf: UnifiedTreeNode,
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
@@ -99,12 +100,21 @@ class MambaComponent(TreeComponent):
                     mamba_value, dst_index
                 )
 
-        # HiCache: if mamba was evicted from device but has host backup,
-        # ensure host_hit_length >= 1 so load_back is triggered.
-        host_node = result.last_host_node
-        cd = host_node.component_data[self.component_type]
-        if cd.value is None and cd.host_value is not None:
-            result = result._replace(host_hit_length=max(result.host_hit_length, 1))
+        # Walk from the matched leaf up through the mamba-evicted segment;
+        # signal load_back if any node is mamba-host-only. Anchoring here
+        # rather than on result.last_host_node avoids reading a FULL.backuped
+        # walk-up that may sit above last_device_node.
+        ct = self.component_type
+        node = last_matched_leaf
+        root_node = self.cache.root_node
+        while node is not root_node:
+            cd = node.component_data[ct]
+            if cd.value is not None:
+                break
+            if cd.host_value is not None:
+                result = result._replace(host_hit_length=max(result.host_hit_length, 1))
+                break
+            node = node.parent
 
         return result._replace(mamba_branching_seqlen=branching_seqlen)
 

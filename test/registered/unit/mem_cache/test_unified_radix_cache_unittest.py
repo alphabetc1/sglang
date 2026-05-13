@@ -1628,6 +1628,50 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_full_finalize_uses_leaf_anchor(self):
+        """A device-hit, unbacked leaf with a FULL-backed / SWA-gap ancestor
+        must not bump host_hit_length: FullComponent.finalize anchors on the
+        matched leaf, not on result.last_host_node (which the matcher's
+        walk-up may have promoted above last_device_node)."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        expected_pages = (sw + ps - 1) // ps
+        chain_pages = expected_pages + 2
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq: list[int] = []
+        for i in range(chain_pages):
+            seq = seq + self._make_seq(1000 * (i + 1), 1)
+            self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        leaf = m.last_device_node
+        chain: list = []
+        cur = leaf
+        while cur is not tree.root_node:
+            chain.append(cur)
+            cur = cur.parent
+        chain.reverse()
+        if len(chain) <= expected_pages:
+            self.skipTest("chain collapsed below the suffix length being tested")
+
+        backed_ancestor = chain[-(expected_pages + 1)]
+        backed_ancestor.component_data[ComponentType.FULL].host_value = (
+            backed_ancestor.component_data[ComponentType.FULL].value.clone()
+        )
+        backed_ancestor.component_data[ComponentType.SWA].value = None
+        backed_ancestor.component_data[ComponentType.SWA].host_value = None
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        self.assertIs(m.last_device_node, leaf)
+        self.assertEqual(m.host_hit_length, 0)
+
     def test_hicache_swa_host_independent_of_full(self):
         """FULL host and SWA host are physically independent.
         Freeing one component's host_value must not touch the other.
@@ -1731,6 +1775,7 @@ class UnifiedRadixCacheSuite:
                     params=MatchPrefixParams(key=RadixKey(self._make_seq(1, 1))),
                     value_chunks=[],
                     best_value_len=0,
+                    last_matched_leaf=leaf,
                 )
                 self.assertEqual(result.host_hit_length, expected)
 

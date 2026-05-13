@@ -92,7 +92,9 @@ class SWAComponent(TreeComponent):
         params: MatchPrefixParams,
         value_chunks: list[torch.Tensor],
         best_value_len: int,
+        last_matched_leaf: UnifiedTreeNode,
     ) -> MatchResult:
+        del last_matched_leaf  # SWA anchors on last_device_node.
         ct = self.component_type
         n_swa = 0
         node = result.last_device_node

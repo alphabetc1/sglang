@@ -721,6 +721,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 value_chunks=value,
                 best_value_len=best_value_len,
+                last_matched_leaf=last_node,
             )
         return result
 

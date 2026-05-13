@@ -132,6 +132,7 @@ class TreeComponent(ABC):
         params: MatchPrefixParams,
         value_chunks: list[torch.Tensor],
         best_value_len: int,
+        last_matched_leaf: UnifiedTreeNode,
     ) -> MatchResult:
         """Post-process the match result after prefix matching completes.
         - Full & SWA: pass through unchanged.
