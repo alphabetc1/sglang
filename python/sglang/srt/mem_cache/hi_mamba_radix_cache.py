@@ -29,10 +29,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from sglang.srt.mem_cache.hybrid_cache.controller import (
     PrefetchOperation,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+from sglang.srt.mem_cache.hybrid_cache.pool_assembler import (
     attach_hybrid_pool_to_mamba_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import (

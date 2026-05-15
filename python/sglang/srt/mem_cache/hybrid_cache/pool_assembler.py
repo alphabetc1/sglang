@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from sglang.srt.mem_cache.hybrid_cache.controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (

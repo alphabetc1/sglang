@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache_components.base import (
     CacheTransferPhase,
     ComponentType,
 )
@@ -1281,7 +1281,7 @@ class UnifiedRadixCacheSuite:
             stack.extend(node.children.values())
 
     def _init_hicache(self, tree):
-        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+        import sglang.srt.mem_cache.hybrid_cache.pool_assembler as assembler
 
         orig_kv_host_pool = assembler.MHATokenToKVPoolHost
         orig_mamba_host_pool = assembler.MambaPoolHost

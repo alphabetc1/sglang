@@ -297,7 +297,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        from sglang.srt.mem_cache.hybrid_cache.pool_assembler import (
             attach_hybrid_pool_to_unified_cache,
         )
 

@@ -62,11 +62,11 @@ node.component_data = {
 | File | Contents |
 |------|----------|
 | `../unified_radix_cache.py` | `UnifiedRadixCache`, `UnifiedTreeNode`, `UnifiedLRUList`, factory `create_unified_radix_cache` |
-| `tree_component.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
-| `full_component.py` | `FullComponent` — standard full-attention KV cache component |
-| `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
-| `mamba_component.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
-| `hybrid_cache_controller.py` | `HybridCacheController` — HiCache 3-tier storage controller (L1 GPU → L2 CPU → L3 Disk) |
+| `base.py` | `TreeComponent` ABC, `ComponentType`, `ComponentData`, `get_and_increase_time_counter`, `next_component_uuid` |
+| `full.py` | `FullComponent` — standard full-attention KV cache component |
+| `swa.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
+| `mamba.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
+| `../hybrid_cache/controller.py` | `HybridCacheController` — HiCache 3-tier storage controller (L1 GPU → L2 CPU → L3 Disk) |
 | `__init__.py` | Re-exports: `ComponentName`, `ComponentData`, `TreeComponent`, `FullComponent`, `SWAComponent`, `MambaComponent` |
 
 ---
@@ -248,7 +248,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 
 ## TreeComponent Hook Reference
 
-Each component implements these hooks. See `tree_component.py` for the ABC and docstrings.
+Each component implements these hooks. See `base.py` for the ABC and docstrings.
 
 ### Match Phase
 

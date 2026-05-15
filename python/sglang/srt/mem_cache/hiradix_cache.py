@@ -32,10 +32,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PrefetchTimeoutConfig,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+from sglang.srt.mem_cache.hybrid_cache.controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+from sglang.srt.mem_cache.hybrid_cache.pool_assembler import (
     attach_hybrid_nsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
