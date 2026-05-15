@@ -5,40 +5,14 @@ NOTE: class name 'HostTensorAllocator' but interface is allocate(dims, dtype)
 name; pool_host/ scope disambiguates from the device-side allocator package.
 """
 
-# ruff: noqa: F401
 from __future__ import annotations
 
 import abc
 import logging
-import threading
 from collections import defaultdict
-from dataclasses import dataclass
-from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.hicache_storage import PoolName
-    from sglang.srt.mem_cache.pool.hisparse import HiSparseC4DevicePool
-
-import numpy as np
-import psutil
 import torch
 
-from sglang.jit_kernel.hicache import (
-    can_use_hicache_jit_kernel,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
-)
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -46,23 +20,9 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
+    pass
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    pass
 
 logger = logging.getLogger(__name__)
 

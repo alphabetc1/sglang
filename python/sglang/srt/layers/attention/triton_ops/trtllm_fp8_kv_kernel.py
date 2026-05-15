@@ -458,7 +458,7 @@ def _naive_fp8_set_kv_buffer(
         raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}")
 
     # Determine target dtype and storage dtype
-    # See: python/sglang/srt/mem_cache/memory_pool.py:445-449
+    # See: python/sglang/srt/mem_cache/pool/mha.py (MHATokenToKVPool)
     store_dtype = k_cache.dtype
     if store_dtype == torch.uint8:
         # Cache is stored as uint8 for FP8 (due to index_put limitation)
@@ -467,7 +467,7 @@ def _naive_fp8_set_kv_buffer(
         dtype = store_dtype  # Cache dtype is the logical dtype
 
     # Replicate the original set_kv_buffer behavior
-    # See: python/sglang/srt/mem_cache/memory_pool.py:777-799
+    # See: python/sglang/srt/mem_cache/pool/mha.py (MHATokenToKVPool)
     if k.dtype != dtype:
         # Need quantization - clone first to avoid modifying input
         k = k.clone()

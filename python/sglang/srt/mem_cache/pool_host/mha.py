@@ -1,20 +1,7 @@
-# ruff: noqa: F401
 from __future__ import annotations
 
-import abc
 import logging
-import threading
-from collections import defaultdict
-from dataclasses import dataclass
-from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.hicache_storage import PoolName
-    from sglang.srt.mem_cache.pool.hisparse import HiSparseC4DevicePool
-
-import numpy as np
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -24,13 +11,7 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 from sglang.jit_kernel.hicache import (
-    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
-)
-from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
-)
-from sglang.jit_kernel.hicache import (
-    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
@@ -44,13 +25,9 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
         transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
@@ -64,12 +41,9 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 
 from sglang.srt.mem_cache.pool.mha import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, synchronized
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.tensor_allocator import (
     ALLOC_MEMORY_FUNCS,
-    HostTensorAllocator,
-    alloc_with_host_register,
-    alloc_with_pin_memory,
 )
 
 

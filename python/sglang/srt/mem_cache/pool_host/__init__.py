@@ -21,10 +21,14 @@ from sglang.srt.mem_cache.pool_host.tensor_allocator import (
 )
 
 __all__ = [
+    "ALLOC_MEMORY_FUNCS",
+    "DeepSeekV4PagedHostPool",
     "DeepSeekV4SingleKVPoolHost",
+    "DeepSeekV4StateHostPool",
     "HostKVCache",
     "HostPoolGroup",
     "HostTensorAllocator",
+    "LogicalHostPool",
     "MambaPoolHost",
     "MHATokenToKVPoolHost",
     "MLATokenToKVPoolHost",

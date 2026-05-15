@@ -1,24 +1,15 @@
 """DeepSeek V4 KV pools and compression-state helpers."""
 
-# ruff: noqa: F401
 from __future__ import annotations
 
-import abc
 import dataclasses
 import logging
-import threading
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, List, Literal, NamedTuple, Optional, Tuple, Union
+from contextlib import nullcontext
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
-import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
-from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import (
@@ -26,22 +17,11 @@ from sglang.srt.layers.attention.dsv4 import (
 )
 from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.attention.nsa import index_buf_accessor
-from sglang.srt.layers.attention.nsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
-from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.mem_cache.pool.base import BaseSWAKVPool, KVCache
 from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
-    set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
-    set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_div,
@@ -49,17 +29,9 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_mps,
     is_npu,
-    is_xpu,
-    next_power_of_2,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.managers.schedule_batch import Req
-
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +43,6 @@ _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
-
-logger = logging.getLogger(__name__)
 
 ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
