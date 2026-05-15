@@ -14,8 +14,8 @@ import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import (
+from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.pool.hisparse import (
     HiSparseC4DevicePool,
     HiSparseNSATokenToKVPool,
 )

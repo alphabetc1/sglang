@@ -16,7 +16,7 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:

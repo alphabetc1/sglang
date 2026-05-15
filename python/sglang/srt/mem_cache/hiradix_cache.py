@@ -38,15 +38,11 @@ from sglang.srt.mem_cache.hybrid_cache.controller import (
 from sglang.srt.mem_cache.hybrid_cache.pool_assembler import (
     attach_hybrid_nsa_pool_to_hiradix_cache,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    NSATokenToKVPool,
-)
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.pool.mha import MHATokenToKVPool
+from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
+from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,

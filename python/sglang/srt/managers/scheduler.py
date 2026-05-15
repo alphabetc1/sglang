@@ -1011,15 +1011,11 @@ class Scheduler(
         if draft_kv_pool is None:
             return
 
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MHATokenToKVPool,
-            MLATokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
-        )
+        from sglang.srt.mem_cache.pool.hybrid_linear import HybridLinearKVPool
+        from sglang.srt.mem_cache.pool.mha import MHATokenToKVPool
+        from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
         pool = draft_kv_pool
         if isinstance(pool, HybridLinearKVPool):

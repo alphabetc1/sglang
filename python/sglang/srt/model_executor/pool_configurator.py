@@ -26,8 +26,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.pool.deepseek_v4 import get_compress_state_ring_size
+from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 

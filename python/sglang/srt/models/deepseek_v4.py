@@ -85,7 +85,7 @@ if TYPE_CHECKING:
         DeepseekV4AttnBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         PPProxyTensors,

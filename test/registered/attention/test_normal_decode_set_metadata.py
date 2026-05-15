@@ -16,7 +16,7 @@ import torch
 from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.pool.swa import SWAKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

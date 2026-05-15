@@ -58,7 +58,7 @@ from sglang.srt.layers.attention.utils import (
     pad_sequence_with_mask,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.pool.swa import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)

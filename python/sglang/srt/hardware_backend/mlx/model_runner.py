@@ -37,7 +37,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 

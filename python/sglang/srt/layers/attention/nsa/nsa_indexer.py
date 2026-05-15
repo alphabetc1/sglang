@@ -84,7 +84,7 @@ from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0

@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils.common import get_device
 from sglang.test.test_utils import CustomTestCase

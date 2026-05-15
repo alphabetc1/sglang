@@ -108,7 +108,7 @@ class ForwardBatchDeepSeekMHAMixin:
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
 
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
 
         assert isinstance(
             self.token_to_kv_pool, MLATokenToKVPool

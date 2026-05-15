@@ -41,7 +41,8 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     TreeNode,
     get_last_access_time,
 )
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.pool.hybrid_linear import HybridLinearKVPool
+from sglang.srt.mem_cache.pool.req_to_token import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )

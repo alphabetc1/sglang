@@ -10,11 +10,9 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
-    DeepSeekV4SingleKVPoolHost,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.pool.hisparse import HiSparseNSATokenToKVPool
+from sglang.srt.mem_cache.pool_host.deepseek_v4 import DeepSeekV4SingleKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
@@ -23,7 +21,7 @@ from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 

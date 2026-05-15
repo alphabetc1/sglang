@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.base import HostKVCache
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -271,7 +271,7 @@ class HiCacheController:
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.pool.hybrid_linear import HybridLinearKVPool
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool

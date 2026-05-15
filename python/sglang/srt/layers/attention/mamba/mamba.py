@@ -25,7 +25,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.pool.mamba import MambaPool
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,

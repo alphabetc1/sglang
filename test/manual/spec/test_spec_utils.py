@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
+from sglang.srt.mem_cache.pool.base import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative.spec_utils import assign_draft_cache_locs
 from sglang.srt.utils import next_power_of_2
 

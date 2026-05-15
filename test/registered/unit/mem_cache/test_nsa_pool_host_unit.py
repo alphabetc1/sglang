@@ -2,11 +2,11 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.nsa import NSAIndexerPoolHost
+from sglang.srt.mem_cache.pool_host.tensor_allocator import (
     ALLOC_MEMORY_FUNCS,
-    MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu

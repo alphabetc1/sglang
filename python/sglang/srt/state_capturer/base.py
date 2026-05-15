@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)

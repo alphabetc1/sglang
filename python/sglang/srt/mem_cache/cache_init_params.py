@@ -7,7 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 

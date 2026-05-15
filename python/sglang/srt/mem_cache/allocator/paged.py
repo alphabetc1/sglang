@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 def alloc_extend_naive(

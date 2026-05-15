@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.group import PoolEntry
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:

@@ -12,7 +12,7 @@ import torch
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host.base import HostKVCache
 
 logger = logging.getLogger(__name__)
 

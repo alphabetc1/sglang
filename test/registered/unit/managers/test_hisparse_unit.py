@@ -80,7 +80,7 @@ class TestHiSparseUnit(unittest.TestCase):
             torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
         cls.tp_group = torch.distributed.group.WORLD
 
-        from sglang.srt.mem_cache.memory_pool_host import (
+        from sglang.srt.mem_cache.pool_host.tensor_allocator import (
             ALLOC_MEMORY_FUNCS,
             alloc_with_pin_memory,
         )
@@ -93,7 +93,7 @@ class TestHiSparseUnit(unittest.TestCase):
         from sglang.srt.mem_cache.allocator.hisparse import (
             HiSparseTokenToKVPoolAllocator,
         )
-        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
+        from sglang.srt.mem_cache.pool.hisparse import HiSparseNSATokenToKVPool
 
         cls.device_pool = HiSparseNSATokenToKVPool(
             size=SIZE,
@@ -118,7 +118,7 @@ class TestHiSparseUnit(unittest.TestCase):
             host_to_device_ratio=HOST_TO_DEVICE_RATIO,
         )
 
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
@@ -142,7 +142,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        from sglang.srt.mem_cache.memory_pool_host import ALLOC_MEMORY_FUNCS
+        from sglang.srt.mem_cache.pool_host.tensor_allocator import ALLOC_MEMORY_FUNCS
 
         ALLOC_MEMORY_FUNCS["cuda"] = cls._original_alloc
         if torch.distributed.is_initialized():

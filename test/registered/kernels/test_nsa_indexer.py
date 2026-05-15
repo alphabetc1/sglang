@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
 from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase

@@ -10,7 +10,8 @@ from typing import Tuple
 import torch
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.pool.base import KVCache
+from sglang.srt.mem_cache.pool.req_to_token import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)

@@ -20,7 +20,7 @@ if _use_aiter_preshuffle:
     from aiter.ops.cache import cp_gather_indexer_k_quant_cache
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
 
 """
 k: data, 128 item per token, fp8

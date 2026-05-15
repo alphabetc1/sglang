@@ -3,11 +3,12 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.pool.mha import MHATokenToKVPool
+from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.tensor_allocator import (
     ALLOC_MEMORY_FUNCS,
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu

@@ -3,11 +3,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-    get_tensor_size_bytes,
-)
+from sglang.srt.mem_cache.pool.base import get_tensor_size_bytes
+from sglang.srt.mem_cache.pool.mha import MHATokenToKVPool
+from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 

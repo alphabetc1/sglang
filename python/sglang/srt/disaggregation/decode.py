@@ -62,13 +62,13 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import (
+from sglang.srt.mem_cache.pool.base import KVCache
+from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.pool.req_to_token import (
     HybridReqToTokenPool,
-    KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.pool.swa import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,

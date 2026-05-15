@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
     from sglang.srt.layers.attention.dsv4.compressor import Compressor
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 

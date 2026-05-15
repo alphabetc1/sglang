@@ -22,20 +22,24 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseNSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    HybridReqToTokenPool,
+from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.pool.hisparse import HiSparseNSATokenToKVPool
+from sglang.srt.mem_cache.pool.hybrid_linear import HybridLinearKVPool
+from sglang.srt.mem_cache.pool.mha import (
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    NoOpMHATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool.mla import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
-    NoOpMHATokenToKVPool,
-    NSATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
+from sglang.srt.mem_cache.pool.req_to_token import (
+    HybridReqToTokenPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.pool.swa import SWAKVPool
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,

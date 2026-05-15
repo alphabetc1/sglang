@@ -7,17 +7,19 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
+from sglang.srt.mem_cache.pool_host.deepseek_v4 import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
-    HostPoolGroup,
     LogicalHostPool,
-    MambaPoolHost,
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.group import (
+    HostPoolGroup,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.nsa import NSAIndexerPoolHost
 
 if TYPE_CHECKING:
     import torch
@@ -644,13 +646,11 @@ def attach_hybrid_pool_to_unified_cache(
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import (
-        HybridLinearKVPool,
-        MLATokenToKVPool,
-        NSATokenToKVPool,
-    )
-    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang.srt.mem_cache.pool.deepseek_v4 import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.pool.hybrid_linear import HybridLinearKVPool
+    from sglang.srt.mem_cache.pool.mla import MLATokenToKVPool
+    from sglang.srt.mem_cache.pool.nsa import NSATokenToKVPool
+    from sglang.srt.mem_cache.pool.swa import SWAKVPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
     try:

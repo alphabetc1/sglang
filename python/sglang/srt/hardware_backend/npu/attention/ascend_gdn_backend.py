@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_prefill_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.mem_cache.pool.mamba import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput

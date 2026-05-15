@@ -1,9 +1,4 @@
-"""Device KV / SSM-state pools.
-
-One file per family. NOTE: Stage D introduces this public namespace; the
-underlying class definitions still live in the legacy files and are
-re-exported here. A follow-up PR will move the bodies in-place.
-"""
+"""Device KV / SSM-state pools. One file per family."""
 
 from sglang.srt.mem_cache.pool.base import (
     BaseSWAKVPool,
@@ -64,5 +59,4 @@ __all__ = [
     "copy_all_layer_kv_cache_tiled",
     "get_tensor_size_bytes",
     "move_kv_cache_native",
-    "NoOpMHATokenToKVPool",
 ]

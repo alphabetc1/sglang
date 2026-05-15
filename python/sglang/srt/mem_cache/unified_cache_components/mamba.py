@@ -36,7 +36,7 @@ class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
-        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.pool.req_to_token import HybridReqToTokenPool
 
         assert isinstance(
             cache.req_to_token_pool, HybridReqToTokenPool
