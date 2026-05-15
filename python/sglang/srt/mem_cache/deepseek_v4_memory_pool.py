@@ -156,89 +156,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         raise NotImplementedError("Use get_key_buffer instead.")
 
 
-class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        start_layer: int | None = None,
-        end_layer: int | None = None,
-    ):
-        super().__init__(
-            size,
-            page_size,
-            dtype,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-        )
-
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.kv_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.compress_ratio = 4
-
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
-    def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
-        mask = (full_indices + 1) % self.compress_ratio == 0
-        compressed_indices = full_indices[mask] // self.compress_ratio
-        return compressed_indices
-
-    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(
-            self.translate_loc_from_full_to_compressed(full_indices)
-        )
-
-    def set_key_buffer(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack,
-    ):
-        loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
-
-    def set_key_buffer_fused(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-    ) -> None:
-        loc = self.translate_loc_to_hisparse_device(loc)
-        return super().set_key_buffer_fused(layer_id, loc, cache_k)
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseC4DevicePool does not support get_cpu_copy")
-
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError("HiSparseC4DevicePool does not support load_cpu_copy")
-
-
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -429,6 +346,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         c4_kv_pool_type = DeepSeekV4SingleKVPool
         if enable_hisparse:
+            from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseC4DevicePool
+
             c4_kv_pool_type = HiSparseC4DevicePool
         self.c4_kv_pool = c4_kv_pool_type(
             c4_size,

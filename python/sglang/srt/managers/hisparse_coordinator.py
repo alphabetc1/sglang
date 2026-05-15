@@ -8,11 +8,13 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    DeepSeekV4SingleKVPoolHost,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4SingleKVPoolHost,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()

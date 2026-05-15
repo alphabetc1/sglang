@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseC4DevicePool
 
 import numpy as np
 import psutil
@@ -2590,3 +2591,118 @@ class NSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+
+class DeepSeekV4SingleKVPoolHost:
+
+    def __init__(
+        self,
+        device_pool: HiSparseC4DevicePool,
+        host_size: int,
+        page_size: int,
+        pin_memory: bool = True,
+        device: str = "cpu",
+    ):
+
+        assert host_size > 0, "Host size must be specified and greater than 0"
+        assert page_size == 1, "Host page size must be 1 for DeepSeekV4SingleKVPoolHost"
+
+        self.device_pool = device_pool
+        self.size = host_size
+        self.page_size = page_size
+        self.num_pages = (self.size + self.page_size - 1) // self.page_size
+        self.pin_memory = pin_memory
+        self.device = device
+
+        self.dtype = device_pool.store_dtype
+        self.layer_num = device_pool.layer_num
+        self.kv_cache_total_dim = device_pool.kv_cache_total_dim
+
+        self.kv_buffer = self.init_kv_buffer()
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.clear()
+
+    def clear(self):
+        self.free_slots = torch.arange(
+            1, self.num_pages + 1, dtype=torch.int64, device="cpu"
+        )
+
+    def init_kv_buffer(self):
+        dims = (self.layer_num, self.size + self.page_size, self.kv_cache_total_dim)
+        requested_bytes = (
+            self.layer_num
+            * (self.size + self.page_size)
+            * self.kv_cache_total_dim
+            * self.dtype.itemsize
+        )
+        host_mem = psutil.virtual_memory()
+        # preserve at least 10GB for other usage
+        ten_gb = 10 * (1024**3)
+        available_bytes = host_mem.available - ten_gb
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        else:
+            logger.info(
+                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+            )
+
+        host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
+        assert self.pin_memory, "DeepSeekV4SingleKVPoolHost requires pin_memory=True"
+        if self.pin_memory:
+            torch.cuda.cudart().cudaHostRegister(
+                host_pool.data_ptr(), host_pool.numel() * host_pool.element_size(), 0
+            )
+        return host_pool
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        from sglang.jit_kernel.deepseek_v4 import hisparse_offload_to_host
+
+        if host_indices.device != device_indices.device:
+            host_indices = host_indices.to(device=device_indices.device)
+        host_indices_i64 = (
+            host_indices.to(torch.int64)
+            if host_indices.dtype != torch.int64
+            else host_indices
+        )
+        device_indices_i64 = (
+            device_indices.to(torch.int64)
+            if device_indices.dtype != torch.int64
+            else device_indices
+        )
+        hisparse_offload_to_host(
+            gpu_ptrs=device_pool.data_ptrs,
+            cpu_ptrs=self.data_ptrs,
+            gpu_indices=device_indices_i64,
+            cpu_indices=host_indices_i64,
+        )
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size > self.available_size():
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+
+        return select_index
+
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        return len(indices)
