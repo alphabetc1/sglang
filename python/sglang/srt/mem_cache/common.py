@@ -437,9 +437,6 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices at a device tensor
         req_pool_indices: request pool indices as list
     """
-    # free out-of-window swa tokens
-    batch.maybe_evict_swa()
-
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
@@ -488,6 +485,16 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+
+    # Bind req_pool_idx now that req_to_token is populated. This is the single
+    # source of truth for extend; the outer prepare_for_extend loop no longer
+    # re-assigns it.
+    for req, pool_idx in zip(batch.reqs, req_pool_indices):
+        req.req_pool_idx = pool_idx
+
+    # Free out-of-window SWA tokens. Must run after write_cache_indices and the
+    # req_pool_idx binding above — _evict_swa indexes req_to_token[req_pool_idx, ...].
+    batch.maybe_evict_swa()
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 

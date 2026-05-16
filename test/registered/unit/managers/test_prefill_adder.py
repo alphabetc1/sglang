@@ -2,12 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_batch import Req
+import torch
+
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -543,6 +546,48 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(result)
         req.set_extend_input_len.assert_called_once_with(200)
         self.assertIn(req, adder.can_run_list)
+
+
+class TestScheduleBatchSwaEviction(CustomTestCase):
+    def _make_radix_extend_batch(self, req):
+        page_size = 256
+        token_allocator = MagicMock()
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(4096, dtype=torch.int64).view(1, -1)
+        )
+        tree_cache = MagicMock()
+        tree_cache.supports_swa.return_value = True
+        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.sliding_window_size = 512
+        tree_cache.page_size = page_size
+
+        batch = ScheduleBatch(
+            reqs=[req],
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_allocator,
+            tree_cache=tree_cache,
+            forward_mode=ForwardMode.EXTEND,
+            enable_overlap=False,
+        )
+        batch.prefix_lens = [2048]
+        return batch, token_allocator
+
+    def test_radix_extend_frees_out_of_window_uncached_swa(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        page_size = 256
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            cache_protected_len=page_size,
+            swa_evicted_seqlen=page_size,
+        )
+        batch, token_allocator = self._make_radix_extend_batch(req)
+
+        batch.maybe_evict_swa()
+
+        token_allocator.free_swa.assert_called_once()
+        freed = token_allocator.free_swa.call_args.args[0]
+        self.assertEqual(freed.tolist(), list(range(page_size, 1280)))
+        self.assertEqual(req.swa_evicted_seqlen, 1280)
 
 
 if __name__ == "__main__":
