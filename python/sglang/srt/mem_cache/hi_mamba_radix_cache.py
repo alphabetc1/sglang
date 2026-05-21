@@ -1725,8 +1725,19 @@ class HiMambaRadixCache(MambaRadixCache):
             self.evict_host,
         )
         if host_indices is None:
-            self._release_host_node(last_host_node, release_mamba=False)
-            return
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % self.page_size)
+            if prefetch_length >= self.prefetch_threshold:
+                new_input_tokens = new_input_tokens[:prefetch_length]
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    prefetch_length
+                )
+                if host_indices is None:
+                    self._release_host_node(last_host_node, release_mamba=False)
+                    return
+            else:
+                self._release_host_node(last_host_node, release_mamba=False)
+                return
 
         # Allocate host mamba slot
         extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
