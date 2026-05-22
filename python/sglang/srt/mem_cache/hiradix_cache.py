@@ -861,12 +861,19 @@ class HiRadixCache(RadixCache):
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
 
+    def _backup_aware_priority(self, node: TreeNode):
+        """Tier-aware priority for write-through: prefer evicting backed-up nodes
+        so non-backed-up nodes stay on GPU and avoid permanent data loss."""
+        if self.cache_controller.write_policy != "write_back" and node.backuped:
+            return (0, self.eviction_strategy.get_priority(node))
+        return (1, self.eviction_strategy.get_priority(node))
+
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self._backup_aware_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -897,7 +904,7 @@ class HiRadixCache(RadixCache):
                     break
             else:
                 # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self._backup_aware_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
