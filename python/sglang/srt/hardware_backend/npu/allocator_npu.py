@@ -2,10 +2,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.allocator import (
-    PagedTokenToKVPoolAllocator,
-    alloc_extend_naive,
-)
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.paged import alloc_extend_naive
 from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
