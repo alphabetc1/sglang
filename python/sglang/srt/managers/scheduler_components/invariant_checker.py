@@ -113,7 +113,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            self.req_to_token_pool.mamba_allocator.size,
         )
         if leak:
             # Page-level leak diagnosis for mamba
@@ -129,12 +129,14 @@ class SchedulerInvariantChecker:
                 expected_full_pages - free_full_pages - cached_full_pages
             )
             free_mamba_pages = set(
-                self.req_to_token_pool.mamba_pool.free_slots.tolist()
+                self.req_to_token_pool.mamba_allocator.free_slots.tolist()
             )
             cached_mamba_pages = set(
                 self.tree_cache.all_mamba_values_flatten().tolist()
             )
-            expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+            expected_mamba_pages = set(
+                range(self.req_to_token_pool.mamba_allocator.size)
+            )
             leaked_mamba_pages = (
                 expected_mamba_pages - free_mamba_pages - cached_mamba_pages
             )

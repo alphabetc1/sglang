@@ -499,6 +499,7 @@ def build_hybrid_mamba_stack(
     server_args: ServerArgs,
     kv_pool: Any,
     mamba_pool: Any,
+    mamba_allocator: Any,
     full_layer_mapping: dict[int, int],
     mamba_layer_mapping: dict[int, int],
     page_size: int,
@@ -548,6 +549,8 @@ def build_hybrid_mamba_stack(
             transfer_layer_num=transfer_layer_num,
             host_evict_fn=host_mamba_evict_fn,
             device_evict_fn=device_mamba_evict_fn,
+            device_alloc_fn=mamba_allocator.alloc,
+            device_free_fn=mamba_allocator.free,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
@@ -795,6 +798,7 @@ class _MambaStrategy(StackStrategy):
             server_args=server_args,
             kv_pool=kvcache.full_kv_pool,
             mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_allocator=params.req_to_token_pool.mamba_allocator,
             full_layer_mapping=full_layer_mapping,
             mamba_layer_mapping=mamba_layer_mapping,
             page_size=cache.page_size,
@@ -1221,6 +1225,7 @@ def attach_hybrid_pool_to_mamba_cache(
             server_args=server_args,
             kv_pool=kvcache,
             mamba_pool=params.req_to_token_pool.mamba_pool,
+            mamba_allocator=params.req_to_token_pool.mamba_allocator,
             full_layer_mapping=full_layer_mapping,
             mamba_layer_mapping=mamba_layer_mapping,
             page_size=params.page_size,

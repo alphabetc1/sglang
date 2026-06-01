@@ -1,5 +1,10 @@
+import importlib.util
+import sys
+import types
 import unittest
 from array import array
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -109,7 +114,7 @@ class TestMamba(unittest.TestCase):
         )
 
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         sampling_params = SamplingParams(
             temperature=0,
@@ -125,34 +130,161 @@ class TestMamba(unittest.TestCase):
         # alloc req
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # free req
         req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
+        assert req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
 
         # alloc again
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
-        assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
+        assert (
+            req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
+        )
+
+    def test_hi_mamba_cow_uses_mamba_allocator(self):
+        class NoAllocMambaPool:
+            pass
+
+        class RecordingAllocator:
+            def __init__(self):
+                self.calls = []
+
+            def alloc(self, need_size):
+                self.calls.append(need_size)
+                return torch.tensor([13], dtype=torch.int64)
+
+        class NoopLRU:
+            def reset_node_and_parents_mru(self, *args):
+                pass
+
+        allocator = RecordingAllocator()
+        tree = object.__new__(HiMambaRadixCache)
+        tree.root_node = TreeNode()
+        tree.req_to_token_pool = SimpleNamespace(
+            mamba_pool=NoAllocMambaPool(),
+            mamba_allocator=allocator,
+        )
+        tree.full_lru_list = NoopLRU()
+        tree.mamba_lru_list = NoopLRU()
+        tree.device = "cpu"
+        tree.evict_mamba = lambda _: self.fail("eviction should not run")
+
+        node = TreeNode()
+        node.parent = tree.root_node
+        node.value = torch.tensor([1], dtype=torch.int64)
+        node.mamba_value = torch.tensor([2], dtype=torch.int64)
+        req = SimpleNamespace(mamba_pool_idx=None)
+
+        tree._match_post_processor(
+            MatchPrefixParams(key=RadixKey(array("q", [1])), cow_mamba=True, req=req),
+            value=[torch.tensor([1], dtype=torch.int64)],
+            best_last_node=node,
+            best_value_len=1,
+        )
+
+        self.assertEqual(allocator.calls, [1])
+        self.assertEqual(req.mamba_pool_idx.item(), 13)
+
+    def test_hi_mamba_load_back_uses_mamba_allocator(self):
+        class NoAllocMambaPool:
+            pass
+
+        class RecordingAllocator:
+            def __init__(self):
+                self.calls = []
+
+            def alloc(self, need_size):
+                self.calls.append(need_size)
+                return torch.tensor([17], dtype=torch.int64)
+
+        allocator = RecordingAllocator()
+        tree = object.__new__(HiMambaRadixCache)
+        tree.req_to_token_pool = SimpleNamespace(
+            mamba_pool=NoAllocMambaPool(),
+            mamba_allocator=allocator,
+        )
+        tree.evict_mamba = lambda _: self.fail("eviction should not run")
+
+        node = TreeNode()
+        node.mamba_host_value = torch.tensor([11], dtype=torch.int64)
+        req = SimpleNamespace(mamba_pool_idx=None)
+
+        transfers = tree.mamba_restore_transfers(node, [node], req)
+
+        self.assertEqual(allocator.calls, [1])
+        self.assertEqual(req.mamba_pool_idx.item(), 17)
+        self.assertIsNotNone(transfers)
+        self.assertTrue(any(t.device_indices is not None for t in transfers))
+
+    def test_mlx_auxiliary_req_pool_exposes_mamba_allocator_alias(self):
+        mlx_mod = types.ModuleType("mlx")
+        mlx_core_mod = types.ModuleType("mlx.core")
+        mlx_core_mod.array = type("FakeMlxArray", (), {})
+        mlx_core_mod.eval = lambda *args: None
+        mlx_mod.core = mlx_core_mod
+        old_mlx = sys.modules.get("mlx")
+        old_mlx_core = sys.modules.get("mlx.core")
+        sys.modules["mlx"] = mlx_mod
+        sys.modules["mlx.core"] = mlx_core_mod
+        try:
+            aux_path = (
+                Path(__file__).parents[4]
+                / "python/sglang/srt/hardware_backend/mlx/kv_cache/auxiliary_state.py"
+            )
+            spec = importlib.util.spec_from_file_location(
+                "_mlx_auxiliary_state_for_test", aux_path
+            )
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            pool = module.MlxAuxiliaryStateReqToTokenPool(
+                size=2,
+                max_context_len=4,
+                device="cpu",
+                enable_memory_saver=False,
+                auxiliary_state_size=3,
+            )
+        finally:
+            if old_mlx is None:
+                sys.modules.pop("mlx", None)
+            else:
+                sys.modules["mlx"] = old_mlx
+            if old_mlx_core is None:
+                sys.modules.pop("mlx.core", None)
+            else:
+                sys.modules["mlx.core"] = old_mlx_core
+            sys.modules.pop("_mlx_auxiliary_state_for_test", None)
+
+        self.assertIs(pool.mamba_allocator, pool.auxiliary_state_pool)
+        allocated = pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(allocated)
+        self.assertEqual(allocated.item(), 1)
 
     def test_mamba_radix_cache_1(self):
         tree, allocator, req_to_token_pool, make_dummy_req = (
             self._setup_tree_and_allocator()
         )
         mamba_pool = req_to_token_pool.mamba_pool
+        mamba_allocator = req_to_token_pool.mamba_allocator
         # test
         print(
-            f"[Start] allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"[Start] allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req1 = make_dummy_req()
         req1_token_ids, req1_kv_indices = [1, 2, 3], allocator.alloc(3)
@@ -170,7 +302,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req2 = make_dummy_req()
         req2_token_ids, req2_kv_indices = [1, 2, 3, 4, 5, 6, 7], allocator.alloc(7)
@@ -188,7 +320,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         req3 = make_dummy_req()
@@ -207,7 +339,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
         req4 = make_dummy_req()
         req4_token_ids, req4_kv_indices = [1, 2, 3, 4, 5, 60, 70], allocator.alloc(7)
@@ -225,7 +357,7 @@ class TestMamba(unittest.TestCase):
         )
         prefix_len = result.prefix_len
         print(
-            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
+            f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_allocator.available_size()}, full available size: {allocator.available_size()}"
         )
 
         tree.pretty_print()
@@ -552,8 +684,9 @@ class TestMamba(unittest.TestCase):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
         _, _, req_to_token_pool, _ = self._setup_tree_and_allocator()
         mamba_pool = req_to_token_pool.mamba_pool
+        mamba_allocator = req_to_token_pool.mamba_allocator
         n = 3
-        indices = mamba_pool.alloc(n)
+        indices = mamba_allocator.alloc(n)
         self.assertIsNotNone(indices)
 
         # Write known sentinel values at the allocated slots.
@@ -608,7 +741,7 @@ class TestMamba(unittest.TestCase):
         n_tokens = 4
         kv_indices = allocator.alloc(n_tokens)
         self.assertIsNotNone(kv_indices)
-        mamba_indices = mamba_pool.alloc(1)
+        mamba_indices = req_to_token_pool.mamba_allocator.alloc(1)
         self.assertIsNotNone(mamba_indices)
 
         # Write sentinel values into KV buffers (all full-attention layers).

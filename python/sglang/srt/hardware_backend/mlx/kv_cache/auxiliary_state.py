@@ -215,6 +215,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        self.mamba_allocator = self.auxiliary_state_pool
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
