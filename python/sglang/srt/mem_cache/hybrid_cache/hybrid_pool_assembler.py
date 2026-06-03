@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
+
+import numpy as np
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -45,12 +47,103 @@ def _make_layer_mapper(
     return mapper
 
 
+class AnchorGroup(NamedTuple):
+    name: str
+    device_pages: int
+    bytes_per_page: int  # sum across all pools sharing this group; 0 for logical
+
+
+class Capacity(NamedTuple):
+    """Resolved capacity for one anchor group, in both views.
+
+    Pick the field that matches your host pool's constructor:
+      * pools accepting ``num_host_pages``: use ``host_pages``
+      * pools accepting ``host_size`` (GB): use ``host_size_gb``
+    Both fields are always populated; callers never need conditionals.
+    """
+
+    host_pages: int
+    host_size_gb: float
+
+
+def resolve_anchor_capacities(
+    server_args: ServerArgs, groups: List[AnchorGroup]
+) -> List[Capacity]:
+    """Resolve per-group capacity from --hicache-size or --hicache-ratio.
+
+    A uniform scaling R is derived once across all groups (back-solved from
+    --hicache-size; or = hicache_ratio). Each group's capacity is then given
+    in both views — host_pages and host_size_gb — sharing that R. Both views
+    are arithmetically consistent.
+
+    To add a new hybrid architecture: list its anchor groups, call this, and
+    feed the appropriate field of each capacity to each host pool.
+    """
+    if server_args.hicache_size > 0:
+        device_bytes = sum(g.device_pages * g.bytes_per_page for g in groups)
+        if device_bytes <= 0:
+            raise ValueError(
+                "--hicache-size requires at least one anchor group with non-zero "
+                "device-side bytes"
+            )
+        ratio = server_args.hicache_size * 1e9 / device_bytes
+    else:
+        ratio = server_args.hicache_ratio
+    return [
+        Capacity(
+            host_pages=max(int(g.device_pages * ratio), g.device_pages + 1),
+            host_size_gb=ratio * g.device_pages * g.bytes_per_page / 1e9,
+        )
+        for g in groups
+    ]
+
+
+def _kv_bytes_per_page(
+    device_pool,
+    page_size: int,
+    use_mla: bool,
+    override_kv_cache_dim: Optional[int] = None,
+) -> int:
+    dtype_size = device_pool.store_dtype.itemsize
+    layer_num = device_pool.layer_num
+    if use_mla:
+        kv_cache_dim = override_kv_cache_dim or (
+            device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+        )
+        return kv_cache_dim * dtype_size * layer_num * page_size
+    # MHA stores K and V separately, hence the *2.
+    return (
+        device_pool.head_num
+        * device_pool.head_dim
+        * 2
+        * dtype_size
+        * layer_num
+        * page_size
+    )
+
+
+def _mamba_bytes_per_page(device_pool) -> int:
+    # MambaPoolHost uses page_size=1, so bytes_per_page == size_per_token.
+    cache = device_pool.mamba_cache
+    conv_bytes = sum(int(np.prod(c.shape[2:])) * c.dtype.itemsize for c in cache.conv)
+    temporal_bytes = (
+        int(np.prod(cache.temporal.shape[2:])) * cache.temporal.dtype.itemsize
+    )
+    return (conv_bytes + temporal_bytes) * device_pool.num_mamba_layers
+
+
+def _state_pool_bytes_per_page(state_pool) -> int:
+    state_tensor = state_pool.kv_score_buffer.kv_score
+    return state_pool.ring_size * state_tensor[0].nbytes
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
     page_size: int,
     server_args: ServerArgs,
     use_mla: bool,
+    host_size_gb: float,
     override_kv_cache_dim: Optional[int] = None,
 ):
     kv_host_pool_cls = MLATokenToKVPoolHost if use_mla else MHATokenToKVPoolHost
@@ -60,7 +153,7 @@ def build_kv_host_pool(
     return kv_host_pool_cls(
         kv_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        host_size_gb,
         page_size,
         server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
@@ -121,6 +214,7 @@ def build_kv_only_stack(
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_gb=server_args.hicache_size,
         override_kv_cache_dim=override_kv_cache_dim,
     )
     entries = [
@@ -181,17 +275,34 @@ def build_hybrid_swa_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+    [kv, swa] = resolve_anchor_capacities(
+        server_args,
+        [
+            AnchorGroup(
+                "KV",
+                full_kv_pool.size // page_size,
+                _kv_bytes_per_page(full_kv_pool, page_size, use_mla),
+            ),
+            AnchorGroup(
+                "SWA",
+                swa_kv_pool.size // page_size,
+                _kv_bytes_per_page(swa_kv_pool, page_size, use_mla),
+            ),
+        ],
+    )
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_gb=kv.host_size_gb,
     )
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_gb=swa.host_size_gb,
     )
 
     # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
@@ -247,22 +358,41 @@ def _deepseek_v4_num_host_pages(
     kvcache: Any,
     page_size: int,
     swa_page_size: int,
+    c4_state_global_layers: List[int],
+    c128_state_global_layers: List[int],
 ) -> tuple[int, int]:
     allocator = params.token_to_kv_pool_allocator
-    device_full_size = getattr(allocator, "size_full", kvcache.size)
-    device_full_pages = (device_full_size + page_size - 1) // page_size
-
+    device_full_pages = (
+        getattr(allocator, "size_full", kvcache.size) + page_size - 1
+    ) // page_size
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
-    if server_args.hicache_size > 0:
-        raise ValueError(
-            "DeepSeek V4 HiCache currently does not support --hicache-size; "
-            "use --hicache-ratio instead."
+    # FULL group: LogicalHostPool (0 bytes) + C4/C128 paged side pools.
+    # SWA group: swa_kv_pool + per-family state pools.
+    full_bpp = 0
+    swa_bpp = kvcache.swa_kv_pool.bytes_per_page_padded
+    if c4_state_global_layers:
+        c4_layer = c4_state_global_layers[0]
+        full_bpp += kvcache.c4_kv_pool.bytes_per_page_padded
+        idx_buf = kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0]
+        full_bpp += idx_buf.shape[1] * idx_buf.element_size()
+        swa_bpp += _state_pool_bytes_per_page(kvcache.compress_state_pools[c4_layer])
+        swa_bpp += _state_pool_bytes_per_page(
+            kvcache.indexer_compress_state_pools[c4_layer]
         )
-    ratio = server_args.hicache_ratio
-    full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
-    swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
-    return full_host_pages, swa_host_pages
+    if c128_state_global_layers:
+        c128_layer = c128_state_global_layers[0]
+        full_bpp += kvcache.c128_kv_pool.bytes_per_page_padded
+        swa_bpp += _state_pool_bytes_per_page(kvcache.compress_state_pools[c128_layer])
+
+    [full, swa] = resolve_anchor_capacities(
+        server_args,
+        [
+            AnchorGroup("FULL", device_full_pages, full_bpp),
+            AnchorGroup("SWA", device_swa_pages, swa_bpp),
+        ],
+    )
+    return full.host_pages, swa.host_pages
 
 
 def build_deepseek_v4_hicache_stack(
@@ -318,6 +448,8 @@ def build_deepseek_v4_hicache_stack(
         kvcache=kvcache,
         page_size=page_size,
         swa_page_size=kvcache.swa_page_size,
+        c4_state_global_layers=c4_state_global_layers,
+        c128_state_global_layers=c128_state_global_layers,
     )
 
     logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
@@ -518,16 +650,29 @@ def build_hybrid_mamba_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+    [kv, mamba] = resolve_anchor_capacities(
+        server_args,
+        [
+            AnchorGroup(
+                "KV",
+                kv_pool.size // page_size,
+                _kv_bytes_per_page(kv_pool, page_size, use_mla),
+            ),
+            # MambaPool uses page_size=1, so device_pages == size.
+            AnchorGroup("MAMBA", mamba_pool.size, _mamba_bytes_per_page(mamba_pool)),
+        ],
+    )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_gb=kv.host_size_gb,
     )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
-        server_args.hicache_size,
+        mamba.host_size_gb,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
     )
@@ -602,6 +747,7 @@ def build_anchor_sidecar_stack(
         page_size=page_size,
         server_args=server_args,
         use_mla=use_mla,
+        host_size_gb=server_args.hicache_size,
         override_kv_cache_dim=override_kv_cache_dim,
     )
     sidecar_host_pool = sidecar_host_pool_factory(kv_host_pool)
