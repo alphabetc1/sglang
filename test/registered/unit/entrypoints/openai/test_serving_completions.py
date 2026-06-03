@@ -15,6 +15,7 @@ from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
+from fastapi.responses import Response
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -51,6 +52,7 @@ class ServingCompletionTestCase(unittest.TestCase):
 
         tm.model_config = Mock(is_multimodal=False)
         tm.server_args = Mock(enable_cache_report=False)
+        tm.request_logger = Mock(log_requests=False, log_requests_level=0)
 
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()
@@ -58,6 +60,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.template_manager = _MockTemplateManager()
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
+        self.fastapi_request.headers = {}
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
@@ -189,6 +192,35 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
+
+    def test_non_streaming_completion_handle_request_returns_pre_serialized_response(
+        self,
+    ):
+        async def _mock_generate(*args, **kwargs):
+            yield {
+                "text": " world",
+                "meta_info": {
+                    "id": "cmpl-fast-path",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "default",
+                },
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=10)
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.sc.handle_request(req, self.fastapi_request)
+        )
+
+        self.assertIsInstance(response, Response)
+        self.assertEqual(response.media_type, "application/json")
+        payload = json.loads(response.body)
+        self.assertEqual(payload["choices"][0]["text"], " world")
+        self.assertEqual(payload["metadata"]["weight_version"], "default")
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""

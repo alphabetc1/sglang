@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from enum import Enum
+from functools import lru_cache
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -45,7 +46,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    mark_frontend_timing,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -74,6 +78,32 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _dump_tool_schema_for_cache(schema: Any) -> Optional[bytes]:
+    try:
+        return orjson.dumps(schema)
+    except (TypeError, orjson.JSONEncodeError):
+        return None
+
+
+@lru_cache(maxsize=1024)
+def _normalize_and_validate_tool_schema_cached(schema_key: bytes) -> bytes:
+    schema = orjson.loads(schema_key)
+    normalize_json_schema_types(schema)
+    Draft202012Validator.check_schema(schema)
+    return orjson.dumps(schema)
+
+
+def _normalize_and_validate_tool_schema(schema: Any) -> Any:
+    schema_key = _dump_tool_schema_for_cache(schema)
+    if schema_key is None:
+        normalized = copy.deepcopy(schema)
+        normalize_json_schema_types(normalized)
+        Draft202012Validator.check_schema(normalized)
+        return normalized
+
+    return orjson.loads(_normalize_and_validate_tool_schema_cached(schema_key))
 
 
 def normalize_tool_content(role: str, content):
@@ -127,6 +157,7 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    _enable_non_streaming_response_fast_path = True
     _default_sampling_params_logged = False
 
     def __init__(
@@ -423,8 +454,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # to standard JSON Schema types before validation. RecursionError
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
-                normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                tool.function.parameters = _normalize_and_validate_tool_schema(
+                    tool.function.parameters
+                )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -474,14 +506,18 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
+        mark_frontend_timing("process_messages_start")
         processed_messages = self._process_messages(request, is_multimodal)
+        mark_frontend_timing("process_messages_finish")
 
         # Build sampling parameters
+        mark_frontend_timing("sampling_params_start")
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
+        mark_frontend_timing("sampling_params_finish")
 
         # Handle single vs multiple requests
         if is_multimodal:
@@ -507,6 +543,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         require_reasoning = self._get_reasoning_from_request(request)
 
+        mark_frontend_timing("generate_req_input_start")
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -540,6 +577,7 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
         )
+        mark_frontend_timing("generate_req_input_finish")
 
         return adapted_request, request
 
@@ -1151,22 +1189,46 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
         try:
+            mark_frontend_timing("tokenizer_manager_start")
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
+            mark_frontend_timing("tokenizer_manager_finish")
         except ValueError as e:
             return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
             ret = [ret]
 
+        mark_frontend_timing("response_build_start")
         response = self._build_chat_response(
             request,
             ret,
             int(time.time()),
         )
+        mark_frontend_timing("response_build_finish")
+        self._maybe_add_frontend_timing(response, adapted_request, ret[0])
 
         return response
+
+    def _maybe_add_frontend_timing(
+        self,
+        response: Union[ChatCompletionResponse, ORJSONResponse],
+        adapted_request: GenerateReqInput,
+        ret_item: Dict[str, Any],
+    ):
+        if not isinstance(response, ChatCompletionResponse):
+            return
+
+        timing = getattr(adapted_request, "_openai_frontend_timing", None)
+        frontend_timing = self._build_frontend_timing_output(
+            timing, ret_item.get("meta_info", {})
+        )
+        if frontend_timing is None:
+            return
+
+        response.metadata = response.metadata or {}
+        response.metadata["sglang_frontend_timing"] = frontend_timing
 
     def _build_chat_response(
         self,

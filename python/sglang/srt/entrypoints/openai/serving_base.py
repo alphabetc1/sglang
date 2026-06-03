@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
 from fastapi import HTTPException, Request
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
@@ -21,10 +23,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+OPENAI_FRONTEND_TIMING_HEADER = "x-sglang-frontend-timing"
+_FRONTEND_TIMING_CONTEXT: ContextVar[Optional[dict]] = ContextVar(
+    "sglang_openai_frontend_timing", default=None
+)
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    return value is not None and value.lower() in {"1", "true", "yes", "on"}
+
+
+def mark_frontend_timing(name: str):
+    timing = _FRONTEND_TIMING_CONTEXT.get()
+    if timing is not None:
+        timing["points"][name] = monotonic_time()
+
 
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
     """Abstract base class for OpenAI endpoint handlers"""
+
+    _enable_non_streaming_response_fast_path = False
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
@@ -35,6 +54,86 @@ class OpenAIServingBase(ABC):
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
             and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             else None
+        )
+
+    def _should_collect_frontend_timing(self, raw_request: Request) -> bool:
+        header_value = raw_request.headers.get(OPENAI_FRONTEND_TIMING_HEADER)
+        return _is_truthy(header_value) or _is_truthy(
+            os.getenv("SGLANG_OPENAI_FRONTEND_TIMING")
+        )
+
+    def _start_frontend_timing(self, raw_request: Request, received_time: float):
+        if not self._should_collect_frontend_timing(raw_request):
+            return None
+        return {"points": {"request_received": received_time}}
+
+    def _build_frontend_timing_output(self, timing: Optional[dict], meta_info: dict):
+        if timing is None:
+            return None
+
+        points = timing["points"]
+
+        def segment(start: str, finish: str):
+            if start in points and finish in points:
+                return max(points[finish] - points[start], 0.0)
+            return None
+
+        segments = {
+            "validation": segment("request_received", "validation_finish"),
+            "openai_convert": segment("openai_convert_start", "openai_convert_finish"),
+            "process_messages": segment(
+                "process_messages_start", "process_messages_finish"
+            ),
+            "sampling_params": segment(
+                "sampling_params_start", "sampling_params_finish"
+            ),
+            "generate_req_input": segment(
+                "generate_req_input_start", "generate_req_input_finish"
+            ),
+            "tokenizer_manager": segment(
+                "tokenizer_manager_start", "tokenizer_manager_finish"
+            ),
+            "response_build": segment("response_build_start", "response_build_finish"),
+        }
+        segments = {k: v for k, v in segments.items() if v is not None}
+
+        def meta_delta(start: str, finish: str):
+            start_v = meta_info.get(start)
+            finish_v = meta_info.get(finish)
+            if start_v is not None and finish_v is not None:
+                return max(finish_v - start_v, 0.0)
+            return None
+
+        engine = {
+            "api_server_dispatch": meta_delta(
+                "request_received_ts", "api_server_dispatch_finish_ts"
+            ),
+            "post_dispatch_to_finish": meta_delta(
+                "api_server_dispatch_finish_ts", "request_finished_ts"
+            ),
+            "response_send_lag": meta_delta(
+                "request_finished_ts", "response_sent_to_client_ts"
+            ),
+            "queue": meta_info.get("queue_time"),
+        }
+        engine = {k: v for k, v in engine.items() if v is not None}
+
+        return {"segments_s": segments, "engine_s": engine}
+
+    def _serialize_non_streaming_response(self, response: Any):
+        if not self._enable_non_streaming_response_fast_path:
+            return response
+
+        if isinstance(response, Response):
+            return response
+
+        model_dump_json = getattr(response, "model_dump_json", None)
+        if model_dump_json is None:
+            return response
+
+        return Response(
+            content=model_dump_json(),
+            media_type="application/json",
         )
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
@@ -77,10 +176,13 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        frontend_timing = self._start_frontend_timing(raw_request, received_time)
+        frontend_timing_token = _FRONTEND_TIMING_CONTEXT.set(frontend_timing)
 
         try:
             # Validate request
             error_msg = self._validate_request(request)
+            mark_frontend_timing("validation_finish")
             if error_msg:
                 return self.create_error_response(error_msg)
 
@@ -90,13 +192,16 @@ class OpenAIServingBase(ABC):
                 request_logger.log_openai_received_request(request, request=raw_request)
 
             # Convert to internal format
+            mark_frontend_timing("openai_convert_start")
             adapted_request, processed_request = self._convert_to_internal_request(
                 request, raw_request
             )
+            mark_frontend_timing("openai_convert_finish")
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+                setattr(adapted_request, "_openai_frontend_timing", frontend_timing)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
@@ -104,9 +209,10 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
             else:
-                return await self._handle_non_streaming_request(
+                response = await self._handle_non_streaming_request(
                     adapted_request, processed_request, raw_request
                 )
+                return self._serialize_non_streaming_response(response)
         except HTTPException as e:
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
@@ -131,6 +237,8 @@ class OpenAIServingBase(ABC):
                 err_type="InternalServerError",
                 status_code=500,
             )
+        finally:
+            _FRONTEND_TIMING_CONTEXT.reset(frontend_timing_token)
 
     @abstractmethod
     def _request_id_prefix(self) -> str:

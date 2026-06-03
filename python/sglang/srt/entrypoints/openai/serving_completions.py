@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for /v1/completion requests"""
 
+    _enable_non_streaming_response_fast_path = True
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,

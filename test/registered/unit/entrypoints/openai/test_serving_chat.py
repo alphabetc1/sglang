@@ -18,6 +18,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from fastapi.responses import Response
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -41,6 +42,8 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
         self.server_args = Mock(
+            context_length=4096,
+            allow_auto_truncate=False,
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
@@ -59,6 +62,7 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -72,6 +76,7 @@ class _MockTokenizerManager:
                     "finish_reason": {"type": "stop", "matched": None},
                     "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
                     "output_top_logprobs": None,
+                    "weight_version": "default",
                 },
                 "index": 0,
             }
@@ -1289,6 +1294,155 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+
+    def test_chat_response_does_not_emit_frontend_timing_by_default(self):
+        ret = [
+            {
+                "text": "Timed response",
+                "meta_info": {
+                    "id": "chatcmpl-no-timing",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.basic_req, ret, 1234567890)
+
+        self.assertEqual(response.metadata, {"weight_version": "default"})
+
+    def test_repeated_tool_schema_validation_uses_cache_and_preserves_normalization(
+        self,
+    ):
+        def make_req():
+            return ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Call a tool."}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {
+                                        "type": "varchar(255)",
+                                        "description": "Lookup key",
+                                    }
+                                },
+                            },
+                        },
+                    }
+                ],
+            )
+
+        first = make_req()
+        second = make_req()
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.Draft202012Validator.check_schema"
+        ) as check_schema:
+            self.assertIsNone(self.chat._validate_request(first))
+            self.assertIsNone(self.chat._validate_request(second))
+
+        self.assertEqual(check_schema.call_count, 1)
+        self.assertEqual(
+            second.tools[0].function.parameters["properties"]["name"]["type"],
+            "string",
+        )
+        self.assertEqual(
+            list(second.tools[0].function.parameters["properties"]["name"].keys()),
+            ["type", "description"],
+        )
+
+    def test_non_streaming_chat_handle_request_returns_pre_serialized_response(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=1,
+            stream=False,
+        )
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                [],
+                None,
+            )
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(req, self.fastapi_request)
+            )
+
+        self.assertIsInstance(response, Response)
+        self.assertEqual(response.media_type, "application/json")
+        payload = json.loads(response.body)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "Test response")
+        self.assertEqual(payload["metadata"]["weight_version"], "default")
+
+    def test_non_streaming_chat_emits_frontend_timing_when_requested(self):
+        self.fastapi_request.headers = {"x-sglang-frontend-timing": "1"}
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=1,
+            stream=False,
+        )
+
+        async def _mock_generate_with_timing():
+            yield {
+                "text": "Timed response",
+                "meta_info": {
+                    "id": "chatcmpl-timing",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "request_received_ts": 100.0,
+                    "api_server_dispatch_finish_ts": 100.25,
+                    "request_finished_ts": 101.0,
+                    "response_sent_to_client_ts": 101.1,
+                    "queue_time": 0.0,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_with_timing()
+
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                [],
+                None,
+            )
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(req, self.fastapi_request)
+            )
+
+        self.assertIsInstance(response, Response)
+        payload = json.loads(response.body)
+        self.assertEqual(payload["metadata"]["weight_version"], "default")
+        timing = payload["metadata"]["sglang_frontend_timing"]
+        self.assertIn("segments_s", timing)
+        self.assertIn("engine_s", timing)
+        self.assertGreaterEqual(timing["segments_s"]["validation"], 0.0)
+        self.assertGreaterEqual(timing["segments_s"]["openai_convert"], 0.0)
+        self.assertGreaterEqual(timing["segments_s"]["process_messages"], 0.0)
+        self.assertGreaterEqual(timing["segments_s"]["tokenizer_manager"], 0.0)
+        self.assertGreaterEqual(timing["segments_s"]["response_build"], 0.0)
+        self.assertAlmostEqual(timing["engine_s"]["api_server_dispatch"], 0.25)
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming chat responses emit cached token details in sglext."""
