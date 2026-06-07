@@ -30,7 +30,7 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "8": {
         "candidate_steps": [1, 3],
         "up_hysteresis": 0.0,
-        "down_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
     },
     "32": {
@@ -149,6 +149,8 @@ class AdaptiveStepSlot:
     - Probes one step beyond observed acceptance
     - EMA smoothing prevents oscillation
     - Only updates every `update_interval` batches for stability
+    - After a switch, skips `cooldown_window` recompute windows
+    - Each recompute can only move one adjacent candidate tier
     - num_steps can be selected from different candidate sets on different batch_sizes
     """
 
@@ -162,6 +164,7 @@ class AdaptiveStepSlot:
         self.warmup_batches = cfg.get("warmup_batches", 10)
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
+        self.cooldown_window = max(0, int(cfg.get("cooldown_window", 1)))
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
         if initial_steps in self.candidate_steps:
@@ -172,6 +175,7 @@ class AdaptiveStepSlot:
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
+        self._cooldown_remaining = 0
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
@@ -194,42 +198,41 @@ class AdaptiveStepSlot:
         if (self._batch_count - self.warmup_batches) % self.update_interval != 0:
             return False
 
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return False
+
         return self._recompute_params()
 
     def _recompute_params(self) -> bool:
         """Recompute steps from EMA. Returns True if params changed."""
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
+        target_idx = current_idx
 
-        # TODO: Consider limiting step changes to avoid overshooting.
-        while current_idx > 0:
+        if current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             drop_threshold = prev_step - 0.5 + self.down_hysteresis
             if self.ema_accept_len <= drop_threshold:
-                current_idx -= 1
-            else:
-                break
-
-        while current_idx < len(self.candidate_steps) - 1:
+                target_idx = current_idx - 1
+        if target_idx == current_idx and current_idx < len(self.candidate_steps) - 1:
             current_step = self.candidate_steps[current_idx]
             rise_threshold = current_step - 0.5 + self.up_hysteresis
             if self.ema_accept_len > rise_threshold:
-                current_idx += 1
-            else:
-                break
+                target_idx = current_idx + 1
 
-        target = self.candidate_steps[current_idx]
+        target = self.candidate_steps[target_idx]
         # EMA ceiling: only caps downward — never blocks step-ups, so the
         # system can explore higher steps and let the EMA catch up.
         if self.ceiling_coeff > 0:
             ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))
-            if target > ceiling and target <= old_steps:
-                while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
-                    current_idx -= 1
-                target = self.candidate_steps[current_idx]
+            if target > ceiling and target <= old_steps and current_idx > 0:
+                target_idx = current_idx - 1
+                target = self.candidate_steps[target_idx]
 
         if target != old_steps:
             self.current_steps = target
+            self._cooldown_remaining = self.cooldown_window
             log_info_on_rank0(
                 logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "

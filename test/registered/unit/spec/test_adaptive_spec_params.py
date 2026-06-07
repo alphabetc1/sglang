@@ -75,6 +75,7 @@ class TestAdaptiveStepSlot(unittest.TestCase):
                 "warmup_batches": 0,
                 "update_interval": 1,
                 "up_hysteresis": 0.0,
+                "cooldown_window": 0,
             },
         )
 
@@ -84,7 +85,7 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         self.assertTrue(params.update([3, 3]))
         self.assertEqual(params.current_steps, 7)
 
-    def test_update_can_scale_down_across_candidates_in_one_recompute(self):
+    def test_update_scales_down_one_adjacent_candidate_per_recompute(self):
         params = self._make_params_from_config(
             7,
             {
@@ -92,8 +93,12 @@ class TestAdaptiveStepSlot(unittest.TestCase):
                 "ema_alpha": 1.0,
                 "warmup_batches": 0,
                 "update_interval": 1,
+                "cooldown_window": 0,
             },
         )
+
+        self.assertTrue(params.update([0, 0]))
+        self.assertEqual(params.current_steps, 3)
 
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 1)
@@ -180,6 +185,7 @@ class TestAdaptiveStepSlot(unittest.TestCase):
                 "update_interval": 1,
                 "up_hysteresis": 0.0,
                 "down_hysteresis": 0.0,
+                "cooldown_window": 0,
             },
         )
 
@@ -213,8 +219,55 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         # Force low ema to trigger ceiling
         params.ema_accept_len = 1.0
         self.assertTrue(params.update([1, 1]))
-        # ceiling = ceil(1.0 * 1.0) = 1, target capped to 1
-        self.assertEqual(params.current_steps, 1)
+        # ceiling = ceil(1.0 * 1.0) = 1, but anti-oscillation limits
+        # each recompute to one adjacent tier.
+        self.assertEqual(params.current_steps, 3)
+
+    def test_cooldown_and_asymmetric_hysteresis_damp_accept_len_jitter(self):
+        unprotected_params = self._make_params_from_config(
+            1,
+            {
+                "candidate_steps": [1, 3],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "up_hysteresis": 0.0,
+                "down_hysteresis": 0.0,
+                "cooldown_window": 0,
+            },
+        )
+        protected_params = self._make_params_from_config(
+            1,
+            {
+                "candidate_steps": [1, 3],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "up_hysteresis": 0.0,
+                "down_hysteresis": -0.25,
+                "cooldown_window": 2,
+            },
+        )
+
+        jittery_accept_lens = [
+            [1, 1, 1, 1, 1],
+            [0, 1, 0, 1, 0],
+            [1, 1, 1, 1, 1],
+            [0, 1, 0, 1, 0],
+            [1, 1, 1, 1, 1],
+        ]
+
+        unprotected_changed_steps = []
+        protected_changed_steps = []
+        for accept_lens in jittery_accept_lens:
+            if unprotected_params.update(accept_lens):
+                unprotected_changed_steps.append(unprotected_params.current_steps)
+            if protected_params.update(accept_lens):
+                protected_changed_steps.append(protected_params.current_steps)
+
+        self.assertEqual(unprotected_changed_steps, [3, 1, 3, 1, 3])
+        self.assertEqual(protected_changed_steps, [3])
+        self.assertEqual(protected_params.current_steps, 3)
 
     def test_ceiling_disabled_by_default(self):
         params = self._make_params_from_config(3, {"candidate_steps": [1, 3, 7]})
