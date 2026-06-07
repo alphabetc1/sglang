@@ -175,6 +175,58 @@ class TestSWALockReleaseLifecycle(CustomTestCase):
         )
         tree.sanity_check()
 
+    def _assert_insert_preserves_full_locked_tombstone(self, swa_evicted_seqlen):
+        tree, allocator, _ = _build_tree(sliding_window_size=4)
+        leaf = _insert_chain(tree, allocator, [1, 2, 3, 4, 5, 6, 7, 8])
+        old_value = leaf.value.clone()
+
+        inc_res = tree.inc_lock_ref(leaf)
+        tree.dec_swa_lock_only(leaf, swa_uuid_for_lock=inc_res.swa_uuid_for_lock)
+        self.assertTrue(leaf.swa_tombstone)
+        self.assertEqual(leaf.full_lock_ref, 1)
+
+        new_value = _swa_alloc(allocator, len(old_value))
+        freed = []
+        original_free = allocator.free
+
+        def wrapped_free(indices):
+            freed.append(indices.clone())
+            return original_free(indices)
+
+        allocator.free = wrapped_free
+        try:
+            tree.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2, 3, 4, 5, 6, 7, 8])),
+                    value=new_value,
+                    prev_prefix_len=0,
+                    swa_evicted_seqlen=swa_evicted_seqlen,
+                )
+            )
+        finally:
+            allocator.free = original_free
+
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], new_value))
+        self.assertTrue(torch.equal(leaf.value, old_value))
+        self.assertTrue(leaf.swa_tombstone)
+        self.assertEqual(leaf.full_lock_ref, 1)
+        self.assertFalse(tree.swa_lru_list.in_list(leaf))
+
+        tree.dec_lock_ref(
+            leaf,
+            DecLockRefParams(swa_uuid_for_lock=inc_res.swa_uuid_for_lock),
+            skip_swa=True,
+        )
+        tree.sanity_check()
+
+    def test_insert_preserves_full_locked_tombstone(self):
+        for branch, swa_evicted_seqlen in [("branch1", 0), ("branch2", 4)]:
+            with self.subTest(branch=branch):
+                self._assert_insert_preserves_full_locked_tombstone(
+                    swa_evicted_seqlen
+                )
+
     def test_dec_swa_lock_only_internal_no_tombstone_no_free(self):
         # Two siblings force an internal node at the shared prefix.
         tree, allocator, _ = _build_tree(sliding_window_size=4)

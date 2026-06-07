@@ -1136,7 +1136,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     assert (
                         swa_evicted_seqlen % self.page_size == 0
                     ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
-                    if swa_evicted_seqlen <= total_prefix_length:
+                    if node.full_lock_ref > 0:
+                        # The tombstone's full KV is still owned by an active
+                        # request. Do not free or overwrite it; the incoming
+                        # request's overlapping KV is not inserted.
+                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    elif swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         # Free full tokens in the original tree node.
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
