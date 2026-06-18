@@ -26,7 +26,7 @@ def _compute_enable_deep_gemm():
 
     try:
         import deep_gemm  # noqa: F401
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
