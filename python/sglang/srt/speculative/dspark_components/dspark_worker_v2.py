@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_chain_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -19,7 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -89,7 +89,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
@@ -127,7 +127,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        self._linear_accept_index_cache = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -230,7 +229,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and is_cuda()
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 commit_ctx=CommitInjectCtx(
@@ -705,7 +704,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
         )
         if batch.return_logprob:
-            compute_spec_v2_chain_logprobs(batch, logits_output, accept.out_tokens)
+            compute_spec_logprobs(
+                batch,
+                logits_output,
+                accept.out_tokens.reshape(-1),
+                chain_stride=self.verify_num_draft_tokens,
+            )
 
         if on_publish is not None:
             if confidence is not None:

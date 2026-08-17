@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import get_exec
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -348,25 +349,36 @@ def get_token_ids_logprobs_chunk(
     return next_split_pruned_len
 
 
-def compute_spec_v2_logprobs(
-    batch,
-    logits_output,
+def compute_spec_logprobs(
+    batch: ScheduleBatch,
+    logits_output: LogitsProcessorOutput,
     predict: torch.Tensor,
-    accept_index: torch.Tensor,
-    speculative_num_steps: int,
+    *,
+    accept_index: Optional[torch.Tensor] = None,
+    chain_stride: Optional[int] = None,
 ):
-    """Compute logprobs for accepted tokens after spec v2 verify sampling.
+    assert (accept_index is None) != (
+        chain_stride is None
+    ), "pass exactly one of accept_index / chain_stride"
 
-    Gathers logits at accepted positions, applies log_softmax (temperature-scaled
-    if not greedy), and populates logits_output.next_token_logprobs (plus optional
-    top-k / token-ids logprobs) so they flow through copy_to_cpu().
-    """
     bs = len(batch.seq_lens)
-    max_accept = speculative_num_steps + 1
-    device = predict.device
+    next_token_logits = logits_output.next_token_logits
 
-    flat_accept_idx = accept_index.long().reshape(-1)
-    gathered_logits = logits_output.next_token_logits[flat_accept_idx]
+    if accept_index is not None:
+        max_accept = accept_index.shape[1]
+        flat_accept_idx = accept_index.long().reshape(-1)
+        gathered_logits = next_token_logits[flat_accept_idx]
+        accepted_token_ids = predict[flat_accept_idx]
+    else:
+        max_accept = chain_stride
+        # Guards the layout contract the identity gather rests on: out token
+        # (b, j) must come from logits row b * stride + j.
+        assert next_token_logits.shape[0] == bs * max_accept, (
+            f"chain layout expects {bs * max_accept} logits rows, got "
+            f"{next_token_logits.shape[0]}"
+        )
+        gathered_logits = next_token_logits
+        accepted_token_ids = predict
 
     if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
@@ -381,12 +393,9 @@ def compute_spec_v2_logprobs(
         )
     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
 
-    accepted_token_ids = predict[flat_accept_idx]
-    token_logprobs = gathered_logprobs[
-        torch.arange(bs * max_accept, device=device),
-        accepted_token_ids.long(),
-    ]
-    logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
+    logits_output.next_token_logprobs = gathered_logprobs.gather(
+        1, accepted_token_ids.long().view(-1, 1)
+    ).view(bs, max_accept)
 
     if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [
@@ -411,28 +420,6 @@ def compute_spec_v2_logprobs(
         ) = get_token_ids_logprobs(
             gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
         )
-
-
-def compute_spec_v2_chain_logprobs(batch, logits_output, out_tokens: torch.Tensor):
-    """Compute logprobs for a linear (chain) verify block.
-
-    Chain verify (DFLASH / DSPARK) emits one output token per verify row in
-    order, so row j of ``next_token_logits`` is the distribution
-    ``out_tokens[:, j]`` came from and the tree accept-index gather reduces to
-    identity. Rows past the request's commit length carry unemitted drafts;
-    downstream slices them off by accept_lens.
-    """
-    bs, chain_len = out_tokens.shape
-    output_indices = torch.arange(
-        bs * chain_len, dtype=torch.int64, device=out_tokens.device
-    ).view(bs, chain_len)
-    compute_spec_v2_logprobs(
-        batch,
-        logits_output,
-        out_tokens.reshape(-1),
-        output_indices,
-        chain_len - 1,
-    )
 
 
 def _deterministic_inference_enabled() -> bool:
