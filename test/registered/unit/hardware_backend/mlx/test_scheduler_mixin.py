@@ -269,13 +269,19 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.ingest_requests.side_effect = recv_side_effect
-        # Model handle_shutdown: processing a non-empty recv batch (the
-        # ShutdownReq) flips the flag; the loop must notice at the top of the
-        # next iteration instead of polling forever.
-        scheduler.process_input_requests.side_effect = lambda reqs: (
-            setattr(scheduler, "gracefully_exit", True) if reqs else None
-        )
+        recv_iter = iter(recv_side_effect)
+
+        def ingest_requests():
+            reqs = next(recv_iter)
+            if isinstance(reqs, BaseException):
+                raise reqs
+            # Model ingest_requests -> handle_shutdown: processing a non-empty
+            # recv batch (the ShutdownReq) flips the flag; the loop must notice
+            # at the top of the next iteration instead of polling forever.
+            if reqs:
+                scheduler.gracefully_exit = True
+
+        scheduler.ingest_requests.side_effect = ingest_requests
         plan = MagicMock()
         plan.batch_to_run = None
         scheduler.get_next_batch_to_run.return_value = plan
@@ -286,8 +292,8 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
             SchedulerMlxOverlapMixin,
         )
 
-        # Iteration 1: recv the ShutdownReq stand-in (flag flips inside
-        # process_input_requests).  Iteration 2 must break before polling
+        # Iteration 1: ingest the ShutdownReq stand-in (flag flips inside
+        # ingest_requests). Iteration 2 must break before polling
         # again; the sentinel raising instead means the loop never exits.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
 
