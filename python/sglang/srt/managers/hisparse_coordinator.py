@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.kernels.ops.kvcache.hisparse import HiSparseSpecState
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 device_module = get_device_module()
 
@@ -1438,6 +1439,54 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
         self.spec_swap.clear_scratch(req_pool_idx)
         self._skip_first_backup[req.kv.req_pool_idx] = False
+
+    @staticmethod
+    def requires_token_positions(forward_mode: ForwardMode) -> bool:
+        """Swap paths need request-relative selections, not fused KV locations."""
+        return forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+
+    def prepare_attention_kv(
+        self,
+        *,
+        forward_mode: ForwardMode,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_tokens: Optional[torch.Tensor],
+        logical_locs: Optional[torch.Tensor] = None,
+        verify_seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return physical KV locations in flattened attention-query order.
+
+        Resident prefill supplies a logical KV table. Decode and target verify
+        instead supply request-relative token positions from the indexer;
+        verify_seq_lens contains the causal length of each verification query.
+        The coordinator owns their grouping and shared-index swap dispatch.
+        This only prepares reads: verify writes and accepted-token commit stay
+        in prepare_spec_verify and commit_spec_accept_tokens, once per round.
+        """
+        if not self.requires_token_positions(forward_mode):
+            assert logical_locs is not None
+            return self.mem_pool_device.translate_loc_to_hisparse_device(
+                logical_locs
+            ).to(torch.int32)
+
+        assert top_k_tokens is not None
+        if forward_mode.is_target_verify():
+            assert verify_seq_lens is not None
+            num_reqs = req_pool_indices.shape[0]
+            num_steps = self.spec_swap.num_draft_tokens
+            physical_locs = self.swap_in_selected_pages(
+                req_pool_indices,
+                verify_seq_lens,
+                top_k_tokens.view(num_reqs, num_steps, -1),
+                layer_id,
+            )
+            return physical_locs.view(num_reqs * num_steps, -1)
+
+        return self.swap_in_selected_pages(
+            req_pool_indices, seq_lens, top_k_tokens, layer_id
+        )
 
     def _run_swap_in_kernel(
         self,

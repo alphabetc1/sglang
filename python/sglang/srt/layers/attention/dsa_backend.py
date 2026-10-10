@@ -2168,25 +2168,16 @@ class DeepseekSparseAttnBackend(
                     cu_seqlens_q=metadata.cu_seqlens_q,
                 )
 
-        # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
-            if forward_batch.forward_mode.is_target_verify():
-                num_reqs = forward_batch.req_pool_indices.shape[0]
-                num_steps = self.speculative_num_draft_tokens
-                assert topk_indices is not None
-                grouped_topk_indices = topk_indices.view(num_reqs, num_steps, -1)
-                assert metadata.dsa_seqlens_expanded is not None
-                page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                    forward_batch.req_pool_indices,
-                    metadata.dsa_seqlens_expanded,
-                    grouped_topk_indices,
-                    layer.layer_id,
-                ).view(num_reqs * num_steps, -1)
-            else:
-                # flash_mla_sparse_fwd / tilelang require int32 page indices.
-                page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                    page_table_1
-                ).to(torch.int32)
+            page_table_1 = self.hisparse_coordinator.prepare_attention_kv(
+                forward_mode=forward_batch.forward_mode,
+                layer_id=layer.layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                top_k_tokens=topk_indices,
+                logical_locs=page_table_1,
+                verify_seq_lens=metadata.dsa_seqlens_expanded,
+            )
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
@@ -2467,11 +2458,12 @@ class DeepseekSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if self.hisparse_coordinator is not None:
-            page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                topk_indices,
-                layer.layer_id,
+            page_table_1 = self.hisparse_coordinator.prepare_attention_kv(
+                forward_mode=forward_batch.forward_mode,
+                layer_id=layer.layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                top_k_tokens=topk_indices,
             )
         elif self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
@@ -3856,9 +3848,8 @@ class DeepseekSparseAttnBackend(
     ) -> DSAIndexerMetadata:
         force_unfused = not self.use_fused_topk or (
             self.hisparse_coordinator is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
+            and self.hisparse_coordinator.requires_token_positions(
+                forward_batch.forward_mode
             )
         )
         return DSAIndexerMetadata(

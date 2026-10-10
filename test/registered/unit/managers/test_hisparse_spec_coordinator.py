@@ -7,13 +7,16 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.srt.managers import hisparse_coordinator
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseSpecSwapManager,
 )
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,6 +24,78 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecCoordinator(CustomTestCase):
+    def test_attention_prefill_uses_logical_locations_not_token_positions(self):
+        """Resident KV addresses and indexer token positions are different spaces."""
+        coordinator = object.__new__(HiSparseCoordinator)
+        pool = object.__new__(HiSparseDSATokenToKVPool)
+        pool.full_to_hisparse_device_index_mapping = torch.tensor([0, 91, 42, 73])
+        coordinator.mem_pool_device = pool
+        for mode in (ForwardMode.EXTEND, ForwardMode.DRAFT_EXTEND_V2):
+            with self.subTest(mode=mode):
+                physical = coordinator.prepare_attention_kv(
+                    forward_mode=mode,
+                    layer_id=0,
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([3]),
+                    top_k_tokens=torch.tensor([[0, 1], [1, 2]]),
+                    logical_locs=torch.tensor([[3, 1], [2, 0]]),
+                )
+                self.assertEqual(physical.dtype, torch.int32)
+                torch.testing.assert_close(
+                    physical, torch.tensor([[73, 91], [42, 0]], dtype=torch.int32)
+                )
+
+    def test_attention_verify_preserves_request_query_order_and_causal_lengths(self):
+        """Flattening must not mix requests or use one length for all draft steps."""
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.enable_prefetch = False
+        coordinator.top_k = 2
+        coordinator.num_real_reqs = torch.tensor([2], dtype=torch.int32)
+        coordinator.req_to_host_pool = torch.empty((3, 16))
+        coordinator.req_device_buffer_tokens = torch.empty((1, 3, 16))
+        coordinator.req_device_buffer_token_locs = torch.empty((1, 3, 16))
+        coordinator.mem_pool_host = SimpleNamespace(kv_buffer=[torch.empty(0)])
+        coordinator.mem_pool_device = SimpleNamespace(kv_buffer=[torch.empty(0)])
+        spec_swap = object.__new__(HiSparseSpecSwapManager)
+        spec_swap._coordinator = coordinator
+        spec_swap.enabled = True
+        spec_swap.num_draft_tokens = 2
+        spec_swap.states = (None,)
+        spec_swap.top_k_device_locs = torch.full((3, 2, 2), -1, dtype=torch.int32)
+        coordinator.spec_swap = spec_swap
+
+        def resolve_kernel(**kwargs):
+            # CPU stand-in for the CUDA operator's request/step indexing contract.
+            tokens = kwargs["top_k_tokens"]
+            reqs = kwargs["req_pool_indices"][:, None, None]
+            lengths = kwargs["seq_lens"].view(2, 2, 1)
+            locations = torch.where(
+                (tokens >= 0) & (tokens < lengths), reqs * 100 + tokens, -1
+            )
+            kwargs["top_k_device_locs"].copy_(locations)
+
+        with patch.object(
+            hisparse_coordinator,
+            "load_cache_to_device_buffer_spec_mla",
+            side_effect=resolve_kernel,
+        ):
+            physical = coordinator.prepare_attention_kv(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                layer_id=0,
+                req_pool_indices=torch.tensor([2, 0]),
+                seq_lens=torch.tensor([4, 8]),
+                top_k_tokens=torch.tensor([[4, 5], [5, -1], [8, 9], [9, -1]]),
+                # Deliberately unrelated: verify must use selections, not this table.
+                logical_locs=torch.zeros((4, 2), dtype=torch.int64),
+                verify_seq_lens=torch.tensor([5, 6, 9, 10]),
+            )
+        torch.testing.assert_close(
+            physical,
+            torch.tensor([[204, -1], [205, -1], [8, -1], [9, -1]], dtype=torch.int32),
+        )
+        # The returned view must retain the graph-stable output allocation.
+        self.assertEqual(physical.data_ptr(), spec_swap.top_k_device_locs.data_ptr())
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
