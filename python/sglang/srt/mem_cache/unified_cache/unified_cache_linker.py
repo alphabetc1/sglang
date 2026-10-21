@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache import lookup_probe
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     ExternalLinkerLoadPhase,
@@ -152,7 +153,9 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
-    def prefetch_lookup(self, build_transfers: Callable[[], list[PoolTransfer]]) -> None:
+    def prefetch_lookup(
+        self, build_transfers: Callable[[], list[PoolTransfer]]
+    ) -> None:
         """Warm a later ``lookup`` off the scheduler thread.
 
         ``build_transfers`` is pure and may run on another thread.
@@ -257,6 +260,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # rid -> when its lookup was last prefetched.
         self.lookup_prefetch_times: dict[str, float] = {}
+        self._probe_calls: dict[str, int] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -288,11 +292,30 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        t0 = time.perf_counter()
+        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        t1 = time.perf_counter()
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        if lookup_probe.enabled():
+            nth = self._probe_calls.get(req.rid, 0) + 1
+            self._probe_calls[req.rid] = nth
+            entry = req.time_stats.wait_queue_entry_time
+            lookup_probe.record(
+                "match",
+                req.rid,
+                device_hit_len,
+                len(tail_hashes),
+                int((t1 - t0) * 1e6),
+                int((time.perf_counter() - t1) * 1e6),
+                max(restorable, default=0),
+                hit_pages,
+                f"{(t0 - entry) if entry else -1:.3f}",
+                nth,
+            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -370,10 +393,12 @@ class UnifiedCacheLinkerWrapper:
             self.lookup_prefetch_times[req.rid] = now
             tail = key[device_len : device_len + tail_len]
             self.cache_linker.prefetch_lookup(
-                lambda tail=tail, anchor=anchor: self._lookup_transfers(
-                    get_storage_hash_str(tail, anchor, page_size=page)
+                lambda tail=tail, anchor=anchor: (
+                    self._lookup_transfers(
+                        get_storage_hash_str(tail, anchor, page_size=page)
+                    )
+                    or []
                 )
-                or []
             )
 
     def _page_hash(self, node_id: NodeId, num_pages: int) -> Optional[str]:
