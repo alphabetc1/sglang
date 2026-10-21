@@ -66,6 +66,9 @@ class _ExistenceCache:
             for entry in cached
         ]
         missing = [i for i, result in enumerate(results) if result is None]
+        from sglang.srt.mem_cache.unified_cache import lookup_probe
+
+        lookup_probe.record("cache", len(keys), len(keys) - len(missing))
         if missing:
             fetched = self.fetch_and_store([keys[i] for i in missing], fetch)
             for i, result in zip(missing, fetched):
@@ -271,6 +274,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def _prefetch_lookup(
         self, build_transfers: Callable[[], list[PoolTransfer]]
     ) -> None:
+        from sglang.srt.mem_cache.unified_cache import lookup_probe
+
+        t0 = time.perf_counter()
         try:
             self._restorable_prefix_pages(
                 build_transfers(),
@@ -281,6 +287,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         except Exception:
             # Best effort: the scheduler's lookup fetches whatever is missing.
             logger.exception("Mooncake lookup prefetch failed")
+        lookup_probe.record("prefetch", int((time.perf_counter() - t0) * 1e6))
 
     def _restorable_prefix_pages(
         self,
