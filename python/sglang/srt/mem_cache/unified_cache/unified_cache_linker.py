@@ -152,7 +152,9 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
-    def prefetch_lookup(self, build_transfers: Callable[[], list[PoolTransfer]]) -> None:
+    def prefetch_lookup(
+        self, build_transfers: Callable[[], list[PoolTransfer]]
+    ) -> None:
         """Warm a later ``lookup`` off the scheduler thread.
 
         ``build_transfers`` is pure and may run on another thread.
@@ -370,10 +372,12 @@ class UnifiedCacheLinkerWrapper:
             self.lookup_prefetch_times[req.rid] = now
             tail = key[device_len : device_len + tail_len]
             self.cache_linker.prefetch_lookup(
-                lambda tail=tail, anchor=anchor: self._lookup_transfers(
-                    get_storage_hash_str(tail, anchor, page_size=page)
+                lambda tail=tail, anchor=anchor: (
+                    self._lookup_transfers(
+                        get_storage_hash_str(tail, anchor, page_size=page)
+                    )
+                    or []
                 )
-                or []
             )
 
     def _page_hash(self, node_id: NodeId, num_pages: int) -> Optional[str]:
