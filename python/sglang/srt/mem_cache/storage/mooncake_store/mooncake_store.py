@@ -1490,7 +1490,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        from sglang.srt.mem_cache.unified_cache import lookup_probe
+
+        t0 = time.perf_counter()
+        result = self.store.batch_is_exist(key_strs)
+        if lookup_probe.enabled():
+            lookup_probe.record(
+                "rpc",
+                len(key_strs),
+                int((time.perf_counter() - t0) * 1e6),
+                sum(1 for r in result if r == 1),
+            )
+        return result
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

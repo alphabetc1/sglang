@@ -23,6 +23,7 @@ reaches nothing but its own requests, which the scheduler aborts.
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.unified_cache import lookup_probe
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
@@ -245,6 +247,7 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        self._probe_calls: dict[str, int] = {}
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -281,11 +284,30 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        t0 = time.perf_counter()
+        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        t1 = time.perf_counter()
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
+        if lookup_probe.enabled():
+            nth = self._probe_calls.get(req.rid, 0) + 1
+            self._probe_calls[req.rid] = nth
+            entry = req.time_stats.wait_queue_entry_time
+            lookup_probe.record(
+                "match",
+                req.rid,
+                device_hit_len,
+                len(tail_hashes),
+                int((t1 - t0) * 1e6),
+                int((time.perf_counter() - t1) * 1e6),
+                max(restorable, default=0),
+                hit_pages,
+                f"{(t0 - entry) if entry else -1:.3f}",
+                nth,
+            )
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
