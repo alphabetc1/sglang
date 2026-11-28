@@ -68,6 +68,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         )
 
     def test_build_hisparse_decode_batch_keeps_requested_token_ids_logprob(self):
+        """HiSparse decode must score each request's requested token ids, not its prompt ids."""
         reqs = [
             _make_req(
                 req_pool_idx=4,
