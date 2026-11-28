@@ -14,6 +14,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.moe.paged_experts import runners
+from sglang.srt.layers.moe.paged_experts.precopy import join, maybe_log
 from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
@@ -21,6 +22,9 @@ from sglang.srt.layers.moe.paged_experts.residency import (
 )
 from sglang.srt.layers.moe.paged_experts.runners import RunnerContract, run_on_slots
 from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 
 
 class EagerExecutor:
@@ -46,6 +50,9 @@ class EagerExecutor:
 
     def run(self, layer, dispatch_output):
         r = self.device_residency
+        if r is not None:
+            join(r)  # a pre-copy into this layer finishes before it reads the residency
+            maybe_log()  # pre-copy counters, also from breakable-graph breaks (prefill)
         if r is not None and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "Paged experts: a captured decode batch routes more entries than the K "
@@ -86,6 +93,8 @@ class EagerExecutor:
         )
 
     def _run_waves(self, layer, dispatch_output, waves, routed, topk_ids):
+        """The step's merged entries, or for a runner that combines, its output: one wave's
+        as the runner returns it, several waves' added in FP32."""
         merged = None
         # Every wave's slot map in one upload that does not wait for the GPU. Index E (and -1,
         # which wraps to it) stays -1: padded routing entries are masked.
@@ -102,14 +111,20 @@ class EagerExecutor:
                 # Only padding is outside the wave.
                 merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
                 break
-            merged = self.contract.run_wave(
+            out = self.contract.run_wave(
                 base_method=self.base_method,
                 layer=layer,
                 dispatch_output=dispatch_output,
                 slots=slots,
-                merged=merged,
+                merged=None if self.contract.combines else merged,
                 num_entries=sum(routed[e] for e in wave.experts),
             )
+            if not self.contract.combines or merged is None:
+                merged = out
+            else:
+                if merged.dtype != torch.float32:
+                    merged = merged.float()
+                merged.add_(out)
         if merged is None:  # no routed entry in any wave: only padding
             merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
         return merged
@@ -140,12 +155,16 @@ class DeviceExecutor:
         self.residency = residency
         self.contract = contract
         self.routed_scaling_factor = routed_scaling_factor
+        # The next MoE layer's pre-copy, launched after this layer's gather; set by
+        # ``precopy.install``.
+        self.precopy_next = None
 
     def run(self, layer, dispatch_output):
         from sglang.kernels.ops.moe.paged_experts import paged_experts_decide
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         r = self.residency
+        join(r)  # a pre-copy into this layer finishes before its decide
         topk_output = dispatch_output.topk_output
         topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
         run_ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=topk_ids.device)
@@ -167,6 +186,13 @@ class DeviceExecutor:
         if not torch.cuda.is_current_stream_capturing():
             # Not a graph replay: page in what the gather left on disk before the GEMM.
             self.store.resolve_pending()
+        pre = self.precopy_next
+        if (
+            pre is not None
+            and dispatch_output.hidden_states.shape[0] > 0
+            and not is_in_breakable_cuda_graph()
+        ):
+            pre.launch(dispatch_output.hidden_states)
         # Every routed expert is now resident; padding got slot 0 and weight 0.
         wave_output = dispatch_output._replace(
             topk_output=topk_output._replace(

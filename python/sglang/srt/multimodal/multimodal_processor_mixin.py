@@ -5,9 +5,10 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.multimodal.media_errors import media_load_error
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
-    configure_media_url_security,
+    configure_worker_media_policy,
     load_audio,
     load_image,
     load_video,
@@ -32,7 +33,7 @@ def _tokenizer_of(processor):
 class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
-    gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_image_decode = True  # Enable device image decoding by default
     gpu_video_decode = True
     smart_rgb_conversion = False
     auto_mm_io_worker_num = 4
@@ -54,12 +55,7 @@ class MultimodalProcessorMixin:
         self.hf_config = hf_config
         self._processor = _processor
 
-        configure_media_url_security(
-            processor_config.allowed_media_domains,
-            processor_config.media_url_max_file_size_mb,
-            processor_config.media_url_timeout,
-            processor_config.allow_local_media_files,
-        )
+        configure_worker_media_policy(processor_config)
 
         self.image_processor_backend = processor_config.image_processor_backend
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
@@ -217,7 +213,7 @@ class MultimodalProcessorMixin:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    return img  # JPEG already decoded to a device tensor
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:
@@ -237,15 +233,12 @@ class MultimodalProcessorMixin:
                 return load_audio(data, audio_sample_rate)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+            error, cause = media_load_error(ValueError, modality, data, e)
         except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+            error, cause = media_load_error(RuntimeError, modality, data, e)
+        else:
+            return None
+        raise error from cause
 
     @staticmethod
     def _get_preprocessed_input_format(data):
