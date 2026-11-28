@@ -83,6 +83,7 @@ class TestStorageSuffix(CustomTestCase):
 
 class TestDirectLinkerKeys(CustomTestCase):
     def test_keys_carry_the_page_layout(self):
+        """UMBP direct-linker keys must change when the pool's page layout changes."""
         entry = DevicePoolEntry(
             name=PoolName.SWA,
             indices_from_pool=PoolName.SWA,

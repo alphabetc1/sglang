@@ -78,6 +78,7 @@ class TestStorageSharing(CustomTestCase):
             )
 
     def test_sharded_keys_carry_the_tp_width(self):
+        """Rank-sharded keys written under one TP width must not be read under another."""
         for tp_size in (4, 8):
             self.assertEqual(
                 _storage_suffix(
@@ -93,6 +94,7 @@ class TestStorageSharing(CustomTestCase):
             self.assertEqual(suffixes[PoolName.KV], "tpshared_v1_dcp2r1_cp0_pp0")
 
     def test_direct_linker_keys_carry_the_page_layout(self):
+        """Mooncake direct-linker keys must change when the pool's page layout changes."""
         entry = DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,

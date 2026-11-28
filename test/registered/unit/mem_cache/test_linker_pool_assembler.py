@@ -33,6 +33,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 class TestDevicePoolEntry(CustomTestCase):
     def test_key_tag_follows_the_page_layout(self):
+        """Pools whose page bytes are laid out differently must not share a storage key tag."""
+
         def entry(*components, packed=True):
             return DevicePoolEntry(
                 name=PoolName.KV,
