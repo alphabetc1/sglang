@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=70, suite="base-a-test-cpu")
 
@@ -953,6 +954,34 @@ class TestStorageWorkerStop(unittest.TestCase):
         cc.pp_prefetch_command_thread = finished
         self.assertEqual(cc._storage_worker_threads(), [])
         self.assertEqual(cc.dead_storage_workers(), [])
+
+
+class TestHostResourceRelease(CustomTestCase):
+    def test_release_waits_for_storage_workers(self):
+        """Shutdown must keep host buffers readable until storage workers exit."""
+        for controller_type in (HiCacheController, HybridCacheController):
+            with self.subTest(controller=controller_type.__name__):
+                cc = _controller(controller_type)
+                buffer, reads = [42], Queue()
+                cache = object.__new__(UnifiedRadixCache)
+                cache.cache_controller = cc
+                cache.linker = None
+                cache.host_pool_group = SimpleNamespace(destroy=buffer.clear)
+
+                def backup():
+                    cc.storage_stop_event.wait()
+                    reads.put(buffer.copy())
+
+                worker = cc._start_storage_worker("hicache-backup", backup)
+                cc.backup_thread = worker
+                try:
+                    cache.release_host_resources()
+                finally:
+                    cc.storage_stop_event.set()
+                    worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(reads.get_nowait(), [42])
+                self.assertEqual(buffer, [])
 
 
 if __name__ == "__main__":
