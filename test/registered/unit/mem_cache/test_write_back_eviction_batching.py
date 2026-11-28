@@ -293,6 +293,7 @@ class _WriteBackBatchingSuite:
                 cache.sanity_check()
 
     def test_idle_waits_for_the_stream_fenced_copies(self):
+        """The scheduler must not report idle while write-back copies fenced on a stream are unfinished."""
         setup_allocator_context()
         cache, allocator, host_pool = self._fill_host_with_one_batch()
         for seq in batch_seqs(1):

@@ -578,7 +578,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return []
         ptrs, sizes, offsets = meta
         # Mooncake's RDMA submit is quadratic in queued ranges, so bound each read.
-        # TODO: remove once Mooncake fixes its submit path.
+        # TODO(alphabetc1): remove once Mooncake fixes its submit path.
         step = min(
             -(-len(keys) // self.load_threads),
             max(1, MAX_RANGES_PER_READ // len(sizes[0])),
