@@ -1486,7 +1486,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # Evicted since the probe: look up again, leasing every page.
                 if any(r != 1 for r in leased):
                     return self.batch_exists_v2(
-                        keys, pool_transfers, extra_info, probe=False
+                        keys,
+                        pool_transfers,
+                        extra_info,
+                        probe=False,
+                        pool_suffixes=pool_suffixes,
                     )
         return PoolTransferResult(final_pages, hit_count, restorable)
 

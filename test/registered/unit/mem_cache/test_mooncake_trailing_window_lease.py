@@ -98,6 +98,23 @@ class TestMooncakeTrailingWindowLease(CustomTestCase):
         self.assertEqual(len(binding.calls[-1][1]), 4 * 4)
         self.assertEqual(result.restorable_prefix_pages, [1, 2])
 
+    def test_pipeline_lookup_retry_keeps_the_stage_object_names(self):
+        """A window evicted after the probe is looked up again under the same
+        pipeline-stage object names, never the single-stage ones."""
+        binding = _ProbeBinding(evicted_after_probe={"p1_s"})
+        store = _make_store(binding, kv_pages=2)
+        swa = PoolTransfer(
+            name=PoolName.SWA, keys=["w0"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+
+        result = store.batch_exists_v2(
+            ["p0", "p1"], [swa], pool_suffixes={PoolName.SWA: ["_s"]}
+        )
+
+        queried = {key for _, keys in binding.calls for key in keys}
+        self.assertEqual(queried, {"p0_s", "p1_s"})
+        self.assertEqual(result.restorable_prefix_pages, [1])
+
     def test_legacy_binding_leases_every_page(self):
         binding = _LegacyBinding(missing={"p3_conv_0"})
         store = _make_store(binding, kv_pages=4)
