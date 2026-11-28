@@ -412,6 +412,7 @@ class UnifiedCacheLinkerWrapper:
         self.offload_skip_prefix_len = 0
 
         cache.tree_core.enable_external_cache_linker = True
+        self.saved_write_through_threshold = cache.write_through_threshold
         cache.write_through_threshold = 1
         self.metrics = cache.metrics_collector
         if self.metrics is not None:
@@ -1230,3 +1231,5 @@ class UnifiedCacheLinkerWrapper:
     def close(self) -> None:
         self.cache_linker.close()
         self._clear_state()
+        self.cache.tree_core.enable_external_cache_linker = False
+        self.cache.write_through_threshold = self.saved_write_through_threshold
