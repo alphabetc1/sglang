@@ -818,6 +818,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         cache.sanity_check()
 
     def test_refused_or_evicted_prefetch_loads_layer_wise_at_admission(self):
+        """A prefetch hit the backend refused or the tree evicted must still load layer-wise at admission."""
         for unavailable in ("refused", "evicted"):
             with self.subTest(unavailable=unavailable):
                 cache, backend, req, allocator = self._fixture()
