@@ -2479,6 +2479,7 @@ def test_storage_backup_spec_round_trips_the_backuped_node():
     "namespace", [{}, {"extra_key": "adapter-a", "cache_salt": "tenant-a"}]
 )
 def test_weight_epoch_seeds_storage_chains(backend, namespace):
+    """Storage hash chains must differ across weight epochs, with and without a namespace."""
     key = RadixKey(array("q", [1, 2, 7, 8]), **namespace)
     plain = get_storage_hash_str(key, page_size=2)
     with get_flags().storage.override(weight_epoch="1:v2"):

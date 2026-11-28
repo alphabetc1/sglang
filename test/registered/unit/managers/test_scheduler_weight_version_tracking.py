@@ -379,6 +379,7 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertEqual(self.recorded, ["v2"])
 
     def test_each_successful_update_moves_the_storage_epoch(self):
+        """Storage written before a weight update must not be read back after it."""
         manager = self._manager(_runner(), session=False)
         epochs = []
         for _ in range(2):
@@ -388,6 +389,7 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertEqual(len(set(epochs)), 2)
 
     def test_failed_update_keeps_the_storage_epoch(self):
+        """A failed weight update must keep the current storage keys readable."""
         manager = self._manager(_runner((False, "boom")), session=False)
         self.assertFalse(manager.update_weights_from_disk(_request()).success)
         self.assertIsNone(get_flags().storage.weight_epoch)
